@@ -35,8 +35,10 @@ fn apply_replay_policy(
     );
     let mut activity = ActivityDiagnostics::default();
     let mut replay_steps = 0u64;
-    for range in &ranges {
-        let replay = replay_target_range(runtime, story, range.clone(), permission)?;
+    for (index, range) in ranges.iter().enumerate() {
+        let cleanup_after = index + 1 == ranges.len();
+        let replay =
+            replay_target_range_impl(runtime, story, range.clone(), permission, cleanup_after)?;
         replay_steps = replay_steps.saturating_add(replay.steps);
         activity.add(replay);
     }
@@ -706,6 +708,16 @@ pub(crate) fn replay_target_range(
     target_range: std::ops::Range<usize>,
     permission: Permission,
 ) -> LeoResult<ActivityDiagnostics> {
+    replay_target_range_impl(runtime, story, target_range, permission, true)
+}
+
+fn replay_target_range_impl(
+    runtime: &mut BackendRuntime,
+    story: &[u8],
+    target_range: std::ops::Range<usize>,
+    permission: Permission,
+    cleanup_after: bool,
+) -> LeoResult<ActivityDiagnostics> {
     let mut activity = ActivityDiagnostics::default();
     if story.is_empty() || target_range.is_empty() || target_range.start > story.len() {
         return Ok(activity);
@@ -729,7 +741,7 @@ pub(crate) fn replay_target_range(
                 .iter()
                 .map(|byte| (*byte as u32, None)),
         );
-        runtime.training_step_batch(&prefix, Permission::Frozen)?;
+        runtime.advance_frozen_batch(&prefix)?;
     }
 
     let target_steps = (next_target..end)
@@ -746,6 +758,8 @@ pub(crate) fn replay_target_range(
     for metrics in runtime.training_step_batch(&target_steps, permission)? {
         activity.record(metrics);
     }
-    runtime.reset_transient_state()?;
+    if cleanup_after {
+        runtime.reset_transient_state()?;
+    }
     Ok(activity)
 }

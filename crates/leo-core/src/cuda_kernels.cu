@@ -1485,6 +1485,28 @@ __device__ void leo_p_inject_symbol(
     }
 }
 
+// Frozen replay-prefix advancement only needs context history for the
+// next supervised step. Active context lookup/projection is output-only work
+// and is recomputed by the first subsequent ordinary step.
+__device__ void leo_p_context_advance_history(
+    const unsigned long long* p,
+    unsigned int symbol
+) {
+    if (leo_p_global_thread() != 0U) return;
+    const LeoConfig* cfg = leo_p_cptr<LeoConfig>(p, LEO_P_CONFIG);
+    unsigned int* history = leo_p_ptr<unsigned int>(p, LEO_P_CONTEXT_HISTORY);
+    unsigned int* history_count = leo_p_ptr<unsigned int>(p, LEO_P_CONTEXT_HISTORY_COUNT);
+    unsigned int count = *history_count;
+    if (count == cfg->context_max_order) {
+        for (unsigned int index = 1U; index < count; ++index) {
+            history[index - 1U] = history[index];
+        }
+        count -= 1U;
+    }
+    history[count++] = symbol;
+    *history_count = count;
+}
+
 __device__ void leo_p_context_resolve(
     const unsigned long long* p,
     unsigned int symbol,
@@ -2924,6 +2946,63 @@ __device__ void leo_train_story_block(
         leo_p_capture_training_step(pointers, step.target_index, step_index);
         __syncthreads();
     }
+}
+
+__device__ void leo_advance_frozen_story_block(
+    const unsigned long long* pointers,
+    const LeoPersistentStep* steps,
+    unsigned int step_count,
+    unsigned long long base_tick,
+    float* shared_values,
+    unsigned int* shared_neurons
+) {
+    unsigned int* recurrent_list = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_LIST);
+    unsigned int* recurrent_count = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_COUNT);
+    unsigned int* input_list = leo_p_ptr<unsigned int>(pointers, LEO_P_INPUT_ELIGIBLE_LIST);
+    unsigned int* input_count = leo_p_ptr<unsigned int>(pointers, LEO_P_INPUT_ELIGIBLE_COUNT);
+
+    for (unsigned int step_index = 0U; step_index < step_count; ++step_index) {
+        const unsigned int symbol = steps[step_index].symbol;
+        const unsigned long long tick = base_tick + (unsigned long long)step_index;
+
+        leo_p_start_tick(pointers, tick);
+        __syncthreads();
+        leo_p_deliver_events(
+            pointers, tick, false, recurrent_list, recurrent_count
+        );
+        __syncthreads();
+        leo_p_inject_symbol(
+            pointers, tick, symbol, false, input_list, input_count
+        );
+        __syncthreads();
+        leo_p_context_advance_history(pointers, symbol);
+        __syncthreads();
+        leo_p_select_blocks(pointers, tick);
+        __syncthreads();
+        leo_p_select_global(pointers, tick, shared_values, shared_neurons);
+        __syncthreads();
+        leo_p_post_and_emit(pointers, tick);
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void leo_advance_frozen_persistent(
+    const unsigned long long* pointers,
+    const LeoPersistentStep* steps,
+    unsigned int step_count,
+    unsigned long long base_tick
+) {
+    __shared__ float shared_values[LEO_GLOBAL_SORT];
+    __shared__ unsigned int shared_neurons[LEO_GLOBAL_SORT];
+    if (blockIdx.x != 0U) return;
+    leo_advance_frozen_story_block(
+        pointers,
+        steps,
+        step_count,
+        base_tick,
+        shared_values,
+        shared_neurons
+    );
 }
 
 extern "C" __global__ void leo_train_persistent(

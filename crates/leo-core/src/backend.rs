@@ -338,6 +338,15 @@ pub trait RuntimeBackend: Send {
             .collect()
     }
 
+    /// Advance transient document state through unsupervised frozen steps.
+    /// The default path preserves the reference implementation by executing
+    /// ordinary frozen steps and discarding their metrics. GPU backends may
+    /// skip output-only work that cannot affect the next recurrent state.
+    fn advance_frozen_batch(&mut self, steps: &[(u32, Option<u32>)]) -> LeoResult<()> {
+        self.training_step_batch(steps, Permission::Frozen)?;
+        Ok(())
+    }
+
     /// Optional GPU-native whole-story batch execution. Implementations return
     /// `None` when they do not support device-resident independent story lanes.
     fn training_story_batch(
@@ -546,6 +555,10 @@ impl RuntimeBackend for GpuRuntime {
         self.runtime.training_step_batch(steps, permission)
     }
 
+    fn advance_frozen_batch(&mut self, steps: &[(u32, Option<u32>)]) -> LeoResult<()> {
+        self.runtime.advance_frozen_batch(steps)
+    }
+
     fn training_story_batch(
         &mut self,
         stories: &[Vec<u8>],
@@ -724,6 +737,10 @@ impl BackendRuntime {
         permission: Permission,
     ) -> LeoResult<Vec<StepMetrics>> {
         self.inner.training_step_batch(steps, permission)
+    }
+
+    pub fn advance_frozen_batch(&mut self, steps: &[(u32, Option<u32>)]) -> LeoResult<()> {
+        self.inner.advance_frozen_batch(steps)
     }
 
     pub fn training_story_batch(

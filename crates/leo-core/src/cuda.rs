@@ -657,6 +657,7 @@ struct KernelFunctions {
     forward: CuFunction,
     capture_training_step: CuFunction,
     train_persistent: CuFunction,
+    advance_frozen_persistent: CuFunction,
     shared_wavefront_pre: CuFunction,
     shared_wavefront_fused: CuFunction,
     shared_select_blocks: CuFunction,
@@ -2536,6 +2537,70 @@ impl CudaRuntime {
         if self.model_dirty {
             self.upload_full_model()?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn advance_frozen_batch(&mut self, steps: &[(u32, Option<u32>)]) -> LeoResult<()> {
+        if steps.is_empty() {
+            return Ok(());
+        }
+        if steps.iter().any(|(_, target)| target.is_some()) {
+            return Err(LeoError::cuda(
+                "frozen state advance does not accept supervised targets",
+            ));
+        }
+
+        self.make_current()?;
+        if self.model_dirty {
+            self.upload_full_model()?;
+        }
+
+        for chunk in steps.chunks(TRAINING_STEP_BATCH_CAPACITY) {
+            let base_tick = self.current_tick;
+            let mut device_steps = Vec::with_capacity(chunk.len());
+            for &(symbol, _) in chunk {
+                if !is_input_symbol(symbol) {
+                    return Err(LeoError::cuda(format!(
+                        "invalid input symbol in frozen state advance: {symbol}"
+                    )));
+                }
+                device_steps.push(CudaPersistentStep {
+                    symbol,
+                    target_index: -1,
+                    context_enabled: 0,
+                    supervised_strength: 0.0,
+                });
+            }
+
+            let pointer_table = self.persistent_pointer_table();
+            self.copy_to_device(self.buffers.persistent_pointer_table, &pointer_table)?;
+            self.copy_to_device(self.buffers.persistent_steps, &device_steps)?;
+
+            let mut pointers = self.buffers.persistent_pointer_table.pointer;
+            let mut persistent_steps = self.buffers.persistent_steps.pointer;
+            let mut step_count = as_u32("frozen state advance step count", chunk.len())?;
+            let mut tick = base_tick;
+            let mut parameters = [
+                param(&mut pointers),
+                param(&mut persistent_steps),
+                param(&mut step_count),
+                param(&mut tick),
+            ];
+
+            // Frozen replay prefixes are sequential in time, but they do not
+            // need output probabilities, loss records, surrogate caches, or
+            // context projections. One persistent block advances exactly the
+            // recurrent/context-history state and avoids a D2H record per byte.
+            self.launch_exact(
+                self.shared.kernels.advance_frozen_persistent,
+                1,
+                PERSISTENT_THREADS,
+                &mut parameters,
+            )?;
+            self.synchronize()?;
+            self.current_tick = self.current_tick.saturating_add(chunk.len() as u64);
+        }
+
         Ok(())
     }
 
@@ -5997,6 +6062,7 @@ fn load_kernels(driver: &DriverFunctions, module: CuModule) -> LeoResult<KernelF
         forward: get_kernel(driver, module, "leo_forward")?,
         capture_training_step: get_kernel(driver, module, "leo_capture_training_step")?,
         train_persistent: get_kernel(driver, module, "leo_train_persistent")?,
+        advance_frozen_persistent: get_kernel(driver, module, "leo_advance_frozen_persistent")?,
         shared_wavefront_pre: get_kernel(driver, module, "leo_shared_wavefront_pre")?,
         shared_wavefront_fused: get_kernel(driver, module, "leo_shared_wavefront_fused")?,
         shared_select_blocks: get_kernel(driver, module, "leo_shared_select_blocks")?,
