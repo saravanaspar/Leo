@@ -1,0 +1,68 @@
+[model]
+name = "Leo-test"
+seed = 1337
+neuron_count = 128
+block_count = 8
+neurons_per_block = 16
+branches_per_neuron = 4
+excitatory_fraction = 0.8
+synapses_per_neuron = 8
+input_fanout = 8
+max_active_per_block = 2
+max_active_global = 8
+
+[dynamics]
+branch_decay = 0.85
+membrane_decay = 0.90
+fatigue_decay = 0.97
+fatigue_gain = 0.02
+refractory_ticks = 1
+target_activity = 0.04
+threshold_homeostasis_rate = 0.0001
+population_inhibition_rate = 0.05
+population_inhibition_max = 2.0
+adaptation_fast_decay = 0.95
+adaptation_medium_decay = 0.99
+adaptation_slow_decay = 0.999
+adaptation_fast_gain = 0.005
+adaptation_medium_gain = 0.001
+adaptation_slow_gain = 0.0002
+membrane_reset_fraction = 0.10
+
+[learning]
+output_learning_rate = 0.002
+recurrent_learning_rate = 0.0005
+inhibitory_learning_rate = 0.00005
+eligibility_decay = 0.95
+eligibility_epsilon = 0.00001
+surrogate_width = 0.25
+surrogate_gain = 0.10
+max_update = 0.01
+weight_min = -1.0
+weight_max = 1.0
+provisional_strength = 0.20
+training_strength = 1.0
+verified_strength = 1.0
+end_document_weight = 4.0
+
+[context]
+embedding_dim = 8
+max_order = 4
+slots_per_order = 128
+probe_limit = 4
+learning_rate = 0.08
+confidence_observations = 2
+dropout_rate = 0.0
+
+[replay]
+fraction = 0.30
+segment_bytes = 8
+teaching_replays = 1
+max_verified_replays = 2
+
+[training]
+max_dataset_passes = 2
+validate_every_bytes = 512
+checkpoint_every_bytes = 1024
+early_stop_checks = 3
+minimum_relative_improvement = 0.005

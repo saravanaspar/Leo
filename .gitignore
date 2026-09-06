@@ -1,0 +1,11 @@
+/target/
+/data/prepared/
+/runs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.leo_binary_path
+*.tmp

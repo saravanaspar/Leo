@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "crates/leo-core",
+    "crates/leo-format",
+    "crates/leo-data",
+    "crates/leo-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Leo Project"]
+license = "Apache-2.0"
+repository = ""
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

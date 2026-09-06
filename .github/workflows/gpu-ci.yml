@@ -1,0 +1,47 @@
+name: gpu-ci
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'crates/**'
+      - 'configs/**'
+      - 'scripts/check.sh'
+      - 'scripts/check_gpu.sh'
+      - '.github/workflows/gpu-ci.yml'
+  schedule:
+    - cron: '17 3 * * 0'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: leo-gpu-ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  cuda:
+    # Configure repository/org variable LEO_GPU_RUNNER to the exact GitHub
+    # larger-runner name or a custom label attached to a self-hosted GPU runner.
+    # With no GPU runner configured the scheduled workflow is safely skipped.
+    if: ${{ vars.LEO_GPU_RUNNER != '' }}
+    runs-on: ${{ vars.LEO_GPU_RUNNER }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: rustfmt, clippy
+      - name: CUDA device and toolkit
+        run: |
+          nvidia-smi
+          test -f "${CUDA_HOME:-/usr/local/cuda}/include/cooperative_groups.h" || \
+            test -f "${CUDA_PATH:-/usr/local/cuda}/include/cooperative_groups.h"
+      - name: CPU/static + CUDA/NVRTC/conformance smoke
+        env:
+          CI: '1'
+          LEO_CACHE_DIR: ${{ runner.temp }}/leo-cache
+        run: ./scripts/check_gpu.sh
