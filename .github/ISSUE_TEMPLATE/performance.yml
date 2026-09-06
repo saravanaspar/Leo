@@ -1,0 +1,51 @@
+name: Performance regression or optimization
+description: Report a measured performance problem or propose an execution optimization
+title: "[Perf]: "
+labels: ["performance"]
+body:
+  - type: input
+    id: commit
+    attributes:
+      label: Leo commit
+      placeholder: exact git commit hash
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware and runtime
+      description: CPU/GPU model, driver, CUDA version, VRAM where relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact benchmark/training command
+    validations:
+      required: true
+  - type: textarea
+    id: data
+    attributes:
+      label: Dataset and limits
+      description: State TinyStories split/revision if used, story/byte limits, workers, passes, validation size.
+    validations:
+      required: true
+  - type: textarea
+    id: numbers
+    attributes:
+      label: Measurements
+      description: Include repeated before/after measurements when possible.
+    validations:
+      required: true
+  - type: textarea
+    id: profile
+    attributes:
+      label: Telemetry / profiler evidence
+      description: cuda_profile events, Nsight Compute observations, or CPU profile evidence.
+  - type: checkboxes
+    id: semantics
+    attributes:
+      label: Correctness
+      options:
+        - label: The proposal does not silently change learning precision, replay, logical batching, or update semantics.
+          required: true

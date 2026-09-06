@@ -118,3 +118,9 @@ The long-term boundary tests are:
 - CPU/CUDA forward/training conformance plus shared-batch CUDA smoke tests on configured GPU CI runners (`.github/workflows/gpu-ci.yml`).
 
 Python source guards are secondary architecture lint; behavioral Rust tests remain the primary correctness evidence where a Rust toolchain is available.
+
+## 11. Open-source validation and reference dataset
+
+The public validation ladder is documented in `docs/TESTING.md`; experiment identity guidance is in `docs/REPRODUCIBILITY.md`. Current public model/data testing is specifically centered on the externally hosted `roneneldan/TinyStories` train/validation files pinned by `scripts/data.sh`. The repository does not vendor the corpus, and TinyStories remains subject to its own upstream license and terms.
+
+Repository CI proves source/build/test invariants. GPU claims require the real `scripts/check_gpu.sh` hardware gate, and model-quality claims require held-out evaluation under a recorded dataset/config/checkpoint/hardware identity.

@@ -45,3 +45,9 @@ Leo is a sparse recurrent byte-learning system with a CPU reference executor and
 ## Acceptance
 
 A v1.0.0 release is acceptable when repository checks pass, v1 artifacts are self-identifying/strictly validated, replay is not backend-dependent, CUDA ABI duplication is absent, docs match the implementation, and Rust/CUDA conformance is run on a machine with the required toolchain/GPU before a production training run.
+
+## Open-source release requirements
+
+The v1.0.0 public repository should keep the Apache-2.0 license, contribution/security/community guidance, reproducible dependency metadata, CI status, and a documented test-data provenance path. Current public quality testing is specifically based on the TinyStories dataset pinned by `scripts/data.sh`; TinyStories is external data and is not relicensed by Leo.
+
+Public performance claims must name the exact source commit, dependency lockfile, dataset identity, configuration, backend/hardware, and benchmark limits. Public model-quality claims must additionally include held-out evaluation conditions.

@@ -1,123 +1,99 @@
 # Leo v1.0.0
 
-Leo is a sparse recurrent byte-learning system implemented in Rust with a CPU reference backend and a custom CUDA backend. **v1.0.0 is a clean training/artifact baseline**: prepare v1 data and initialize a fresh v1 model before the reference training run.
+<p align="center">
+  <strong>A sparse recurrent byte-learning system with a CPU reference backend and a custom NVIDIA CUDA backend.</strong>
+</p>
 
-The v1 training policy keeps bounded surprise replay enabled at **30%** in the shipped configs, uses FP32 exact semantics, and records independent model/training/execution/dataset/CUDA-ABI contract versions. Backend selection changes execution, not learning policy.
+<p align="center">
+  <a href="https://github.com/saravanaspar/Leo/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/saravanaspar/Leo/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/saravanaspar/Leo/actions/workflows/gpu-ci.yml"><img alt="GPU CI" src="https://github.com/saravanaspar/Leo/actions/workflows/gpu-ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <img alt="Rust 1.85" src="https://img.shields.io/badge/Rust-1.85%2B-orange.svg">
+  <img alt="Version 1.0.0" src="https://img.shields.io/badge/version-1.0.0-informational.svg">
+</p>
 
-Durability contracts: [semantics](docs/SEMANTICS.md), [artifact formats](docs/FORMATS.md), and [technical design](docs/TDD.md).
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#tinystories-testing-dataset">TinyStories</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#gpu-execution">GPU</a> ·
+  <a href="#testing-and-validation">Testing</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a> ·
+  <a href="SECURITY.md">Security</a>
+</p>
 
-This repository provides:
+> [!IMPORTANT]
+> **Current public development and quality testing is specifically centered on the [TinyStories dataset](https://huggingface.co/datasets/roneneldan/TinyStories).** Leo is research-oriented software. Passing repository tests proves implementation invariants; it does not by itself prove model quality, generalization, or production readiness.
 
-- single-GPU CUDA training
-- experimental multi-GPU CUDA training
-- persistent per-GPU model replicas
-- sparse multi-GPU parameter synchronization
-- automatic multi-GPU frozen evaluation
-- capped validation during scripted training
-- CPU reference backend
-- checkpoint/resume support
+Leo v1.0.0 is a clean durability baseline for fresh training and long-lived experiments. It keeps **FP32 learning semantics**, **30% bounded-surprise replay** in the standard configurations, strict artifact identity, checkpoint/resume safety, a CPU reference path, and execution-only CUDA optimization.
+
+## Project status
+
+| Area | Status |
+| --- | --- |
+| CPU reference backend | Supported |
+| Single-GPU CUDA training | Supported |
+| CUDA execution autotuning | Supported, execution-only |
+| CUDA Graph sparse apply/reset | Supported when driver APIs allow it |
+| Async pinned H2D/D2H pipeline | Supported |
+| Cooperative fused wavefront | Preferred when hardware supports it |
+| Multi-GPU training | **Experimental** batch-end device mean |
+| FP16/BF16 training | Not part of v1.0.0 |
+| Dynamic topology growth | Not part of v1.0.0 |
+| Pre-v1 artifact compatibility | Intentionally not supported |
+
+### Core v1 guarantees
+
+- **One learning contract:** CPU/GPU selection changes execution location, not learning policy.
+- **FP32 only:** no hidden FP16/BF16/approximate-math training path.
+- **30% replay:** standard configurations keep bounded-surprise replay enabled at `0.30`.
+- **Strict artifacts:** datasets, checkpoints, and resume state are identity-bound and validated.
+- **One CUDA ABI source:** Rust/CUDA pointer/config layouts come from `crates/leo-core/cuda_abi.def`.
+- **Execution-only tuning:** CUDA tuning cannot change logical `--workers`, replay fraction, precision, update barriers, or learning equations.
+
+<details>
+<summary><strong>What Leo provides</strong></summary>
+
+- model initialization
+- train / resume / fresh-run flows
+- CPU and CUDA backends
 - held-out and training-set evaluation
-- prompt generation, teaching, inspection, rollback, and benchmarking
+- text generation and explicit teaching permissions
+- inspect / checkpoint / rollback
+- training and frozen benchmarks
+- single-GPU CUDA verification and hardware profiling
+- optional experimental multi-GPU synchronization
 
-## Automatic safe GPU execution acceleration
-
-The CUDA backend automatically optimizes **execution**, not the learning policy. v1.0.0 keeps FP32 and 30% bounded-surprise replay unchanged while using exact worklists, sparse delta application, adaptive physical lane chunks, cooperative-grid wavefront fusion, online multi-dimensional GPU execution tuning, SHA-256-keyed NVRTC PTX caching, separate pinned transfer/compute streams, one-batch-ahead dataset prefetch, and CUDA Graph replay for the stable sparse apply/reset sequence when the installed driver supports it.
-
-The logical `--workers` value is never autotuned because it defines the story batch whose sparse deltas are mean-reduced. The tuner searches execution-only lane, sparse-apply, and fused-grid geometry, and its cache identity includes the concrete GPU/driver/model/semantics identity plus logical batch width. Profiles live under `${LEO_CACHE_DIR}/cuda`, `${XDG_CACHE_HOME}/leo/cuda`, or `~/.cache/leo/cuda`. Delete that cache at any time to force PTX recompilation and execution-plan retuning; it contains no learned model state. Runtime `cuda_profile` events report sampled transfer/compute/wait timing; use `scripts/profile_cuda.sh` with Nsight Compute for real DRAM, occupancy, warp/branch, instruction, and atomic hardware counters.
-
-## Multi-GPU note
-
-Enable multi-GPU training with:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 LEO_MULTI_GPU=1
-```
-
-The current training synchronization mode is:
-
-```text
-gpu_multi_device_batch_mean_experimental
-```
-
-The two GPU shards are merged at the end of each story batch. Sparse changed parameters are synchronized back to the persistent GPU replicas.
-
-The implementation reports:
-
-```text
-exact_single_gpu_wavefront_equivalence=false
-```
-
-because multi-GPU training uses batch-end device averaging rather than reproducing the exact single-GPU byte-wavefront update order.
-
-Frozen evaluation is read-only and can be distributed across all visible GPUs without changing the model.
+</details>
 
 ---
 
-# Repository layout
+## Quick start
 
-```text
-Leo/
-├── Cargo.toml
-├── configs/
-├── crates/
-├── data/
-│   └── prepared/
-├── docs/
-├── python/
-├── runs/
-│   └── quality/
-├── scripts/
-├── tests/
-└── README.md
-```
+### 1. Requirements
 
-The clean archive keeps all of `data/` and only permanent runs under `runs/quality/`.
+- Rust **1.85+**
+- Python **3.12+** for repository/data tooling
+- NVIDIA driver + CUDA toolkit for GPU execution
+- `hf` CLI when downloading TinyStories automatically
 
-Temporary benchmark runs, build output, caches, and patch backups are intentionally excluded.
-
----
-
-# 1. Kaggle setup
-
-Enter the project:
+Clone and enter the repository:
 
 ```bash
-cd /kaggle/working/Leo
+git clone https://github.com/saravanaspar/Leo.git
+cd Leo
 ```
 
-Install Rust if needed:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-  | sh -s -- -y --profile minimal
-
-export PATH="$HOME/.cargo/bin:$PATH"
-```
-
-Optional development components:
-
-```bash
-rustup component add rustfmt clippy
-```
-
-Build Leo:
+Build:
 
 ```bash
 cargo build --release -p leo-cli
 ```
 
-The source archive intentionally does not carry the pre-v1 `Cargo.lock`. The first v1 build generates a lockfile for the pinned direct dependencies; keep that generated `Cargo.lock` with the exact training environment you use for the reference run.
-
 The binary is:
 
 ```text
 target/release/leo
-```
-
-Check GPUs:
-
-```bash
-nvidia-smi -L
 ```
 
 Show CLI help:
@@ -126,11 +102,25 @@ Show CLI help:
 ./target/release/leo --help
 ```
 
+Run the CPU/static repository gate:
+
+```bash
+bash ./scripts/check.sh
+```
+
+> [!NOTE]
+> `Cargo.lock` should be committed for the v1.0.0 application baseline. Dependency changes should be explicit, reviewed, and validated rather than silently drifting between training environments.
+
 ---
 
-# 2. Prepared data
+## TinyStories testing dataset
 
-The normal prepared TinyStories dataset is:
+Leo does **not** vendor the TinyStories corpus. `scripts/data.sh` downloads and verifies the upstream files when needed.
+
+**Dataset:** [roneneldan/TinyStories on Hugging Face](https://huggingface.co/datasets/roneneldan/TinyStories)<br>
+**Paper:** [TinyStories: How Small Can Language Models Be and Still Speak Coherent English?](https://arxiv.org/abs/2305.07759)
+
+The repository currently prepares:
 
 ```text
 data/prepared/
@@ -141,13 +131,17 @@ data/prepared/
 └── manifest.json
 ```
 
-The validation set is held out. Do not train on `tinystories.valid.*`.
+The validation split is held out. Do not train on `tinystories.valid.*`.
 
-## Prepare or rebuild data
-
-General script syntax:
+Prepare the default dataset:
 
 ```bash
+bash ./scripts/data.sh
+```
+
+General syntax:
+
+```text
 ./scripts/data.sh \
   [raw-directory] \
   [prepared-directory] \
@@ -157,17 +151,90 @@ General script syntax:
   [valid-byte-limit]
 ```
 
-Default:
+<details>
+<summary><strong>Exact TinyStories provenance currently pinned by Leo</strong></summary>
 
-```bash
-./scripts/data.sh
+```text
+repository: roneneldan/TinyStories
+revision:   5485261731eaac25dd8e5ebbc3839d0a9870b185
+revision URL: https://huggingface.co/datasets/roneneldan/TinyStories/tree/5485261731eaac25dd8e5ebbc3839d0a9870b185
+
+TinyStories-train.txt
+sha256: c5cf5e22ff13614e830afbe61a99fbcbe8bcb7dd72252b989fa1117a368d401f
+
+TinyStories-valid.txt
+sha256: 94e431816c4cce81ff71e4408ff8d3bda9a42e8d2663986697c3954288cb38b4
 ```
 
-The script downloads the pinned TinyStories train/validation files if they are missing, verifies their checksums, and writes the prepared byte/index files.
+These values come from `scripts/data.sh`. Prepared artifacts record source repository, revision, source checksums, and their own identity.
+
+</details>
+
+> [!CAUTION]
+> TinyStories is an **external dataset** and is not covered by Leo's Apache-2.0 software license. The upstream dataset card currently lists `cdla-sharing-1.0`; always review the current dataset card and terms before downloading, redistributing, or using it in another context.
+
+See [docs/TESTING.md](docs/TESTING.md) for the full validation ladder and [docs/REPRODUCIBILITY.md](docs/REPRODUCIBILITY.md) for experiment identity guidance.
 
 ---
 
-# 3. Initialize a model
+## Architecture
+
+```mermaid
+flowchart LR
+    RAW["Raw corpus<br/>TinyStories today"] --> PREP["LEODATA1<br/>verified dataset"]
+    CFG["Strict TOML config"] --> MODEL["PSCLS100<br/>canonical model"]
+    PREP --> TRAIN["TrainingPolicy v1<br/>30% bounded-surprise replay"]
+    MODEL --> TRAIN
+    TRAIN --> BR{BackendRuntime}
+    BR --> CPU[CPU reference executor]
+    BR --> CUDA[CUDA executor]
+    CPU --> NEXT[Canonical model update]
+    CUDA --> NEXT
+    NEXT --> CKPT[Atomic checkpoint + resume state]
+```
+
+Persistent learned state is separated from transient per-document execution state. A fresh executor can therefore start from a canonical model without inheriting membrane, activation, fatigue, eligibility, delay-ring, selection, or scratch state from another document.
+
+### Repository layout
+
+```text
+Leo/
+├── .github/                 # CI, issue forms, PR template, dependency updates
+├── configs/                 # supported v1 model/training configs
+├── crates/
+│   ├── leo-cli/             # CLI + training lifecycle boundary
+│   ├── leo-core/            # model, runtime, CPU/CUDA execution
+│   ├── leo-data/            # verified dataset artifacts
+│   └── leo-format/          # checkpoint format and persistence
+├── docs/                    # semantics, formats, design, testing
+├── python/                  # repository/data validation tooling
+├── scripts/                 # data, train, evaluate, CI/GPU/profile helpers
+├── tests/                   # reference validation tests
+├── CONTRIBUTING.md
+├── SECURITY.md
+└── README.md
+```
+
+<details>
+<summary><strong>Read the design contracts</strong></summary>
+
+- [Product requirements](docs/PRD.md)
+- [Technical design](docs/TDD.md)
+- [Execution and learning semantics](docs/SEMANTICS.md)
+- [Artifact formats](docs/FORMATS.md)
+- [Backend ADR](docs/ADR-0001-EXECUTION-BACKENDS.md)
+- [Testing strategy](docs/TESTING.md)
+- [Reproducibility](docs/REPRODUCIBILITY.md)
+
+Historical GPU stage documents remain in `docs/` as implementation history; the current v1 contract is defined by the files above and the code.
+
+</details>
+
+---
+
+## Initialize and train
+
+Create a run directory and model:
 
 ```bash
 mkdir -p runs/quality/my-run
@@ -177,11 +244,26 @@ mkdir -p runs/quality/my-run
   --output runs/quality/my-run/leo.pscls
 ```
 
----
+### Recommended single-GPU example
 
-# 4. Recommended two-GPU training
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+./target/release/leo train \
+  --model runs/quality/my-run/leo.pscls \
+  --train-bytes data/prepared/tinystories.train.bytes \
+  --train-index data/prepared/tinystories.train.idx \
+  --valid-bytes data/prepared/tinystories.valid.bytes \
+  --valid-index data/prepared/tinystories.valid.idx \
+  --validation-stories 100 \
+  --passes 1 \
+  --workers 64 \
+  --backend gpu \
+  --fresh-run
+```
 
-`scripts/train.sh` accepts:
+Use `--fresh-run` only when intentionally starting a new training operation and discarding compatible prior resume state for that model.
+
+### Scripted training
 
 ```text
 ./scripts/train.sh \
@@ -196,87 +278,11 @@ mkdir -p runs/quality/my-run
   [validation-stories]
 ```
 
-Recommended example:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-LEO_MULTI_GPU=1 \
-./scripts/train.sh \
-  data/prepared \
-  runs/quality/my-run \
-  configs/tinystories.toml \
-  1 \
-  100000 \
-  64 \
-  "" \
-  gpu \
-  100
-```
-
-Meaning:
-
-```text
-passes               1
-max training stories 100000
-workers               64 total
-max input bytes       unlimited
-backend               gpu
-validation stories    100
-```
-
-The script builds Leo, initializes the model if it does not exist, trains, and writes `train.jsonl` in the run directory.
-
-The script caps validation instead of silently evaluating the complete validation corpus after every pass.
-
-For development:
-
-```text
-10 validation stories    smoke check
-100 validation stories   routine check
-1000 validation stories  larger quality check
-full validation set      deliberate final evaluation only
-```
-
----
-
-# 5. Direct two-GPU training
-
-Use the direct CLI when you want complete control.
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-LEO_MULTI_GPU=1 \
-./target/release/leo train \
-  --model runs/quality/my-run/leo.pscls \
-  --train-bytes data/prepared/tinystories.train.bytes \
-  --train-index data/prepared/tinystories.train.idx \
-  --valid-bytes data/prepared/tinystories.valid.bytes \
-  --valid-index data/prepared/tinystories.valid.idx \
-  --validation-stories 100 \
-  --passes 1 \
-  --workers 64 \
-  --backend gpu \
-  --fresh-run
-```
-
-Use `--fresh-run` only when intentionally starting a fresh training operation and discarding any previous resume state for that model.
-
----
-
-# 6. Resume training
-
-Leo maintains training resume state beside the model checkpoint.
-
-To resume an interrupted direct training run, use the same command again without `--fresh-run`.
-
-For normal scripted training, simply rerun the same `scripts/train.sh` command.
-
 Example:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-LEO_MULTI_GPU=1 \
-./scripts/train.sh \
+CUDA_VISIBLE_DEVICES=0 \
+bash ./scripts/train.sh \
   data/prepared \
   runs/quality/my-run \
   configs/tinystories.toml \
@@ -288,87 +294,12 @@ LEO_MULTI_GPU=1 \
   100
 ```
 
----
+<details>
+<summary><strong>Resume, CPU training, and constrained runs</strong></summary>
 
-# 7. Training without validation
+Resume an interrupted run by repeating the same training command **without** `--fresh-run`.
 
-Useful for a pure speed benchmark or controlled experiment:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-LEO_MULTI_GPU=1 \
-./target/release/leo train \
-  --model runs/quality/my-run/leo.pscls \
-  --train-bytes data/prepared/tinystories.train.bytes \
-  --train-index data/prepared/tinystories.train.idx \
-  --passes 1 \
-  --max-stories 1024 \
-  --workers 64 \
-  --backend gpu \
-  --fresh-run
-```
-
-No `--valid-bytes` or `--valid-index` means no post-pass validation.
-
----
-
-# 8. Limit training by story count
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-LEO_MULTI_GPU=1 \
-./target/release/leo train \
-  --model runs/quality/my-run/leo.pscls \
-  --train-bytes data/prepared/tinystories.train.bytes \
-  --train-index data/prepared/tinystories.train.idx \
-  --passes 1 \
-  --max-stories 10000 \
-  --workers 64 \
-  --backend gpu
-```
-
----
-
-# 9. Limit training by input bytes
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-LEO_MULTI_GPU=1 \
-./target/release/leo train \
-  --model runs/quality/my-run/leo.pscls \
-  --train-bytes data/prepared/tinystories.train.bytes \
-  --train-index data/prepared/tinystories.train.idx \
-  --passes 1 \
-  --max-bytes 100000000 \
-  --workers 64 \
-  --backend gpu
-```
-
----
-
-# 10. Single-GPU training
-
-Expose only one GPU and do not set `LEO_MULTI_GPU=1`:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 \
-./target/release/leo train \
-  --model runs/quality/my-run/leo.pscls \
-  --train-bytes data/prepared/tinystories.train.bytes \
-  --train-index data/prepared/tinystories.train.idx \
-  --valid-bytes data/prepared/tinystories.valid.bytes \
-  --valid-index data/prepared/tinystories.valid.idx \
-  --validation-stories 100 \
-  --passes 1 \
-  --workers 64 \
-  --backend gpu
-```
-
----
-
-# 11. CPU training
-
-CPU is primarily the reference backend:
+CPU reference training:
 
 ```bash
 ./target/release/leo train \
@@ -380,152 +311,152 @@ CPU is primarily the reference backend:
   --backend cpu
 ```
 
----
-
-# 12. Fast frozen held-out benchmark
-
-Frozen benchmark evaluation automatically uses all visible GPUs.
+Limit by story count:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-./target/release/leo benchmark \
+./target/release/leo train \
   --model runs/quality/my-run/leo.pscls \
-  --bytes data/prepared/tinystories.valid.bytes \
-  --index data/prepared/tinystories.valid.idx \
-  --stories 100 \
-  --backend gpu
-```
-
-During multi-GPU evaluation you should see progress similar to:
-
-```text
-{"event":"evaluation_progress","shard":0,"shards":2,...}
-{"event":"evaluation_progress","shard":1,"shards":2,...}
-```
-
----
-
-# 13. Held-out evaluation
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-./target/release/leo eval \
-  --model runs/quality/my-run/leo.pscls \
-  --bytes data/prepared/tinystories.valid.bytes \
-  --index data/prepared/tinystories.valid.idx \
-  --stories 100 \
-  --generation-stories 4 \
-  --prompt "Once upon a time" \
-  --backend gpu
-```
-
-This evaluates the model on held-out validation stories and runs generation probes.
-
----
-
-# 14. Held-out plus training-set evaluation
-
-This compares performance on unseen validation stories with performance on training stories:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-./target/release/leo eval \
-  --model runs/quality/my-run/leo.pscls \
-  --bytes data/prepared/tinystories.valid.bytes \
-  --index data/prepared/tinystories.valid.idx \
-  --stories 100 \
   --train-bytes data/prepared/tinystories.train.bytes \
   --train-index data/prepared/tinystories.train.idx \
-  --train-stories 100 \
+  --passes 1 \
+  --max-stories 10000 \
+  --workers 64 \
+  --backend gpu
+```
+
+Limit by raw input bytes:
+
+```bash
+./target/release/leo train \
+  --model runs/quality/my-run/leo.pscls \
+  --train-bytes data/prepared/tinystories.train.bytes \
+  --train-index data/prepared/tinystories.train.idx \
+  --passes 1 \
+  --max-bytes 100000000 \
+  --workers 64 \
+  --backend gpu
+```
+
+</details>
+
+---
+
+## GPU execution
+
+The CUDA backend may optimize **execution only**. It keeps the v1 learning contract unchanged while using:
+
+- persistent device model buffers
+- exact touched/learning worklists
+- sparse delta application
+- adaptive physical lane chunks
+- cooperative-grid wavefront fusion with a compatibility fallback
+- hardware/model/driver-specific execution-plan tuning
+- SHA-256-keyed NVRTC PTX caching
+- pinned host staging
+- separate transfer and compute streams
+- event-ordered H2D/compute/D2H overlap
+- one-batch-ahead verified dataset prefetch
+- CUDA Graph replay for the stable sparse apply/reset sequence
+- sampled runtime telemetry
+
+The logical `--workers` batch is never autotuned because it defines the canonical batch whose sparse deltas are mean-reduced.
+
+Execution/PTX profiles are cache data, not model state. They live under one of:
+
+```text
+${LEO_CACHE_DIR}/cuda
+${XDG_CACHE_HOME}/leo/cuda
+~/.cache/leo/cuda
+```
+
+Deleting that cache forces recompilation/retuning without deleting learned parameters.
+
+### GPU verification
+
+```bash
+bash ./scripts/check_gpu.sh
+```
+
+### Hardware-counter profiling
+
+Requires NVIDIA Nsight Compute (`ncu`):
+
+```bash
+bash ./scripts/profile_cuda.sh \
+  runs/quality/my-run/leo.pscls \
+  data/prepared/tinystories.train.bytes \
+  data/prepared/tinystories.train.idx \
+  64 256 leo-cuda-profile
+```
+
+The GPU GitHub Actions workflow only runs when the repository/org variable `LEO_GPU_RUNNER` names a configured GPU runner. Otherwise it safely skips instead of pretending GPU validation occurred.
+
+<details>
+<summary><strong>Experimental multi-GPU mode</strong></summary>
+
+Enable it explicitly:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 LEO_MULTI_GPU=1 \
+./target/release/leo train \
+  --model runs/quality/my-run/leo.pscls \
+  --train-bytes data/prepared/tinystories.train.bytes \
+  --train-index data/prepared/tinystories.train.idx \
+  --passes 1 \
+  --workers 64 \
+  --backend gpu
+```
+
+Current synchronization is:
+
+```text
+gpu_multi_device_batch_mean_experimental
+```
+
+Multi-GPU training performs batch-end device averaging and therefore reports:
+
+```text
+exact_single_gpu_wavefront_equivalence=false
+```
+
+Do not treat multi-GPU results as byte-for-byte equivalent to the single-GPU wavefront update order.
+
+</details>
+
+---
+
+## Evaluate and generate
+
+Held-out evaluation:
+
+```bash
+./target/release/leo eval \
+  --model runs/quality/my-run/leo.pscls \
+  --bytes data/prepared/tinystories.valid.bytes \
+  --index data/prepared/tinystories.valid.idx \
+  --stories 100 \
   --generation-stories 4 \
   --prompt "Once upon a time" \
   --backend gpu
 ```
 
----
-
-# 15. Complete evaluation script
-
-General syntax:
-
-```text
-./scripts/evaluate.sh \
-  <prepared-data-directory> \
-  <run-directory> \
-  [valid-stories] \
-  [train-stories] \
-  [backend]
-```
-
-Example:
+Generate text:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-./scripts/evaluate.sh \
-  data/prepared \
-  runs/quality/my-run \
-  100 \
-  100 \
-  gpu
+./target/release/leo prompt \
+  --model runs/quality/my-run/leo.pscls \
+  --text "Once upon a time" \
+  --max-bytes 500 \
+  --temperature 0.8 \
+  --backend gpu
 ```
 
-The script performs:
+<details>
+<summary><strong>More CLI recipes</strong></summary>
 
-1. held-out evaluation
-2. optional training-set comparison
-3. generation probe
-4. prompt generation
-5. frozen benchmark
-6. baseline comparison
-
-Typical run outputs include:
-
-```text
-train.jsonl
-eval.jsonl
-story.txt
-benchmark.jsonl
-baselines.json
-```
-
----
-
-# 16. All-in-one train then evaluate
+Training benchmark:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-LEO_MULTI_GPU=1 \
-./scripts/train.sh \
-  data/prepared \
-  runs/quality/my-run \
-  configs/tinystories.toml \
-  1 \
-  100000 \
-  64 \
-  "" \
-  gpu \
-  100 \
-&& \
-CUDA_VISIBLE_DEVICES=0,1 \
-./scripts/evaluate.sh \
-  data/prepared \
-  runs/quality/my-run \
-  100 \
-  100 \
-  gpu
-```
-
-Evaluation starts only if training exits successfully.
-
----
-
-# 17. Training benchmark
-
-Benchmark training without committing the benchmark run as a normal training job:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-LEO_MULTI_GPU=1 \
 ./target/release/leo benchmark \
   --train \
   --model runs/quality/my-run/leo.pscls \
@@ -536,83 +467,18 @@ LEO_MULTI_GPU=1 \
   --backend gpu
 ```
 
-Byte-limited benchmark:
+Frozen held-out benchmark:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-LEO_MULTI_GPU=1 \
 ./target/release/leo benchmark \
-  --train \
   --model runs/quality/my-run/leo.pscls \
-  --bytes data/prepared/tinystories.train.bytes \
-  --index data/prepared/tinystories.train.idx \
-  --max-bytes 10000000 \
-  --workers 64 \
+  --bytes data/prepared/tinystories.valid.bytes \
+  --index data/prepared/tinystories.valid.idx \
+  --stories 100 \
   --backend gpu
 ```
 
----
-
-# GPU verification and hardware profiling
-
-Run the real CUDA/NVRTC/conformance smoke locally on a GPU machine:
-
-```bash
-./scripts/check_gpu.sh
-```
-
-For a hardware-counter profile of a representative training benchmark:
-
-```bash
-./scripts/profile_cuda.sh \
-  runs/quality/my-run/leo.pscls \
-  data/prepared/tinystories.train.bytes \
-  data/prepared/tinystories.train.idx \
-  64 256 leo-cuda-profile
-```
-
-The optional `.github/workflows/gpu-ci.yml` runs the same GPU smoke weekly and on manual dispatch when the repository/org variable `LEO_GPU_RUNNER` is set to a configured GitHub GPU larger-runner name (GitHub Team/Enterprise Cloud) or a custom label on a self-hosted GPU runner. Without that variable the job is skipped rather than pretending GPU validation occurred.
-
----
-
-# 18. Generate text
-
-```bash
-./target/release/leo prompt \
-  --model runs/quality/my-run/leo.pscls \
-  --text "Once upon a time" \
-  --max-bytes 500 \
-  --temperature 0.8 \
-  --backend gpu
-```
-
-JSON output:
-
-```bash
-./target/release/leo prompt \
-  --model runs/quality/my-run/leo.pscls \
-  --text "Once upon a time" \
-  --max-bytes 500 \
-  --temperature 0.8 \
-  --backend gpu \
-  --json
-```
-
----
-
-# 19. Teach text directly
-
-Provisional:
-
-```bash
-./target/release/leo teach \
-  --model runs/quality/my-run/leo.pscls \
-  --permission provisional \
-  --text "Text to teach." \
-  --backend gpu
-```
-
-Training permission:
+Teach text explicitly:
 
 ```bash
 ./target/release/leo teach \
@@ -622,28 +488,7 @@ Training permission:
   --backend gpu
 ```
 
-Verified:
-
-```bash
-./target/release/leo teach \
-  --model runs/quality/my-run/leo.pscls \
-  --permission verified \
-  --text "Text to teach." \
-  --backend gpu
-```
-
----
-
-# 20. Inspect a checkpoint
-
-Human-readable:
-
-```bash
-./target/release/leo inspect \
-  --model runs/quality/my-run/leo.pscls
-```
-
-JSON:
+Inspect:
 
 ```bash
 ./target/release/leo inspect \
@@ -651,18 +496,14 @@ JSON:
   --json
 ```
 
----
-
-# 21. Create a checkpoint generation
+Checkpoint:
 
 ```bash
 ./target/release/leo checkpoint \
   --model runs/quality/my-run/leo.pscls
 ```
 
----
-
-# 22. Roll back to an older generation
+Rollback:
 
 ```bash
 ./target/release/leo rollback \
@@ -670,191 +511,83 @@ JSON:
   --generation 3
 ```
 
-Use a generation number that exists in retained checkpoint history.
-
----
-
-# 23. Backend information and probes
-
-CPU backend:
+Backend information:
 
 ```bash
 ./target/release/leo backend \
-  --backend cpu \
-  --json
-```
-
-GPU backend:
-
-```bash
-./target/release/leo backend \
-  --backend gpu \
-  --json
-```
-
-GPU backend with a model probe:
-
-```bash
-./target/release/leo backend \
-  --backend gpu \
+  --backend auto \
   --model runs/quality/my-run/leo.pscls \
   --json
 ```
 
----
-
-# 24. Development checks
-
-Compile check:
-
-```bash
-cargo check --release -p leo-cli
-```
-
-Build:
-
-```bash
-cargo build --release -p leo-cli
-```
-
-Format:
-
-```bash
-cargo fmt --all
-```
-
-Rust delimiter scanner:
-
-```bash
-python3 python/check_rust_delimiters.py
-```
-
-Python tests:
-
-```bash
-python3 -m pytest -q python/tests tests
-```
-
-Complete project check:
-
-```bash
-./scripts/check.sh
-```
+</details>
 
 ---
 
-# 25. CLI command reference
+## Testing and validation
 
-The main CLI commands are:
+For normal contributions:
 
-```text
-init
-train
-eval
-prompt
-teach
-inspect
-checkpoint
-rollback
-benchmark
-backend
+```bash
+cargo fmt --check
+cargo build
+cargo test
+cargo clippy -- -D warnings
+bash ./scripts/check.sh
 ```
 
-Current CLI help syntax:
+For changes that affect CUDA execution, kernels, ABI, launch planning, or GPU-visible training behavior, also run on a suitable NVIDIA machine:
 
-```text
-leo init --config <FILE> --output <MODEL.pscls>
-
-leo train --model <MODEL.pscls>
-  --train-index <FILE>
-  --train-bytes <FILE>
-  [--valid-index <FILE> --valid-bytes <FILE>]
-  [--passes N]
-  [--max-stories N]
-  [--max-bytes N]
-  [--workers N]
-  [--backend auto|cpu|gpu]
-  [--fresh-run]
-
-leo eval --model <MODEL.pscls>
-  --index <FILE>
-  --bytes <FILE>
-  [--stories N]
-  [--train-index <FILE> --train-bytes <FILE> --train-stories N]
-  [--generation-stories N]
-  [--prompt "Once upon a time"]
-  [--backend auto|cpu|gpu]
-
-leo prompt --model <MODEL.pscls>
-  --text <STORY_PREFIX>
-  [--max-bytes N]
-  [--temperature F]
-  [--seed N]
-  [--backend auto|cpu|gpu]
-  [--json]
-
-leo teach --model <MODEL.pscls>
-  --permission provisional|training|verified
-  --text <LESSON>
-  [--backend auto|cpu|gpu]
-
-leo inspect --model <MODEL.pscls> [--json]
-
-leo checkpoint --model <MODEL.pscls>
-
-leo rollback --model <MODEL.pscls> --generation <N>
-
-leo benchmark --model <MODEL.pscls>
-  --index <FILE>
-  --bytes <FILE>
-  [--stories N]
-  [--train --max-bytes N --workers N]
-  [--backend auto|cpu|gpu]
-
-leo backend
-  [--backend auto|cpu|gpu]
-  [--model <MODEL.pscls>]
-  [--json]
+```bash
+bash ./scripts/check_gpu.sh
 ```
 
-Leo supports capped training validation with `--validation-stories N` and opt-in multi-GPU training through `LEO_MULTI_GPU=1`.
+| Gate | Purpose |
+| --- | --- |
+| `cargo fmt --check` | canonical Rust formatting |
+| `cargo build` | workspace compilation |
+| `cargo test` | Rust behavioral/unit/integration tests |
+| `cargo clippy -- -D warnings` | warning-free Rust lint gate |
+| `scripts/check.sh` | Python/source/ABI/config + Rust repository gate |
+| `scripts/check_gpu.sh` | real CUDA/NVRTC/conformance/autotuning smoke |
+| `scripts/profile_cuda.sh` | optional Nsight performance investigation |
+
+Read [docs/TESTING.md](docs/TESTING.md) before making changes to training semantics or CUDA execution.
 
 ---
 
-# 26. Clean archival policy
+## Contributing
 
-Keep:
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md).
 
-```text
-Cargo.toml
-LICENSE
-Makefile
-README.md
-configs/
-crates/
-data/
-docs/
-python/
-runs/quality/
-scripts/
-tests/
-```
+Useful paths:
 
-Remove before making a canonical archive:
+- [Open an issue](https://github.com/saravanaspar/Leo/issues)
+- [Pull requests](https://github.com/saravanaspar/Leo/pulls)
+- [Changelog](CHANGELOG.md)
+- [Support guidance](SUPPORT.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
 
-```text
-target/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-__pycache__/
-.ipynb_checkpoints/
-.leo_binary_path
-runs/* except runs/quality/
-```
+Performance PRs must preserve the v1 semantic contract unless they explicitly propose and justify a semantic/versioned change. "Faster" is not accepted as a reason to silently change replay, arithmetic precision, logical batching, update ordering, or dataset identity.
 
-Recommended archive command from `/kaggle/working`:
+---
 
-```bash
-tar -cf - Leo | pigz -1 -p "$(nproc)" > Leo_clean_mgpu.tar.gz
-```
+## Security
+
+Please do **not** publish exploitable security reports in a public issue. Follow [SECURITY.md](SECURITY.md) for responsible reporting guidance.
+
+---
+
+## License and external data
+
+Leo source code is licensed under the [Apache License 2.0](LICENSE).
+
+TinyStories is an external project/dataset. Its files, metadata, paper, and licensing are governed by their respective upstream terms. Leo's Apache-2.0 license does not relicense TinyStories.
+
+---
+
+## Acknowledgements
+
+Current public development/testing uses **TinyStories** by Ronen Eldan and Yuanzhi Li as a compact language-learning benchmark corpus. See the [dataset](https://huggingface.co/datasets/roneneldan/TinyStories) and [paper](https://arxiv.org/abs/2305.07759).
+
+If you use Leo in research, see [CITATION.cff](CITATION.cff).

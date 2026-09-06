@@ -1,0 +1,71 @@
+name: Bug report
+description: Report a reproducible Leo defect
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Do not include security exploit details here; use SECURITY.md instead.
+  - type: input
+    id: version
+    attributes:
+      label: Leo version / commit
+      description: Prefer the exact git commit hash.
+      placeholder: v1.0.0 / abc1234
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, rustc version, and CPU/GPU backend.
+      placeholder: Ubuntu 24.04, rustc 1.85.0, backend=gpu
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU / driver / CUDA
+      description: Required for GPU issues; otherwise write N/A.
+      placeholder: NVIDIA ..., driver ..., CUDA ...
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Include the smallest command/input sequence that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and logs
+      description: Remove secrets, private paths/data, and unnecessary large output.
+    validations:
+      required: true
+  - type: dropdown
+    id: tinystories
+    attributes:
+      label: Does this reproduce with the repository's pinned TinyStories preparation path?
+      options:
+        - Yes
+        - No
+        - Not tested
+        - Not applicable
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Validation
+      options:
+        - label: I searched existing issues first.
+          required: true
+        - label: This report does not contain a privately reportable security vulnerability.
+          required: true

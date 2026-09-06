@@ -1,0 +1,39 @@
+name: Feature request
+description: Propose a focused improvement to Leo
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What limitation are you trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the smallest useful solution.
+    validations:
+      required: true
+  - type: dropdown
+    id: semantics
+    attributes:
+      label: Would this intentionally change learning/artifact semantics?
+      options:
+        - No
+        - Yes
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Compatibility, quality, or reproducibility impact
+      description: Mention FP32/replay/batching/artifact/version implications when relevant.
+  - type: textarea
+    id: validation
+    attributes:
+      label: How should this be tested?
+      description: Include CPU/GPU/TinyStories/performance validation ideas when relevant.

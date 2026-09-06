@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use Leo in research, please cite the software repository and the exact commit used for your experiment."
+title: "Leo"
+type: software
+authors:
+  - name: "Leo Project contributors"
+repository-code: "https://github.com/saravanaspar/Leo"
+url: "https://github.com/saravanaspar/Leo"
+license: "Apache-2.0"
+version: "1.0.0"
