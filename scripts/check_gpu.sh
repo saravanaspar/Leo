@@ -22,7 +22,7 @@ done
   exit 2
 }
 
-./scripts/check.sh
+bash ./scripts/check.sh
 cargo build --release -p leo-cli
 LEO="$ROOT/target/release/leo"
 

@@ -132,6 +132,29 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("graph_launches", gpu_check)
 
 
+    def test_replay_prefix_uses_frozen_state_fast_path_without_changing_replay_budget(self):
+        training = (ROOT / "crates/leo-cli/src/training.rs").read_text()
+        backend = (ROOT / "crates/leo-core/src/backend.rs").read_text()
+        cuda = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+
+        self.assertIn("runtime.advance_frozen_batch(&prefix)?;", training)
+        self.assertIn("fn advance_frozen_batch", backend)
+        self.assertIn("leo_advance_frozen_persistent", cuda)
+        self.assertIn("leo_advance_frozen_persistent", kernels)
+        frozen_kernel = kernels.split(
+            'extern "C" __global__ void leo_advance_frozen_persistent', 1
+        )[0].rsplit("__device__ void leo_advance_frozen_story_block", 1)[1]
+        self.assertIn("leo_p_context_advance_history", frozen_kernel)
+        self.assertIn("leo_p_post_and_emit", frozen_kernel)
+        self.assertNotIn("leo_p_forward", frozen_kernel)
+        self.assertNotIn("leo_p_capture_training_step", frozen_kernel)
+        self.assertNotIn("leo_p_cache_surrogate", frozen_kernel)
+        self.assertIn("runtime.model().config.replay.fraction", training)
+        self.assertIn("runtime.model().config.replay.segment_bytes", training)
+        self.assertIn("let cleanup_after = index + 1 == ranges.len();", training)
+        self.assertIn("if cleanup_after {", training)
+
     def test_training_lifecycle_is_owned_by_training_module(self):
         main = (ROOT / "crates/leo-cli/src/main.rs").read_text()
         lifecycle = (ROOT / "crates/leo-cli/src/training/lifecycle.rs").read_text()
