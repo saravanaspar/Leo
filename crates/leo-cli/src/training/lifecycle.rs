@@ -5,10 +5,10 @@
 use super::dataset::{open_dataset, shuffled_story_order, StoryBatchPrefetcher};
 use super::resume::{
     advance_checkpoint_deadline, cleanup_training_resume_artifacts, commit_training_checkpoint,
-    load_resume_best_model, load_training_resume_for_model, persist_training_resume_for_saved_model,
-    resume_state_matches_model, save_training_resume_state, training_resume_path,
-    validate_training_resume_identity, TrainingResumeState, TRAINING_CHECKPOINT_INTERVAL,
-    TRAINING_CHECKPOINT_PREVIOUS_GENERATIONS,
+    load_resume_best_model, load_training_resume_for_model,
+    persist_training_resume_for_saved_model, resume_state_matches_model,
+    save_training_resume_state, training_resume_path, validate_training_resume_identity,
+    TrainingResumeState, TRAINING_CHECKPOINT_INTERVAL, TRAINING_CHECKPOINT_PREVIOUS_GENERATIONS,
 };
 use super::validation::{
     evaluate_model, meaningful_improvement, print_prediction_evaluation, update_best_validation,
@@ -16,7 +16,9 @@ use super::validation::{
 use super::TrainingEngine;
 use crate::json_escape;
 use leo_core::semantics::{EXECUTION_SEMANTICS_NAME, LEO_RELEASE_VERSION, TRAINING_POLICY_NAME};
-use leo_core::{available_gpu_devices, BackendKind, BackendRuntime, LeoError, LeoResult, Permission};
+use leo_core::{
+    available_gpu_devices, BackendKind, BackendRuntime, LeoError, LeoResult, Permission,
+};
 use leo_format::load_model;
 use std::env;
 use std::time::Instant;
@@ -52,7 +54,10 @@ pub(crate) fn run_training(request: TrainRequest<'_>) -> LeoResult<()> {
     let passes = request
         .passes
         .unwrap_or(runtime.model().config.training.max_dataset_passes);
-    let story_limit = request.story_limit.unwrap_or(dataset.len()).min(dataset.len());
+    let story_limit = request
+        .story_limit
+        .unwrap_or(dataset.len())
+        .min(dataset.len());
     let workers = request
         .workers
         .unwrap_or_else(|| if backend == BackendKind::Gpu { 64 } else { 1 });
@@ -235,17 +240,14 @@ pub(crate) fn run_training(request: TrainRequest<'_>) -> LeoResult<()> {
             }
             let next_input_bytes_seen = input_bytes_seen.saturating_add(batch_input_bytes);
             if next_position < story_limit {
-                let remaining_bytes = max_training_bytes
-                    .map(|limit| limit.saturating_sub(next_input_bytes_seen));
+                let remaining_bytes =
+                    max_training_bytes.map(|limit| limit.saturating_sub(next_input_bytes_seen));
                 prefetcher.request(next_position, workers, remaining_bytes)?;
             }
             input_bytes_seen = next_input_bytes_seen;
             let batch_started = Instant::now();
-            let report = training_engine.train_batch(
-                &mut runtime,
-                stories,
-                Permission::Training,
-            )?;
+            let report =
+                training_engine.train_batch(&mut runtime, stories, Permission::Training)?;
             let batch_seconds = batch_started.elapsed().as_secs_f64();
             let previous_presentations = presentations;
             presentations = presentations.saturating_add(report.stories);

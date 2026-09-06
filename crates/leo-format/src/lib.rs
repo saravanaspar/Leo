@@ -10,7 +10,7 @@ use leo_core::metrics::TrainingStatistics;
 use leo_core::model::{
     ContextProjection, InputProjection, Model, NeuronParameters, OutputProjection, SynapseArrays,
 };
-use leo_core::semantics::{CHECKPOINT_SCHEMA_VERSION, SemanticsContract};
+use leo_core::semantics::{SemanticsContract, CHECKPOINT_SCHEMA_VERSION};
 use leo_core::{Config, LeoError, LeoResult};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -205,10 +205,12 @@ fn prune_generations(path: &Path, keep_previous_generations: usize) -> LeoResult
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
-        .ok_or_else(|| LeoError::checkpoint_corrupt(format!(
-            "checkpoint path has no file name: {}",
-            path.display()
-        )))?
+        .ok_or_else(|| {
+            LeoError::checkpoint_corrupt(format!(
+                "checkpoint path has no file name: {}",
+                path.display()
+            ))
+        })?
         .to_string_lossy();
     let prefix = format!("{file_name}.gen");
     let mut generations = Vec::new();
@@ -303,13 +305,23 @@ fn encode_model(model: &Model) -> LeoResult<Vec<u8>> {
             kind: SectionKind::RecurrentTargets,
             payload: encode_recurrent_targets(&model.recurrent),
             dtype: DType::Bytes,
-            shape: [model.neuron_count() as u64, model.recurrent.capacity_per_neuron as u64, 0, 0],
+            shape: [
+                model.neuron_count() as u64,
+                model.recurrent.capacity_per_neuron as u64,
+                0,
+                0,
+            ],
         },
         EncodedSection {
             kind: SectionKind::RecurrentMetadata,
             payload: encode_recurrent_metadata(&model.recurrent),
             dtype: DType::Bytes,
-            shape: [model.neuron_count() as u64, model.recurrent.capacity_per_neuron as u64, 0, 0],
+            shape: [
+                model.neuron_count() as u64,
+                model.recurrent.capacity_per_neuron as u64,
+                0,
+                0,
+            ],
         },
         EncodedSection {
             kind: SectionKind::RecurrentWeights,
@@ -321,13 +333,23 @@ fn encode_model(model: &Model) -> LeoResult<Vec<u8>> {
             kind: SectionKind::InputProjection,
             payload: encode_input(&model.input),
             dtype: DType::Bytes,
-            shape: [leo_core::symbols::SYMBOL_COUNT as u64, model.input.fanout as u64, 0, 0],
+            shape: [
+                leo_core::symbols::SYMBOL_COUNT as u64,
+                model.input.fanout as u64,
+                0,
+                0,
+            ],
         },
         EncodedSection {
             kind: SectionKind::OutputWeights,
             payload: encode_vec_f32(&model.output.weights),
             dtype: DType::F32,
-            shape: [leo_core::symbols::OUTPUT_CLASSES as u64, model.neuron_count() as u64, 0, 0],
+            shape: [
+                leo_core::symbols::OUTPUT_CLASSES as u64,
+                model.neuron_count() as u64,
+                0,
+                0,
+            ],
         },
         EncodedSection {
             kind: SectionKind::OutputBias,
@@ -339,7 +361,12 @@ fn encode_model(model: &Model) -> LeoResult<Vec<u8>> {
             kind: SectionKind::ContextProjection,
             payload: encode_context(&model.context),
             dtype: DType::Bytes,
-            shape: [model.context.observations.len() as u64, model.config.context.embedding_dim as u64, leo_core::symbols::OUTPUT_CLASSES as u64, 0],
+            shape: [
+                model.context.observations.len() as u64,
+                model.config.context.embedding_dim as u64,
+                leo_core::symbols::OUTPUT_CLASSES as u64,
+                0,
+            ],
         },
         EncodedSection {
             kind: SectionKind::TrainingStatistics,
@@ -418,7 +445,9 @@ fn encode_model(model: &Model) -> LeoResult<Vec<u8>> {
 
 fn decode_model(bytes: &[u8]) -> LeoResult<Model> {
     if bytes.len() < HEADER_SIZE {
-        return Err(LeoError::checkpoint_corrupt("checkpoint is smaller than the v1 header"));
+        return Err(LeoError::checkpoint_corrupt(
+            "checkpoint is smaller than the v1 header",
+        ));
     }
     validate_header(&bytes[..HEADER_SIZE])?;
     let generation = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
@@ -430,13 +459,17 @@ fn decode_model(bytes: &[u8]) -> LeoResult<Model> {
         )));
     }
     if u32::from_le_bytes(bytes[28..32].try_into().unwrap()) != 0 {
-        return Err(LeoError::checkpoint_corrupt("unsupported checkpoint header flags"));
+        return Err(LeoError::checkpoint_corrupt(
+            "unsupported checkpoint header flags",
+        ));
     }
     let table_end = HEADER_SIZE
         .checked_add(section_count.saturating_mul(DESCRIPTOR_SIZE))
         .ok_or_else(|| LeoError::checkpoint_corrupt("descriptor table overflow"))?;
     if table_end > bytes.len() {
-        return Err(LeoError::checkpoint_corrupt("truncated checkpoint descriptor table"));
+        return Err(LeoError::checkpoint_corrupt(
+            "truncated checkpoint descriptor table",
+        ));
     }
     let payload_region_start = align_up(table_end, ALIGNMENT);
 
@@ -520,7 +553,8 @@ fn decode_model(bytes: &[u8]) -> LeoResult<Model> {
         ));
     }
 
-    let contract = decode_semantics_contract(required(&sections, SectionKind::SemanticsContract)?.payload)?;
+    let contract =
+        decode_semantics_contract(required(&sections, SectionKind::SemanticsContract)?.payload)?;
     if contract != SemanticsContract::CURRENT {
         return Err(LeoError::checkpoint_incompatible(format!(
             "checkpoint semantics {:?} do not match Leo v1.0.0 semantics {:?}",
@@ -550,7 +584,8 @@ fn decode_model(bytes: &[u8]) -> LeoResult<Model> {
         bias: decode_vec_f32(required(&sections, SectionKind::OutputBias)?.payload)?,
     };
     let context = decode_context(required(&sections, SectionKind::ContextProjection)?.payload)?;
-    let statistics = decode_statistics(required(&sections, SectionKind::TrainingStatistics)?.payload)?;
+    let statistics =
+        decode_statistics(required(&sections, SectionKind::TrainingStatistics)?.payload)?;
     let (section_generation, parameter_revision) =
         decode_generation(required(&sections, SectionKind::GenerationMetadata)?.payload)?;
     if section_generation != generation {
@@ -577,7 +612,9 @@ fn decode_model(bytes: &[u8]) -> LeoResult<Model> {
 
 fn validate_header(header: &[u8]) -> LeoResult<()> {
     if header.len() != HEADER_SIZE {
-        return Err(LeoError::checkpoint_corrupt("invalid checkpoint header size"));
+        return Err(LeoError::checkpoint_corrupt(
+            "invalid checkpoint header size",
+        ));
     }
     if &header[0..8] != MAGIC {
         return Err(LeoError::checkpoint_incompatible(
@@ -591,16 +628,25 @@ fn validate_header(header: &[u8]) -> LeoResult<()> {
         )));
     }
     if u32::from_le_bytes(header[12..16].try_into().unwrap()) != ENDIAN_MARKER {
-        return Err(LeoError::checkpoint_incompatible("unsupported checkpoint endianness"));
+        return Err(LeoError::checkpoint_incompatible(
+            "unsupported checkpoint endianness",
+        ));
     }
-    if header[48..HEADER_DIGEST_OFFSET].iter().any(|byte| *byte != 0) {
-        return Err(LeoError::checkpoint_corrupt("checkpoint header reserved bytes are nonzero"));
+    if header[48..HEADER_DIGEST_OFFSET]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(LeoError::checkpoint_corrupt(
+            "checkpoint header reserved bytes are nonzero",
+        ));
     }
     let declared = digest_from_slice(&header[HEADER_DIGEST_OFFSET..HEADER_SIZE]);
     let mut normalized = header.to_vec();
     normalized[HEADER_DIGEST_OFFSET..HEADER_SIZE].fill(0);
     if digest_bytes(&normalized) != declared {
-        return Err(LeoError::checkpoint_corrupt("checkpoint header SHA-256 mismatch"));
+        return Err(LeoError::checkpoint_corrupt(
+            "checkpoint header SHA-256 mismatch",
+        ));
     }
     Ok(())
 }
@@ -661,14 +707,63 @@ fn validate_shapes(
 ) -> LeoResult<()> {
     let expected = [
         (SectionKind::Config, [0, 0, 0, 0]),
-        (SectionKind::NeuronParameters, [model.neuron_count() as u64, 0, 0, 0]),
-        (SectionKind::RecurrentTargets, [model.neuron_count() as u64, model.recurrent.capacity_per_neuron as u64, 0, 0]),
-        (SectionKind::RecurrentMetadata, [model.neuron_count() as u64, model.recurrent.capacity_per_neuron as u64, 0, 0]),
-        (SectionKind::RecurrentWeights, [model.recurrent.weight.len() as u64, 0, 0, 0]),
-        (SectionKind::InputProjection, [leo_core::symbols::SYMBOL_COUNT as u64, model.input.fanout as u64, 0, 0]),
-        (SectionKind::OutputWeights, [leo_core::symbols::OUTPUT_CLASSES as u64, model.neuron_count() as u64, 0, 0]),
-        (SectionKind::OutputBias, [model.output.bias.len() as u64, 0, 0, 0]),
-        (SectionKind::ContextProjection, [model.context.observations.len() as u64, model.config.context.embedding_dim as u64, leo_core::symbols::OUTPUT_CLASSES as u64, 0]),
+        (
+            SectionKind::NeuronParameters,
+            [model.neuron_count() as u64, 0, 0, 0],
+        ),
+        (
+            SectionKind::RecurrentTargets,
+            [
+                model.neuron_count() as u64,
+                model.recurrent.capacity_per_neuron as u64,
+                0,
+                0,
+            ],
+        ),
+        (
+            SectionKind::RecurrentMetadata,
+            [
+                model.neuron_count() as u64,
+                model.recurrent.capacity_per_neuron as u64,
+                0,
+                0,
+            ],
+        ),
+        (
+            SectionKind::RecurrentWeights,
+            [model.recurrent.weight.len() as u64, 0, 0, 0],
+        ),
+        (
+            SectionKind::InputProjection,
+            [
+                leo_core::symbols::SYMBOL_COUNT as u64,
+                model.input.fanout as u64,
+                0,
+                0,
+            ],
+        ),
+        (
+            SectionKind::OutputWeights,
+            [
+                leo_core::symbols::OUTPUT_CLASSES as u64,
+                model.neuron_count() as u64,
+                0,
+                0,
+            ],
+        ),
+        (
+            SectionKind::OutputBias,
+            [model.output.bias.len() as u64, 0, 0, 0],
+        ),
+        (
+            SectionKind::ContextProjection,
+            [
+                model.context.observations.len() as u64,
+                model.config.context.embedding_dim as u64,
+                leo_core::symbols::OUTPUT_CLASSES as u64,
+                0,
+            ],
+        ),
         (SectionKind::TrainingStatistics, [9, 0, 0, 0]),
         (SectionKind::GenerationMetadata, [2, 0, 0, 0]),
         (SectionKind::SemanticsContract, [5, 0, 0, 0]),
@@ -714,10 +809,14 @@ fn encode_descriptor(output: &mut [u8], descriptor: &Descriptor) {
 
 fn decode_descriptor(input: &[u8]) -> LeoResult<Descriptor> {
     if input.len() != DESCRIPTOR_SIZE {
-        return Err(LeoError::checkpoint_corrupt("invalid checkpoint descriptor size"));
+        return Err(LeoError::checkpoint_corrupt(
+            "invalid checkpoint descriptor size",
+        ));
     }
     if input[104..128].iter().any(|byte| *byte != 0) {
-        return Err(LeoError::checkpoint_corrupt("checkpoint descriptor reserved bytes are nonzero"));
+        return Err(LeoError::checkpoint_corrupt(
+            "checkpoint descriptor reserved bytes are nonzero",
+        ));
     }
     let kind = SectionKind::from_u32(u32::from_le_bytes(input[0..4].try_into().unwrap()))?;
     let mut shape = [0u64; 4];
@@ -748,7 +847,9 @@ fn encode_generation(generation: u64, parameter_revision: u64) -> Vec<u8> {
 
 fn decode_generation(input: &[u8]) -> LeoResult<(u64, u64)> {
     if input.len() != 16 {
-        return Err(LeoError::checkpoint_corrupt("invalid generation metadata length"));
+        return Err(LeoError::checkpoint_corrupt(
+            "invalid generation metadata length",
+        ));
     }
     let mut reader = Reader::new(input);
     let generation = reader.u64()?;
@@ -767,7 +868,9 @@ fn encode_semantics_contract(contract: SemanticsContract) -> Vec<u8> {
 
 fn decode_semantics_contract(input: &[u8]) -> LeoResult<SemanticsContract> {
     if input.len() != 20 {
-        return Err(LeoError::checkpoint_corrupt("invalid semantics contract length"));
+        return Err(LeoError::checkpoint_corrupt(
+            "invalid semantics contract length",
+        ));
     }
     let mut values = [0u32; 5];
     for (index, value) in values.iter_mut().enumerate() {
@@ -1063,11 +1166,12 @@ impl<'a> Reader<'a> {
         if self.position == self.input.len() {
             Ok(())
         } else {
-            Err(LeoError::checkpoint_corrupt("unexpected trailing checkpoint data"))
+            Err(LeoError::checkpoint_corrupt(
+                "unexpected trailing checkpoint data",
+            ))
         }
     }
 }
-
 
 fn align_up(value: usize, alignment: usize) -> usize {
     value

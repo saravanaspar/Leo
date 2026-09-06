@@ -348,11 +348,6 @@ impl Runtime {
         }
     }
 
-    pub(crate) fn output_weight_cache(&mut self) -> &[f32] {
-        self.ensure_output_weight_cache();
-        &self.output_weights_by_neuron
-    }
-
     pub fn begin_document(&mut self) {
         self.reset_transient_state();
     }
@@ -433,7 +428,9 @@ impl Runtime {
         permission: Permission,
     ) -> LeoResult<StepMetrics> {
         if !is_input_symbol(symbol) {
-            return Err(LeoError::internal(format!("invalid input symbol: {symbol}")));
+            return Err(LeoError::internal(format!(
+                "invalid input symbol: {symbol}"
+            )));
         }
         let target_index = target
             .map(|value| {
@@ -1257,7 +1254,9 @@ impl Runtime {
             let delta = bounded_delta(raw_delta, maximum_update);
             self.model.output.bias[output] += delta;
             if !self.model.output.bias[output].is_finite() {
-                return Err(LeoError::numerical(format!("output bias {output} became non-finite")));
+                return Err(LeoError::numerical(format!(
+                    "output bias {output} became non-finite"
+                )));
             }
         }
         if self.context_applied_this_step {
@@ -1304,7 +1303,9 @@ impl Runtime {
                 let updated = (self.model.context.output_weights[row + dimension] + delta)
                     .clamp(weight_min, weight_max);
                 if !updated.is_finite() {
-                    return Err(LeoError::numerical("non-finite context output update rejected"));
+                    return Err(LeoError::numerical(
+                        "non-finite context output update rejected",
+                    ));
                 }
                 self.model.context.output_weights[row + dimension] = updated;
             }

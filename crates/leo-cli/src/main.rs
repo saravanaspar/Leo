@@ -4,28 +4,24 @@ use leo_core::symbols::{
 };
 use leo_core::utf8::Utf8State;
 use leo_core::{
-    available_gpu_devices, BackendCapabilities, BackendKind, BackendRuntime, ArtifactDigest, Config,
-    DeviceModelLayout, LeoError, LeoErrorKind, LeoResult, Model, Permission, Sha256,
+    available_gpu_devices, ArtifactDigest, BackendCapabilities, BackendKind, BackendRuntime,
+    Config, DeviceModelLayout, LeoError, LeoErrorKind, LeoResult, Model, Permission, Sha256,
 };
-use leo_format::{
-    checkpoint_hash, commit_model, load_model, rollback_model,
-    save_model_atomic,
-};
+use leo_format::{checkpoint_hash, commit_model, load_model, rollback_model, save_model_atomic};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
-use std::fs;
 use std::time::Instant;
 
 mod training;
 
-use training::{
-    evaluate_model, open_dataset, print_learning_quality, print_prediction_evaluation,
-    replay_target_range, run_training, train_document_pass, train_story_batch,
-    ActivityDiagnostics, StoryBatchPrefetcher, TrainRequest,
-};
 #[cfg(test)]
 use training::{
     advance_checkpoint_deadline, read_story_batch, shuffled_story_order, TrainingResumeState,
+};
+use training::{
+    evaluate_model, open_dataset, print_learning_quality, print_prediction_evaluation,
+    replay_target_range, run_training, train_document_pass, train_story_batch, ActivityDiagnostics,
+    StoryBatchPrefetcher, TrainRequest,
 };
 
 fn main() {
@@ -51,7 +47,16 @@ fn run() -> LeoResult<()> {
 
     if !matches!(
         command.as_str(),
-        "init" | "train" | "eval" | "prompt" | "teach" | "inspect" | "checkpoint" | "rollback" | "benchmark" | "backend"
+        "init"
+            | "train"
+            | "eval"
+            | "prompt"
+            | "teach"
+            | "inspect"
+            | "checkpoint"
+            | "rollback"
+            | "benchmark"
+            | "backend"
     ) {
         return Err(LeoError::usage(format!("unknown command: {command}")));
     }
@@ -140,12 +145,8 @@ fn command_eval(arguments: &Arguments) -> LeoResult<()> {
     {
         let train_story_limit = arguments.optional_usize("train-stories")?;
         let training_dataset = open_dataset(train_bytes, train_index, "training evaluation")?;
-        let training = evaluate_model(
-            model.clone(),
-            &training_dataset,
-            train_story_limit,
-            backend,
-        )?;
+        let training =
+            evaluate_model(model.clone(), &training_dataset, train_story_limit, backend)?;
         print_prediction_evaluation("training_evaluation", &training);
         print_learning_quality(&training, &held_out);
     }
@@ -530,8 +531,7 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
         let mut weighted_loss = 0.0f64;
         let mut targets = 0u64;
         let story_order: Vec<usize> = (0..story_limit).collect();
-        let prefetcher =
-            StoryBatchPrefetcher::spawn(&dataset, story_order, "training benchmark")?;
+        let prefetcher = StoryBatchPrefetcher::spawn(&dataset, story_order, "training benchmark")?;
         if position < story_limit {
             let remaining_bytes = max_input_bytes.map(|limit| limit.saturating_sub(input_bytes));
             prefetcher.request(position, workers, remaining_bytes)?;
@@ -1151,7 +1151,14 @@ fn command_schema(command: &str) -> Option<CommandSchema> {
             flags: &[],
         },
         "prompt" => CommandSchema {
-            values: &["model", "text", "max-bytes", "temperature", "seed", "backend"],
+            values: &[
+                "model",
+                "text",
+                "max-bytes",
+                "temperature",
+                "seed",
+                "backend",
+            ],
             flags: &["json"],
         },
         "teach" => CommandSchema {
@@ -1171,7 +1178,15 @@ fn command_schema(command: &str) -> Option<CommandSchema> {
             flags: &[],
         },
         "benchmark" => CommandSchema {
-            values: &["model", "index", "bytes", "stories", "max-bytes", "workers", "backend"],
+            values: &[
+                "model",
+                "index",
+                "bytes",
+                "stories",
+                "max-bytes",
+                "workers",
+                "backend",
+            ],
             flags: &["train"],
         },
         "backend" => CommandSchema {
@@ -1293,12 +1308,13 @@ impl Arguments {
 
 #[cfg(test)]
 mod tests {
+    use super::training::{ranges_overlap, select_replay_ranges};
     use super::{
         adjusted_generation_weight, advance_checkpoint_deadline, allowed_output,
         backend_from_arguments, is_help_command, prime_document_prefix, read_story_batch,
-        shuffled_story_order, train_story_batch, Arguments, TrainingResumeState,
+        shuffled_story_order, train_story_batch, Arguments, StoryBatchPrefetcher,
+        TrainingResumeState,
     };
-    use super::training::{ranges_overlap, select_replay_ranges};
     use leo_core::symbols::{BEGIN_DOCUMENT, END_DOCUMENT_OUTPUT_INDEX};
     use leo_core::utf8::Utf8State;
     use leo_core::{BackendKind, BackendRuntime, Config, Model, Permission, Runtime};
@@ -1330,11 +1346,7 @@ mod tests {
     fn command_schema_accepts_flags_without_values() {
         let arguments = Arguments::parse_for(
             "benchmark",
-            vec![
-                "--train".to_owned(),
-                "--workers".to_owned(),
-                "4".to_owned(),
-            ],
+            vec!["--train".to_owned(), "--workers".to_owned(), "4".to_owned()],
         )
         .unwrap();
         assert!(arguments.flag("train"));
@@ -1343,11 +1355,9 @@ mod tests {
 
     #[test]
     fn command_schema_rejects_unknown_and_duplicate_options() {
-        assert!(Arguments::parse_for(
-            "train",
-            vec!["--wrokers".to_owned(), "4".to_owned()],
-        )
-        .is_err());
+        assert!(
+            Arguments::parse_for("train", vec!["--wrokers".to_owned(), "4".to_owned()],).is_err()
+        );
         assert!(Arguments::parse_for(
             "train",
             vec![
@@ -1394,11 +1404,9 @@ mod tests {
 
     #[test]
     fn backend_argument_uses_the_shared_backend_parser() {
-        let arguments = Arguments::parse_for(
-            "backend",
-            vec!["--backend".to_owned(), "gpu".to_owned()],
-        )
-        .unwrap();
+        let arguments =
+            Arguments::parse_for("backend", vec!["--backend".to_owned(), "gpu".to_owned()])
+                .unwrap();
         assert_eq!(
             backend_from_arguments(&arguments).unwrap(),
             BackendKind::Gpu
@@ -1454,10 +1462,8 @@ mod tests {
 
     #[test]
     fn prefetched_story_batch_matches_synchronous_reader() {
-        let base = std::env::temp_dir().join(format!(
-            "leo-cli-prefetch-batch-{}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("leo-cli-prefetch-batch-{}", std::process::id()));
         let bytes = base.with_extension("bytes");
         let index = base.with_extension("idx");
         fs::write(&bytes, b"onetwothree").unwrap();
@@ -1487,8 +1493,7 @@ mod tests {
 
         let mut synchronous = PreparedDataset::open(&bytes, &index).unwrap();
         let order = vec![2usize, 0, 1];
-        let expected =
-            read_story_batch(&mut synchronous, &order, 0, 3, Some(8), "test").unwrap();
+        let expected = read_story_batch(&mut synchronous, &order, 0, 3, Some(8), "test").unwrap();
 
         let dataset = PreparedDataset::open(&bytes, &index).unwrap();
         let prefetcher = StoryBatchPrefetcher::spawn(&dataset, order, "test").unwrap();

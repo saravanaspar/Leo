@@ -316,12 +316,7 @@ impl MultiGpuBatchTrainer {
         }
 
         canonical.enable_parameter_tracking();
-        let replay = apply_batch_replay_policy(
-            canonical,
-            &stories,
-            &losses_by_story,
-            permission,
-        )?;
+        let replay = apply_batch_replay_policy(canonical, &stories, &losses_by_story, permission)?;
         activity.add(replay.activity);
 
         if replay.replay_steps > 0 {
@@ -331,15 +326,15 @@ impl MultiGpuBatchTrainer {
                 let mut handles = Vec::with_capacity(device_count);
                 for worker in &mut self.runtimes[..device_count] {
                     let changes = &replay_changes;
-                    handles.push(scope.spawn(move || {
-                        worker.synchronize_sparse_model(canonical_model, changes)
-                    }));
+                    handles.push(
+                        scope.spawn(move || {
+                            worker.synchronize_sparse_model(canonical_model, changes)
+                        }),
+                    );
                 }
                 for handle in handles {
                     handle.join().map_err(|_| {
-                        LeoError::internal(
-                            "multi-GPU replay synchronization worker panicked",
-                        )
+                        LeoError::internal("multi-GPU replay synchronization worker panicked")
                     })??;
                 }
                 Ok::<_, LeoError>(())
@@ -523,7 +518,8 @@ pub(crate) fn train_story_batch(
                 }
                 losses_by_story.push(losses);
             }
-            let replay = apply_batch_replay_policy(runtime, &stories, &losses_by_story, permission)?;
+            let replay =
+                apply_batch_replay_policy(runtime, &stories, &losses_by_story, permission)?;
             activity.add(replay.activity);
             return Ok(BatchTrainingReport {
                 mean_loss: loss_sum / targets.max(1) as f64,
@@ -579,12 +575,8 @@ pub(crate) fn train_story_batch(
         activity.add(report.activity);
         losses_by_story.push(report.losses);
     }
-    let replay = apply_batch_replay_policy(
-        runtime,
-        &trained_stories,
-        &losses_by_story,
-        permission,
-    )?;
+    let replay =
+        apply_batch_replay_policy(runtime, &trained_stories, &losses_by_story, permission)?;
     activity.add(replay.activity);
 
     Ok(BatchTrainingReport {
@@ -656,11 +648,7 @@ pub(crate) fn select_replay_ranges(
     fraction: f32,
     segment_targets: usize,
 ) -> Vec<std::ops::Range<usize>> {
-    if losses.is_empty()
-        || !fraction.is_finite()
-        || fraction <= 0.0
-        || segment_targets == 0
-    {
+    if losses.is_empty() || !fraction.is_finite() || fraction <= 0.0 || segment_targets == 0 {
         return Vec::new();
     }
 
@@ -705,7 +693,10 @@ pub(crate) fn select_replay_ranges(
     selected
 }
 
-pub(crate) fn ranges_overlap(left: &std::ops::Range<usize>, right: &std::ops::Range<usize>) -> bool {
+pub(crate) fn ranges_overlap(
+    left: &std::ops::Range<usize>,
+    right: &std::ops::Range<usize>,
+) -> bool {
     left.start < right.end && right.start < left.end
 }
 
@@ -758,4 +749,3 @@ pub(crate) fn replay_target_range(
     runtime.reset_transient_state()?;
     Ok(activity)
 }
-

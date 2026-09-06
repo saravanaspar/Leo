@@ -211,8 +211,9 @@ impl Config {
     }
 
     pub fn from_toml(text: &str) -> LeoResult<Self> {
-        let config = toml::from_str::<Self>(text)
-            .map_err(|error| LeoError::configuration(format!("invalid TOML configuration: {error}")))?;
+        let config = toml::from_str::<Self>(text).map_err(|error| {
+            LeoError::configuration(format!("invalid TOML configuration: {error}"))
+        })?;
         config.validate()?;
         Ok(config)
     }
@@ -260,7 +261,9 @@ impl Config {
             ));
         }
         if self.model.input_fanout > self.model.neuron_count {
-            return Err(LeoError::configuration("input_fanout cannot exceed neuron_count"));
+            return Err(LeoError::configuration(
+                "input_fanout cannot exceed neuron_count",
+            ));
         }
         if self.model.max_active_per_block == 0
             || self.model.max_active_per_block > self.model.neurons_per_block
@@ -332,7 +335,9 @@ impl Config {
             ("max_update", self.learning.max_update),
         ] {
             if !value.is_finite() || value <= 0.0 {
-                return Err(LeoError::configuration(format!("{name} must be finite and positive")));
+                return Err(LeoError::configuration(format!(
+                    "{name} must be finite and positive"
+                )));
             }
         }
         if !self.dynamics.target_activity.is_finite()
@@ -388,7 +393,9 @@ impl Config {
             ("verified_strength", self.learning.verified_strength),
         ] {
             if !strength.is_finite() || !(0.0..=1.0).contains(&strength) || strength == 0.0 {
-                return Err(LeoError::configuration(format!("{name} must be finite and in (0, 1]")));
+                return Err(LeoError::configuration(format!(
+                    "{name} must be finite and in (0, 1]"
+                )));
             }
         }
 
@@ -403,10 +410,14 @@ impl Config {
             ));
         }
         if self.context.embedding_dim > 256 {
-            return Err(LeoError::configuration("context.embedding_dim cannot exceed 256"));
+            return Err(LeoError::configuration(
+                "context.embedding_dim cannot exceed 256",
+            ));
         }
         if self.context.max_order > 16 {
-            return Err(LeoError::configuration("context.max_order cannot exceed 16"));
+            return Err(LeoError::configuration(
+                "context.max_order cannot exceed 16",
+            ));
         }
         if self.context.probe_limit > self.context.slots_per_order {
             return Err(LeoError::configuration(
@@ -449,14 +460,18 @@ impl Config {
             || self.replay.teaching_replays == 0
             || self.replay.max_verified_replays == 0
         {
-            return Err(LeoError::configuration("all replay limits must be positive"));
+            return Err(LeoError::configuration(
+                "all replay limits must be positive",
+            ));
         }
         if self.training.max_dataset_passes == 0
             || self.training.validate_every_bytes == 0
             || self.training.checkpoint_every_bytes == 0
             || self.training.early_stop_checks == 0
         {
-            return Err(LeoError::configuration("all training limits must be positive"));
+            return Err(LeoError::configuration(
+                "all training limits must be positive",
+            ));
         }
         if !self.training.minimum_relative_improvement.is_finite()
             || self.training.minimum_relative_improvement < 0.0

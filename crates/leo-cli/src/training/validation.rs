@@ -2,7 +2,10 @@
 
 use super::metrics::{ActivityDiagnostics, EvaluationMetrics};
 use leo_core::symbols::{BEGIN_DOCUMENT, END_DOCUMENT};
-use leo_core::{available_gpu_devices, BackendKind, BackendRuntime, LeoError, LeoResult, Model, Permission, StepMetrics};
+use leo_core::{
+    available_gpu_devices, BackendKind, BackendRuntime, LeoError, LeoResult, Model, Permission,
+    StepMetrics,
+};
 use leo_data::PreparedDataset;
 use std::thread;
 
@@ -38,13 +41,7 @@ pub(crate) fn evaluate_model(
                 LeoError::dataset(format!("cannot clone verified evaluation dataset: {error}"))
             })?;
             handles.push(thread::spawn(move || {
-                evaluate_model_shard(
-                    runtime,
-                    shard_dataset,
-                    limit,
-                    shard_index,
-                    gpu_devices,
-                )
+                evaluate_model_shard(runtime, shard_dataset, limit, shard_index, gpu_devices)
             }));
         }
 
@@ -162,7 +159,6 @@ fn record_evaluation_step(
     activity.record(metrics);
 }
 
-
 pub(crate) fn print_prediction_evaluation(event: &str, metrics: &EvaluationMetrics) {
     let context_gain = metrics
         .activity
@@ -207,7 +203,6 @@ pub(crate) fn print_learning_quality(training: &EvaluationMetrics, held_out: &Ev
     );
 }
 
-
 pub(crate) fn update_best_validation(
     current_model: &Model,
     validation: &EvaluationMetrics,
@@ -228,4 +223,3 @@ pub(crate) fn meaningful_improvement(previous: f64, current: f64, minimum_relati
     }
     current < previous && (previous - current) / previous.abs().max(1.0e-12) >= minimum_relative
 }
-

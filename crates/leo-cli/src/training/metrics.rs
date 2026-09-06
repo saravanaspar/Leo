@@ -210,4 +210,3 @@ impl EvaluationMetrics {
         self.activity.add(other.activity);
     }
 }
-

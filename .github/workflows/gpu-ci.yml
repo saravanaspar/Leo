@@ -44,4 +44,4 @@ jobs:
         env:
           CI: '1'
           LEO_CACHE_DIR: ${{ runner.temp }}/leo-cache
-        run: ./scripts/check_gpu.sh
+        run: bash ./scripts/check_gpu.sh

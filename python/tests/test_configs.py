@@ -146,7 +146,7 @@ class IntegratedConfigTests(unittest.TestCase):
         self.assertIn("batched_documents: true", backend)
         self.assertIn("training_story_batch", backend)
         self.assertIn("GPU_STORY_BATCH_MAX_LANES", cuda)
-        self.assertIn("cuMemcpyDtoDAsync", cuda)
+        self.assertNotIn("cuMemcpyDtoDAsync", cuda)
         self.assertIn("nvrtcCompileProgram", cuda)
         self.assertIn("cuLaunchKernel", cuda)
         self.assertIn("include_str!(\"cuda_kernels.cu\")", cuda)

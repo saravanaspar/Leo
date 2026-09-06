@@ -268,7 +268,9 @@ impl Model {
             || self.context.observations.len() != context_slots
             || self.context.output_weights.len() != context_output_count
         {
-            return Err(LeoError::internal("model tensor dimensions are incompatible"));
+            return Err(LeoError::internal(
+                "model tensor dimensions are incompatible",
+            ));
         }
 
         let float_vectors: [&[f32]; 8] = [

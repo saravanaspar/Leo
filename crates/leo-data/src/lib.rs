@@ -98,10 +98,18 @@ impl PreparedDataset {
         let records_len = usize::try_from(record_count)
             .ok()
             .and_then(|count| count.checked_mul(INDEX_RECORD_SIZE))
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "dataset record table overflow"))?;
-        let expected_len = INDEX_HEADER_SIZE
-            .checked_add(records_len)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "dataset index length overflow"))?;
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "dataset record table overflow",
+                )
+            })?;
+        let expected_len = INDEX_HEADER_SIZE.checked_add(records_len).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "dataset index length overflow",
+            )
+        })?;
         if raw.len() != expected_len {
             return invalid_data(format!(
                 "dataset index length mismatch: expected {expected_len}, got {}",
@@ -138,12 +146,21 @@ impl PreparedDataset {
             let end = entry
                 .offset
                 .checked_add(entry.length as u64)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "dataset story range overflow"))?;
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "dataset story range overflow",
+                    )
+                })?;
             if end > bytes_length {
-                return invalid_data(format!("dataset story {record_index} extends past the bytes file"));
+                return invalid_data(format!(
+                    "dataset story {record_index} extends past the bytes file"
+                ));
             }
             if entry.offset < previous_end {
-                return invalid_data(format!("dataset story {record_index} overlaps a previous story"));
+                return invalid_data(format!(
+                    "dataset story {record_index} overlaps a previous story"
+                ));
             }
             previous_end = end;
             entries.push(entry);
@@ -250,7 +267,12 @@ pub fn write_index(
         let end = entry
             .offset
             .checked_add(entry.length as u64)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "dataset story range overflow"))?;
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "dataset story range overflow",
+                )
+            })?;
         if entry.offset < previous_end || end > bytes_length {
             return invalid_data(format!("invalid range for dataset story {index}"));
         }

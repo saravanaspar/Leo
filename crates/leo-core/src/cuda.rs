@@ -51,8 +51,6 @@ const CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH: c_int = 95;
 const CUDA_KERNEL_BODY: &str = include_str!("cuda_kernels.cu");
 const CUDA_ABI_HEADER: &str = include_str!(concat!(env!("OUT_DIR"), "/leo_cuda_abi.h"));
 include!(concat!(env!("OUT_DIR"), "/cuda_abi_generated.rs"));
-const _: [(); CUDA_ABI_GENERATED_VERSION as usize] =
-    [(); crate::semantics::CUDA_ABI_VERSION as usize];
 
 fn cuda_kernel_source() -> String {
     let mut source = String::with_capacity(CUDA_ABI_HEADER.len() + CUDA_KERNEL_BODY.len() + 1);
@@ -62,12 +60,12 @@ fn cuda_kernel_source() -> String {
     source
 }
 
-
 impl CudaConfig {
     fn from_model(model: &Model) -> LeoResult<Self> {
         let c = &model.config;
         let to_u32 = |name: &str, value: usize| {
-            u32::try_from(value).map_err(|_| LeoError::cuda(format!("{name} exceeds CUDA u32 capacity")))
+            u32::try_from(value)
+                .map_err(|_| LeoError::cuda(format!("{name} exceeds CUDA u32 capacity")))
         };
         let refractory_ticks = u32::try_from(c.dynamics.refractory_ticks)
             .map_err(|_| LeoError::cuda("refractory_ticks exceeds CUDA u32 capacity"))?;
@@ -212,7 +210,6 @@ type CuMemcpyHtoD = unsafe extern "C" fn(CuDevicePtr, *const c_void, usize) -> c
 type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, CuDevicePtr, usize) -> c_int;
 type CuMemcpyHtoDAsync = unsafe extern "C" fn(CuDevicePtr, *const c_void, usize, CuStream) -> c_int;
 type CuMemcpyDtoHAsync = unsafe extern "C" fn(*mut c_void, CuDevicePtr, usize, CuStream) -> c_int;
-type CuMemcpyDtoDAsync = unsafe extern "C" fn(CuDevicePtr, CuDevicePtr, usize, CuStream) -> c_int;
 type CuLaunchKernel = unsafe extern "C" fn(
     CuFunction,
     c_uint,
@@ -321,7 +318,9 @@ impl DynamicLibrary {
 
     fn symbol_optional(&self, names: &[&str]) -> Option<*mut c_void> {
         for name in names {
-            let Ok(symbol) = CString::new(*name) else { continue; };
+            let Ok(symbol) = CString::new(*name) else {
+                continue;
+            };
             let address = unsafe { dlsym(self.handle, symbol.as_ptr()) };
             if !address.is_null() {
                 return Some(address);
@@ -394,7 +393,6 @@ struct DriverFunctions {
     memcpy_dtoh: CuMemcpyDtoH,
     memcpy_htod_async: CuMemcpyHtoDAsync,
     memcpy_dtoh_async: CuMemcpyDtoHAsync,
-    memcpy_dtod_async: CuMemcpyDtoDAsync,
     launch_kernel: CuLaunchKernel,
     launch_cooperative_kernel: CuLaunchCooperativeKernel,
     occupancy_max_active_blocks_per_multiprocessor: CuOccupancyMaxActiveBlocksPerMultiprocessor,
@@ -415,15 +413,27 @@ impl DriverFunctions {
         let library = DynamicLibrary::open(&["libcuda.so.1", "libcuda.so"])?;
         Ok(Arc::new(Self {
             init: load_function!(library, &["cuInit"], CuInit),
-            driver_get_version: load_function!(library, &["cuDriverGetVersion"], CuDriverGetVersion),
+            driver_get_version: load_function!(
+                library,
+                &["cuDriverGetVersion"],
+                CuDriverGetVersion
+            ),
             device_get_name: load_function!(library, &["cuDeviceGetName"], CuDeviceGetName),
-            device_get_uuid: load_optional_function!(library, &["cuDeviceGetUuid_v2", "cuDeviceGetUuid"], CuDeviceGetUuid),
+            device_get_uuid: load_optional_function!(
+                library,
+                &["cuDeviceGetUuid_v2", "cuDeviceGetUuid"],
+                CuDeviceGetUuid
+            ),
             device_get_pci_bus_id: load_function!(
                 library,
                 &["cuDeviceGetPCIBusId"],
                 CuDeviceGetPciBusId
             ),
-            device_total_mem: load_function!(library, &["cuDeviceTotalMem_v2", "cuDeviceTotalMem"], CuDeviceTotalMem),
+            device_total_mem: load_function!(
+                library,
+                &["cuDeviceTotalMem_v2", "cuDeviceTotalMem"],
+                CuDeviceTotalMem
+            ),
             device_get_count: load_function!(library, &["cuDeviceGetCount"], CuDeviceGetCount),
             device_get: load_function!(library, &["cuDeviceGet"], CuDeviceGet),
             device_get_attribute: load_function!(
@@ -451,10 +461,18 @@ impl DriverFunctions {
             ),
             stream_wait_event: load_function!(library, &["cuStreamWaitEvent"], CuStreamWaitEvent),
             event_create: load_function!(library, &["cuEventCreate"], CuEventCreate),
-            event_destroy: load_function!(library, &["cuEventDestroy_v2", "cuEventDestroy"], CuEventDestroy),
+            event_destroy: load_function!(
+                library,
+                &["cuEventDestroy_v2", "cuEventDestroy"],
+                CuEventDestroy
+            ),
             event_record: load_function!(library, &["cuEventRecord"], CuEventRecord),
             event_synchronize: load_function!(library, &["cuEventSynchronize"], CuEventSynchronize),
-            event_elapsed_time: load_function!(library, &["cuEventElapsedTime"], CuEventElapsedTime),
+            event_elapsed_time: load_function!(
+                library,
+                &["cuEventElapsedTime"],
+                CuEventElapsedTime
+            ),
             module_load_data: load_function!(library, &["cuModuleLoadData"], CuModuleLoadData),
             module_unload: load_function!(library, &["cuModuleUnload"], CuModuleUnload),
             module_get_function: load_function!(
@@ -464,7 +482,11 @@ impl DriverFunctions {
             ),
             mem_alloc: load_function!(library, &["cuMemAlloc_v2", "cuMemAlloc"], CuMemAlloc),
             mem_free: load_function!(library, &["cuMemFree_v2", "cuMemFree"], CuMemFree),
-            mem_alloc_host: load_function!(library, &["cuMemAllocHost_v2", "cuMemAllocHost"], CuMemAllocHost),
+            mem_alloc_host: load_function!(
+                library,
+                &["cuMemAllocHost_v2", "cuMemAllocHost"],
+                CuMemAllocHost
+            ),
             mem_free_host: load_function!(library, &["cuMemFreeHost"], CuMemFreeHost),
             memset_d8: load_function!(library, &["cuMemsetD8_v2", "cuMemsetD8"], CuMemsetD8),
             memset_d32: load_function!(library, &["cuMemsetD32_v2", "cuMemsetD32"], CuMemsetD32),
@@ -490,11 +512,6 @@ impl DriverFunctions {
                 &["cuMemcpyDtoHAsync_v2", "cuMemcpyDtoHAsync"],
                 CuMemcpyDtoHAsync
             ),
-            memcpy_dtod_async: load_function!(
-                library,
-                &["cuMemcpyDtoDAsync_v2", "cuMemcpyDtoDAsync"],
-                CuMemcpyDtoDAsync
-            ),
             launch_kernel: load_function!(library, &["cuLaunchKernel"], CuLaunchKernel),
             launch_cooperative_kernel: load_function!(
                 library,
@@ -507,12 +524,28 @@ impl DriverFunctions {
                 CuOccupancyMaxActiveBlocksPerMultiprocessor
             ),
             get_error_string: load_function!(library, &["cuGetErrorString"], CuGetErrorString),
-            stream_begin_capture: load_optional_function!(library, &["cuStreamBeginCapture"], CuStreamBeginCapture),
-            stream_end_capture: load_optional_function!(library, &["cuStreamEndCapture"], CuStreamEndCapture),
-            graph_instantiate_with_flags: load_optional_function!(library, &["cuGraphInstantiateWithFlags"], CuGraphInstantiateWithFlags),
+            stream_begin_capture: load_optional_function!(
+                library,
+                &["cuStreamBeginCapture"],
+                CuStreamBeginCapture
+            ),
+            stream_end_capture: load_optional_function!(
+                library,
+                &["cuStreamEndCapture"],
+                CuStreamEndCapture
+            ),
+            graph_instantiate_with_flags: load_optional_function!(
+                library,
+                &["cuGraphInstantiateWithFlags"],
+                CuGraphInstantiateWithFlags
+            ),
             graph_launch: load_optional_function!(library, &["cuGraphLaunch"], CuGraphLaunch),
             graph_destroy: load_optional_function!(library, &["cuGraphDestroy"], CuGraphDestroy),
-            graph_exec_destroy: load_optional_function!(library, &["cuGraphExecDestroy"], CuGraphExecDestroy),
+            graph_exec_destroy: load_optional_function!(
+                library,
+                &["cuGraphExecDestroy"],
+                CuGraphExecDestroy
+            ),
             _library: library,
         }))
     }
@@ -624,7 +657,6 @@ struct KernelFunctions {
     forward: CuFunction,
     capture_training_step: CuFunction,
     train_persistent: CuFunction,
-    train_story_batch: CuFunction,
     shared_wavefront_pre: CuFunction,
     shared_wavefront_fused: CuFunction,
     shared_select_blocks: CuFunction,
@@ -711,10 +743,13 @@ fn query_cuda_hardware_identity(
         let mut raw = CuUuid::default();
         let result = unsafe { device_get_uuid(&mut raw, device) };
         if result == CUDA_SUCCESS {
-            raw.bytes
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
+            let mut encoded = String::with_capacity(raw.bytes.len() * 2);
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            for byte in raw.bytes {
+                encoded.push(HEX[(byte >> 4) as usize] as char);
+                encoded.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+            encoded
         } else {
             // Older drivers may expose the symbol but reject UUID lookup for
             // specific virtualized devices. The rest of the identity remains
@@ -844,7 +879,9 @@ fn create_runtime_events(driver: &DriverFunctions) -> LeoResult<CudaRuntimeEvent
     })();
     if result.is_err() {
         for event in created {
-            unsafe { (driver.event_destroy)(event); }
+            unsafe {
+                (driver.event_destroy)(event);
+            }
         }
     }
     result
@@ -1455,16 +1492,28 @@ impl CudaRuntime {
         )?;
         let kernels = load_kernels(&driver, module)?;
         let fused_blocks_128 = cooperative_grid_capacity(
-            &driver, kernels.shared_wavefront_fused, cooperative_launch != 0,
-            multiprocessor_count, 128, "fused wavefront 128",
+            &driver,
+            kernels.shared_wavefront_fused,
+            cooperative_launch != 0,
+            multiprocessor_count,
+            128,
+            "fused wavefront 128",
         )?;
         let fused_blocks_256 = cooperative_grid_capacity(
-            &driver, kernels.shared_wavefront_fused, cooperative_launch != 0,
-            multiprocessor_count, 256, "fused wavefront 256",
+            &driver,
+            kernels.shared_wavefront_fused,
+            cooperative_launch != 0,
+            multiprocessor_count,
+            256,
+            "fused wavefront 256",
         )?;
         let fused_blocks_512 = cooperative_grid_capacity(
-            &driver, kernels.shared_wavefront_fused, cooperative_launch != 0,
-            multiprocessor_count, 512, "fused wavefront 512",
+            &driver,
+            kernels.shared_wavefront_fused,
+            cooperative_launch != 0,
+            multiprocessor_count,
+            512,
+            "fused wavefront 512",
         )?;
         let persistent_grid_blocks = if cooperative_launch != 0 && multiprocessor_count > 0 {
             let mut active_blocks_per_sm = 0;
@@ -1606,6 +1655,8 @@ impl CudaRuntime {
         Ok(fork)
     }
 
+    // Sequential fallible allocation keeps partial-resource cleanup explicit and auditable.
+    #[allow(clippy::field_reassign_with_default)]
     pub(crate) fn allocate_shared_batch_lane(&mut self) -> LeoResult<CudaBatchLane> {
         self.make_current()?;
         let n = self.model.neuron_count();
@@ -1718,13 +1769,14 @@ impl CudaRuntime {
                 TRAINING_STEP_BATCH_CAPACITY.saturating_mul(mem::size_of::<CudaPersistentStep>()),
             )?,
             host_records: self.allocate_pinned_host(
-                TRAINING_STEP_BATCH_CAPACITY.saturating_mul(mem::size_of::<CudaTrainingStepRecord>()),
+                TRAINING_STEP_BATCH_CAPACITY
+                    .saturating_mul(mem::size_of::<CudaTrainingStepRecord>()),
             )?,
         };
         self.reset_shared_batch_lane(&mut lane)?;
         let pointer_table = self.shared_batch_pointer_table(&lane);
         pinned_write(lane.host_pointer_table, &pointer_table)?;
-        self.copy_pinned_to_device_async(
+        self.copy_pinned_to_device_async::<CuDevicePtr>(
             lane.buffers.persistent_pointer_table,
             lane.host_pointer_table,
             PERSISTENT_POINTER_COUNT,
@@ -1831,32 +1883,48 @@ impl CudaRuntime {
         pointers[PersistentPointer::BlockCutoff.index()] = b.block_cutoff.pointer;
         pointers[PersistentPointer::PopulationCutoff.index()] = b.population_cutoff.pointer;
         pointers[PersistentPointer::PopulationInhibition.index()] = b.population_inhibition.pointer;
-        pointers[PersistentPointer::RecBranchSensitivity.index()] = b.recurrent_branch_sensitivity.pointer;
-        pointers[PersistentPointer::RecMembraneSensitivity.index()] = b.recurrent_membrane_sensitivity.pointer;
-        pointers[PersistentPointer::RecFatigueSensitivity.index()] = b.recurrent_fatigue_sensitivity.pointer;
-        pointers[PersistentPointer::RecAdaptationFastSensitivity.index()] = b.recurrent_adaptation_fast_sensitivity.pointer;
-        pointers[PersistentPointer::RecAdaptationMediumSensitivity.index()] = b.recurrent_adaptation_medium_sensitivity.pointer;
-        pointers[PersistentPointer::RecAdaptationSlowSensitivity.index()] = b.recurrent_adaptation_slow_sensitivity.pointer;
+        pointers[PersistentPointer::RecBranchSensitivity.index()] =
+            b.recurrent_branch_sensitivity.pointer;
+        pointers[PersistentPointer::RecMembraneSensitivity.index()] =
+            b.recurrent_membrane_sensitivity.pointer;
+        pointers[PersistentPointer::RecFatigueSensitivity.index()] =
+            b.recurrent_fatigue_sensitivity.pointer;
+        pointers[PersistentPointer::RecAdaptationFastSensitivity.index()] =
+            b.recurrent_adaptation_fast_sensitivity.pointer;
+        pointers[PersistentPointer::RecAdaptationMediumSensitivity.index()] =
+            b.recurrent_adaptation_medium_sensitivity.pointer;
+        pointers[PersistentPointer::RecAdaptationSlowSensitivity.index()] =
+            b.recurrent_adaptation_slow_sensitivity.pointer;
         pointers[PersistentPointer::RecEligibility.index()] = b.recurrent_eligibility.pointer;
         pointers[PersistentPointer::RecLastTick.index()] = b.recurrent_last_tick.pointer;
         pointers[PersistentPointer::RecEligibleMark.index()] = b.recurrent_eligible_mark.pointer;
         pointers[PersistentPointer::RecEligibleList.index()] = b.recurrent_eligible_list.pointer;
         pointers[PersistentPointer::RecEligibleCount.index()] = b.recurrent_eligible_count.pointer;
-        pointers[PersistentPointer::RecNextEligibleList.index()] = b.recurrent_next_eligible_list.pointer;
-        pointers[PersistentPointer::RecNextEligibleCount.index()] = b.recurrent_next_eligible_count.pointer;
-        pointers[PersistentPointer::InputBranchSensitivity.index()] = b.input_branch_sensitivity.pointer;
-        pointers[PersistentPointer::InputMembraneSensitivity.index()] = b.input_membrane_sensitivity.pointer;
-        pointers[PersistentPointer::InputFatigueSensitivity.index()] = b.input_fatigue_sensitivity.pointer;
-        pointers[PersistentPointer::InputAdaptationFastSensitivity.index()] = b.input_adaptation_fast_sensitivity.pointer;
-        pointers[PersistentPointer::InputAdaptationMediumSensitivity.index()] = b.input_adaptation_medium_sensitivity.pointer;
-        pointers[PersistentPointer::InputAdaptationSlowSensitivity.index()] = b.input_adaptation_slow_sensitivity.pointer;
+        pointers[PersistentPointer::RecNextEligibleList.index()] =
+            b.recurrent_next_eligible_list.pointer;
+        pointers[PersistentPointer::RecNextEligibleCount.index()] =
+            b.recurrent_next_eligible_count.pointer;
+        pointers[PersistentPointer::InputBranchSensitivity.index()] =
+            b.input_branch_sensitivity.pointer;
+        pointers[PersistentPointer::InputMembraneSensitivity.index()] =
+            b.input_membrane_sensitivity.pointer;
+        pointers[PersistentPointer::InputFatigueSensitivity.index()] =
+            b.input_fatigue_sensitivity.pointer;
+        pointers[PersistentPointer::InputAdaptationFastSensitivity.index()] =
+            b.input_adaptation_fast_sensitivity.pointer;
+        pointers[PersistentPointer::InputAdaptationMediumSensitivity.index()] =
+            b.input_adaptation_medium_sensitivity.pointer;
+        pointers[PersistentPointer::InputAdaptationSlowSensitivity.index()] =
+            b.input_adaptation_slow_sensitivity.pointer;
         pointers[PersistentPointer::InputEligibility.index()] = b.input_eligibility.pointer;
         pointers[PersistentPointer::InputLastTick.index()] = b.input_last_tick.pointer;
         pointers[PersistentPointer::InputEligibleMark.index()] = b.input_eligible_mark.pointer;
         pointers[PersistentPointer::InputEligibleList.index()] = b.input_eligible_list.pointer;
         pointers[PersistentPointer::InputEligibleCount.index()] = b.input_eligible_count.pointer;
-        pointers[PersistentPointer::InputNextEligibleList.index()] = b.input_next_eligible_list.pointer;
-        pointers[PersistentPointer::InputNextEligibleCount.index()] = b.input_next_eligible_count.pointer;
+        pointers[PersistentPointer::InputNextEligibleList.index()] =
+            b.input_next_eligible_list.pointer;
+        pointers[PersistentPointer::InputNextEligibleCount.index()] =
+            b.input_next_eligible_count.pointer;
         pointers[PersistentPointer::RingCount.index()] = b.ring_count.pointer;
         pointers[PersistentPointer::RingSource.index()] = b.ring_source.pointer;
         pointers[PersistentPointer::RingActivation.index()] = b.ring_activation.pointer;
@@ -1872,9 +1940,12 @@ impl CudaRuntime {
         pointers[PersistentPointer::Logits.index()] = b.logits.pointer;
         pointers[PersistentPointer::Probabilities.index()] = b.probabilities.pointer;
         pointers[PersistentPointer::Errors.index()] = b.errors.pointer;
-        pointers[PersistentPointer::LearningDestinationEpoch.index()] = b.learning_destination_epoch.pointer;
-        pointers[PersistentPointer::LearningDestinationList.index()] = b.learning_destination_list.pointer;
-        pointers[PersistentPointer::LearningDestinationCount.index()] = b.learning_destination_count.pointer;
+        pointers[PersistentPointer::LearningDestinationEpoch.index()] =
+            b.learning_destination_epoch.pointer;
+        pointers[PersistentPointer::LearningDestinationList.index()] =
+            b.learning_destination_list.pointer;
+        pointers[PersistentPointer::LearningDestinationCount.index()] =
+            b.learning_destination_count.pointer;
         pointers[PersistentPointer::LearningSignal.index()] = b.learning_signal.pointer;
         pointers[PersistentPointer::Counters.index()] = b.counters.pointer;
         pointers[PersistentPointer::ErrorFlag.index()] = b.error_flag.pointer;
@@ -1902,11 +1973,13 @@ impl CudaRuntime {
         pointers[BatchDeltaPointer::OutputList.index()] = b.batch_delta_output_list.pointer;
         pointers[BatchDeltaPointer::OutputCount.index()] = b.batch_delta_output_count.pointer;
         pointers[BatchDeltaPointer::OutputBias.index()] = b.batch_delta_output_bias.pointer;
-        pointers[BatchDeltaPointer::ContextEmbedding.index()] = b.batch_delta_context_embedding.pointer;
+        pointers[BatchDeltaPointer::ContextEmbedding.index()] =
+            b.batch_delta_context_embedding.pointer;
         pointers[BatchDeltaPointer::ContextMarks.index()] = b.batch_delta_context_marks.pointer;
         pointers[BatchDeltaPointer::ContextList.index()] = b.batch_delta_context_list.pointer;
         pointers[BatchDeltaPointer::ContextCount.index()] = b.batch_delta_context_count.pointer;
-        pointers[BatchDeltaPointer::ContextObservations.index()] = b.batch_delta_context_observations.pointer;
+        pointers[BatchDeltaPointer::ContextObservations.index()] =
+            b.batch_delta_context_observations.pointer;
         pointers[BatchDeltaPointer::ContextOutput.index()] = b.batch_delta_context_output.pointer;
         pointers
     }
@@ -2466,52 +2539,6 @@ impl CudaRuntime {
         Ok(())
     }
 
-    pub(crate) fn prepare_batch_lane_from(&mut self, master: &CudaRuntime) -> LeoResult<()> {
-        if !Arc::ptr_eq(&self.shared, &master.shared) {
-            return Err(LeoError::cuda(
-                "GPU story batch lanes must share one CUDA context/module",
-            ));
-        }
-        self.make_current()?;
-        self.current_tick = 0;
-        self.model.parameter_revision = master.model.parameter_revision;
-        self.model.statistics = master.model.statistics.clone();
-        self.model_dirty = false;
-        self.persistent_document_activity = false;
-        self.track_parameter_changes = true;
-        self.accumulated_changes = ParameterChanges::default();
-        self.accumulated_threshold_mark.fill(false);
-        self.accumulated_recurrent_mark.fill(false);
-        self.accumulated_input_mark.fill(false);
-        self.accumulated_output_mark.fill(false);
-        self.accumulated_context_mark.fill(false);
-        self.output_bias_dirty_since_sync = false;
-        self.context_output_dirty_since_sync = false;
-        self.probabilities.fill(0.0);
-        self.neural_logits.fill(0.0);
-        self.active.clear();
-        self.activation.fill(0.0);
-
-        let src = master.buffers;
-        let dst = self.buffers;
-        for (destination, source) in [
-            (dst.threshold, src.threshold),
-            (dst.recurrent_weight, src.recurrent_weight),
-            (dst.input_weight, src.input_weight),
-            (dst.output_weight, src.output_weight),
-            (dst.output_bias, src.output_bias),
-            (dst.context_keys, src.context_keys),
-            (dst.context_embeddings, src.context_embeddings),
-            (dst.context_observations, src.context_observations),
-            (dst.context_output_weight, src.context_output_weight),
-        ] {
-            self.copy_device_to_device_async(destination, source)?;
-        }
-        self.clear_device_changes_all_async()?;
-        self.reset_transient_state()?;
-        Ok(())
-    }
-
     pub(crate) fn training_step_batch(
         &mut self,
         steps: &[(u32, Option<u32>)],
@@ -2552,8 +2579,9 @@ impl CudaRuntime {
                 }
                 let target_index = target
                     .map(|value| {
-                        output_symbol_to_index(value)
-                            .ok_or_else(|| LeoError::cuda(format!("invalid output target: {value}")))
+                        output_symbol_to_index(value).ok_or_else(|| {
+                            LeoError::cuda(format!("invalid output target: {value}"))
+                        })
                     })
                     .transpose()?;
                 let context_enabled = matches!(permission, Permission::Frozen)
@@ -2657,8 +2685,9 @@ impl CudaRuntime {
                 }
                 let target_index = target
                     .map(|value| {
-                        output_symbol_to_index(value)
-                            .ok_or_else(|| LeoError::cuda(format!("invalid output target: {value}")))
+                        output_symbol_to_index(value).ok_or_else(|| {
+                            LeoError::cuda(format!("invalid output target: {value}"))
+                        })
                     })
                     .transpose()?;
                 let tick = base_tick.saturating_add(record_index as u64);
@@ -2822,32 +2851,48 @@ impl CudaRuntime {
         pointers[PersistentPointer::BlockCutoff.index()] = b.block_cutoff.pointer;
         pointers[PersistentPointer::PopulationCutoff.index()] = b.population_cutoff.pointer;
         pointers[PersistentPointer::PopulationInhibition.index()] = b.population_inhibition.pointer;
-        pointers[PersistentPointer::RecBranchSensitivity.index()] = b.recurrent_branch_sensitivity.pointer;
-        pointers[PersistentPointer::RecMembraneSensitivity.index()] = b.recurrent_membrane_sensitivity.pointer;
-        pointers[PersistentPointer::RecFatigueSensitivity.index()] = b.recurrent_fatigue_sensitivity.pointer;
-        pointers[PersistentPointer::RecAdaptationFastSensitivity.index()] = b.recurrent_adaptation_fast_sensitivity.pointer;
-        pointers[PersistentPointer::RecAdaptationMediumSensitivity.index()] = b.recurrent_adaptation_medium_sensitivity.pointer;
-        pointers[PersistentPointer::RecAdaptationSlowSensitivity.index()] = b.recurrent_adaptation_slow_sensitivity.pointer;
+        pointers[PersistentPointer::RecBranchSensitivity.index()] =
+            b.recurrent_branch_sensitivity.pointer;
+        pointers[PersistentPointer::RecMembraneSensitivity.index()] =
+            b.recurrent_membrane_sensitivity.pointer;
+        pointers[PersistentPointer::RecFatigueSensitivity.index()] =
+            b.recurrent_fatigue_sensitivity.pointer;
+        pointers[PersistentPointer::RecAdaptationFastSensitivity.index()] =
+            b.recurrent_adaptation_fast_sensitivity.pointer;
+        pointers[PersistentPointer::RecAdaptationMediumSensitivity.index()] =
+            b.recurrent_adaptation_medium_sensitivity.pointer;
+        pointers[PersistentPointer::RecAdaptationSlowSensitivity.index()] =
+            b.recurrent_adaptation_slow_sensitivity.pointer;
         pointers[PersistentPointer::RecEligibility.index()] = b.recurrent_eligibility.pointer;
         pointers[PersistentPointer::RecLastTick.index()] = b.recurrent_last_tick.pointer;
         pointers[PersistentPointer::RecEligibleMark.index()] = b.recurrent_eligible_mark.pointer;
         pointers[PersistentPointer::RecEligibleList.index()] = b.recurrent_eligible_list.pointer;
         pointers[PersistentPointer::RecEligibleCount.index()] = b.recurrent_eligible_count.pointer;
-        pointers[PersistentPointer::RecNextEligibleList.index()] = b.recurrent_next_eligible_list.pointer;
-        pointers[PersistentPointer::RecNextEligibleCount.index()] = b.recurrent_next_eligible_count.pointer;
-        pointers[PersistentPointer::InputBranchSensitivity.index()] = b.input_branch_sensitivity.pointer;
-        pointers[PersistentPointer::InputMembraneSensitivity.index()] = b.input_membrane_sensitivity.pointer;
-        pointers[PersistentPointer::InputFatigueSensitivity.index()] = b.input_fatigue_sensitivity.pointer;
-        pointers[PersistentPointer::InputAdaptationFastSensitivity.index()] = b.input_adaptation_fast_sensitivity.pointer;
-        pointers[PersistentPointer::InputAdaptationMediumSensitivity.index()] = b.input_adaptation_medium_sensitivity.pointer;
-        pointers[PersistentPointer::InputAdaptationSlowSensitivity.index()] = b.input_adaptation_slow_sensitivity.pointer;
+        pointers[PersistentPointer::RecNextEligibleList.index()] =
+            b.recurrent_next_eligible_list.pointer;
+        pointers[PersistentPointer::RecNextEligibleCount.index()] =
+            b.recurrent_next_eligible_count.pointer;
+        pointers[PersistentPointer::InputBranchSensitivity.index()] =
+            b.input_branch_sensitivity.pointer;
+        pointers[PersistentPointer::InputMembraneSensitivity.index()] =
+            b.input_membrane_sensitivity.pointer;
+        pointers[PersistentPointer::InputFatigueSensitivity.index()] =
+            b.input_fatigue_sensitivity.pointer;
+        pointers[PersistentPointer::InputAdaptationFastSensitivity.index()] =
+            b.input_adaptation_fast_sensitivity.pointer;
+        pointers[PersistentPointer::InputAdaptationMediumSensitivity.index()] =
+            b.input_adaptation_medium_sensitivity.pointer;
+        pointers[PersistentPointer::InputAdaptationSlowSensitivity.index()] =
+            b.input_adaptation_slow_sensitivity.pointer;
         pointers[PersistentPointer::InputEligibility.index()] = b.input_eligibility.pointer;
         pointers[PersistentPointer::InputLastTick.index()] = b.input_last_tick.pointer;
         pointers[PersistentPointer::InputEligibleMark.index()] = b.input_eligible_mark.pointer;
         pointers[PersistentPointer::InputEligibleList.index()] = b.input_eligible_list.pointer;
         pointers[PersistentPointer::InputEligibleCount.index()] = b.input_eligible_count.pointer;
-        pointers[PersistentPointer::InputNextEligibleList.index()] = b.input_next_eligible_list.pointer;
-        pointers[PersistentPointer::InputNextEligibleCount.index()] = b.input_next_eligible_count.pointer;
+        pointers[PersistentPointer::InputNextEligibleList.index()] =
+            b.input_next_eligible_list.pointer;
+        pointers[PersistentPointer::InputNextEligibleCount.index()] =
+            b.input_next_eligible_count.pointer;
         pointers[PersistentPointer::RingCount.index()] = b.ring_count.pointer;
         pointers[PersistentPointer::RingSource.index()] = b.ring_source.pointer;
         pointers[PersistentPointer::RingActivation.index()] = b.ring_activation.pointer;
@@ -2863,19 +2908,28 @@ impl CudaRuntime {
         pointers[PersistentPointer::Logits.index()] = b.logits.pointer;
         pointers[PersistentPointer::Probabilities.index()] = b.probabilities.pointer;
         pointers[PersistentPointer::Errors.index()] = b.errors.pointer;
-        pointers[PersistentPointer::LearningDestinationEpoch.index()] = b.learning_destination_epoch.pointer;
-        pointers[PersistentPointer::LearningDestinationList.index()] = b.learning_destination_list.pointer;
-        pointers[PersistentPointer::LearningDestinationCount.index()] = b.learning_destination_count.pointer;
+        pointers[PersistentPointer::LearningDestinationEpoch.index()] =
+            b.learning_destination_epoch.pointer;
+        pointers[PersistentPointer::LearningDestinationList.index()] =
+            b.learning_destination_list.pointer;
+        pointers[PersistentPointer::LearningDestinationCount.index()] =
+            b.learning_destination_count.pointer;
         pointers[PersistentPointer::LearningSignal.index()] = b.learning_signal.pointer;
         pointers[PersistentPointer::Counters.index()] = b.counters.pointer;
         pointers[PersistentPointer::ErrorFlag.index()] = b.error_flag.pointer;
         pointers[PersistentPointer::TrainingStepRecords.index()] = b.training_step_records.pointer;
-        pointers[PersistentPointer::ChangedThresholdMarks.index()] = b.changed_threshold_marks.pointer;
-        pointers[PersistentPointer::ChangedThresholdList.index()] = b.changed_threshold_list.pointer;
-        pointers[PersistentPointer::ChangedThresholdCount.index()] = b.changed_threshold_count.pointer;
-        pointers[PersistentPointer::ChangedRecurrentMarks.index()] = b.changed_recurrent_marks.pointer;
-        pointers[PersistentPointer::ChangedRecurrentList.index()] = b.changed_recurrent_list.pointer;
-        pointers[PersistentPointer::ChangedRecurrentCount.index()] = b.changed_recurrent_count.pointer;
+        pointers[PersistentPointer::ChangedThresholdMarks.index()] =
+            b.changed_threshold_marks.pointer;
+        pointers[PersistentPointer::ChangedThresholdList.index()] =
+            b.changed_threshold_list.pointer;
+        pointers[PersistentPointer::ChangedThresholdCount.index()] =
+            b.changed_threshold_count.pointer;
+        pointers[PersistentPointer::ChangedRecurrentMarks.index()] =
+            b.changed_recurrent_marks.pointer;
+        pointers[PersistentPointer::ChangedRecurrentList.index()] =
+            b.changed_recurrent_list.pointer;
+        pointers[PersistentPointer::ChangedRecurrentCount.index()] =
+            b.changed_recurrent_count.pointer;
         pointers[PersistentPointer::ChangedInputMarks.index()] = b.changed_input_marks.pointer;
         pointers[PersistentPointer::ChangedInputList.index()] = b.changed_input_list.pointer;
         pointers[PersistentPointer::ChangedInputCount.index()] = b.changed_input_count.pointer;
@@ -3789,6 +3843,8 @@ impl CudaRuntime {
             self.model.statistics.persistent_ticks.saturating_add(1);
     }
 
+    // Sequential fallible allocation keeps partial-resource cleanup explicit and auditable.
+    #[allow(clippy::field_reassign_with_default)]
     fn allocate_buffers(&mut self) -> LeoResult<()> {
         let n = self.model.neuron_count();
         let recurrent = self.model.recurrent.weight.len();
@@ -4386,70 +4442,6 @@ impl CudaRuntime {
         Ok(())
     }
 
-    fn copy_device_to_device_async(
-        &self,
-        destination: DeviceBuffer,
-        source: DeviceBuffer,
-    ) -> LeoResult<()> {
-        if destination.bytes != source.bytes {
-            return Err(LeoError::cuda(format!(
-                "CUDA device copy size mismatch: destination={} source={}",
-                destination.bytes, source.bytes
-            )));
-        }
-        if destination.bytes == 0 {
-            return Ok(());
-        }
-        self.shared.driver.check(
-            unsafe {
-                (self.shared.driver.memcpy_dtod_async)(
-                    destination.pointer,
-                    source.pointer,
-                    destination.bytes,
-                    self.compute_stream,
-                )
-            },
-            "cuMemcpyDtoDAsync",
-        )
-    }
-
-    fn clear_device_changes_all_async(&self) -> LeoResult<()> {
-        let b = self.buffers;
-        for buffer in [
-            b.batch_delta_threshold,
-            b.batch_delta_threshold_marks,
-            b.batch_delta_threshold_count,
-            b.batch_delta_recurrent,
-            b.batch_delta_recurrent_marks,
-            b.batch_delta_recurrent_count,
-            b.batch_delta_input,
-            b.batch_delta_input_marks,
-            b.batch_delta_input_count,
-            b.batch_delta_output,
-            b.batch_delta_output_marks,
-            b.batch_delta_output_count,
-            b.batch_delta_output_bias,
-            b.batch_delta_context_embedding,
-            b.batch_delta_context_marks,
-            b.batch_delta_context_count,
-            b.batch_delta_context_observations,
-            b.batch_delta_context_output,
-            b.changed_threshold_marks,
-            b.changed_threshold_count,
-            b.changed_recurrent_marks,
-            b.changed_recurrent_count,
-            b.changed_input_marks,
-            b.changed_input_count,
-            b.changed_output_marks,
-            b.changed_output_count,
-            b.changed_context_marks,
-            b.changed_context_count,
-        ] {
-            self.memset_zero_async(buffer)?;
-        }
-        Ok(())
-    }
-
     fn make_current(&self) -> LeoResult<()> {
         self.shared.driver.check(
             unsafe { (self.shared.driver.ctx_set_current)(self.shared.context) },
@@ -4503,9 +4495,7 @@ impl CudaRuntime {
         host: PinnedHostBuffer,
         elements: usize,
     ) -> LeoResult<()> {
-        self.copy_pinned_to_device_async_on(
-            buffer, host, elements, self.compute_stream,
-        )
+        self.copy_pinned_to_device_async_on::<T>(buffer, host, elements, self.compute_stream)
     }
 
     fn copy_pinned_to_device_async_on<T>(
@@ -4557,12 +4547,7 @@ impl CudaRuntime {
         }
         self.shared.driver.check(
             unsafe {
-                (self.shared.driver.memcpy_dtoh_async)(
-                    host.pointer,
-                    buffer.pointer,
-                    bytes,
-                    stream,
-                )
+                (self.shared.driver.memcpy_dtoh_async)(host.pointer, buffer.pointer, bytes, stream)
             },
             "cuMemcpyDtoHAsync",
         )
@@ -4696,11 +4681,7 @@ impl CudaRuntime {
         self.copy_from_device(buffer, values)
     }
 
-    fn launch_sparse_apply_and_reset(
-        &mut self,
-        blocks: u32,
-        threads: u32,
-    ) -> LeoResult<bool> {
+    fn launch_sparse_apply_and_reset(&mut self, blocks: u32, threads: u32) -> LeoResult<bool> {
         let plan = (blocks.max(1), threads.max(32));
         if self.sparse_apply_graph_plan != Some(plan) {
             self.destroy_sparse_apply_graph();
@@ -4759,14 +4740,13 @@ impl CudaRuntime {
         )
     }
 
-    fn capture_sparse_apply_graph(&self, blocks: u32, threads: u32) -> LeoResult<Option<CuGraphExec>> {
+    fn capture_sparse_apply_graph(
+        &self,
+        blocks: u32,
+        threads: u32,
+    ) -> LeoResult<Option<CuGraphExec>> {
         let driver = &self.shared.driver;
-        let (
-            Some(begin_capture),
-            Some(end_capture),
-            Some(instantiate),
-            Some(graph_destroy),
-        ) = (
+        let (Some(begin_capture), Some(end_capture), Some(instantiate), Some(graph_destroy)) = (
             driver.stream_begin_capture,
             driver.stream_end_capture,
             driver.graph_instantiate_with_flags,
@@ -4855,9 +4835,7 @@ impl CudaRuntime {
         parameters: &mut [*mut c_void],
     ) -> LeoResult<()> {
         if grid_x == 0 || block_x == 0 {
-            return Err(LeoError::cuda(
-                "invalid CUDA cooperative launch dimensions",
-            ));
+            return Err(LeoError::cuda("invalid CUDA cooperative launch dimensions"));
         }
         self.shared.driver.check(
             unsafe {
@@ -4888,7 +4866,7 @@ impl CudaRuntime {
         if work_items == 0 {
             return Ok(());
         }
-        let grid_x = ((work_items as u64 + u64::from(threads) - 1) / u64::from(threads)) as c_uint;
+        let grid_x = (work_items as u64).div_ceil(u64::from(threads)) as c_uint;
         self.launch_exact(function, grid_x, threads, parameters)
     }
 
@@ -4958,7 +4936,9 @@ impl Drop for CudaRuntime {
         }
         for event in self.events.upload_ready.drain(..) {
             if !event.is_null() {
-                unsafe { (self.shared.driver.event_destroy)(event); }
+                unsafe {
+                    (self.shared.driver.event_destroy)(event);
+                }
             }
         }
         for event in [
@@ -4971,7 +4951,9 @@ impl Drop for CudaRuntime {
             self.events.d2h_end,
         ] {
             if !event.is_null() {
-                unsafe { (self.shared.driver.event_destroy)(event); }
+                unsafe {
+                    (self.shared.driver.event_destroy)(event);
+                }
             }
         }
         if !self.transfer_stream.is_null() {
@@ -5011,8 +4993,8 @@ enum WavefrontLaunchKind {
     Direct { phase_launches: u64 },
 }
 
-fn launch_shared_wavefront_chunk(
-    coordinator: &CudaRuntime,
+#[derive(Clone, Copy)]
+struct WavefrontChunkLaunch {
     lane_start: usize,
     physical_lane_count: usize,
     step_index: usize,
@@ -5021,7 +5003,22 @@ fn launch_shared_wavefront_chunk(
     strength: f32,
     batch_scale: f32,
     execution_plan: CudaExecutionPlan,
+}
+
+fn launch_shared_wavefront_chunk(
+    coordinator: &CudaRuntime,
+    launch: WavefrontChunkLaunch,
 ) -> LeoResult<WavefrontLaunchKind> {
+    let WavefrontChunkLaunch {
+        lane_start,
+        physical_lane_count,
+        step_index,
+        model_block_count,
+        learning_trace,
+        strength,
+        batch_scale,
+        execution_plan,
+    } = launch;
     let lane_count = as_u32("GPU physical lane chunk", physical_lane_count)?;
     let pointer_offset = lane_start.saturating_mul(mem::size_of::<CuDevicePtr>());
     let count_offset = lane_start.saturating_mul(mem::size_of::<u32>());
@@ -5034,14 +5031,10 @@ fn launch_shared_wavefront_chunk(
         coordinator.buffers.batch_step_buffers.pointer,
         pointer_offset,
     )?;
-    let step_counts_base = device_pointer_offset(
-        coordinator.buffers.batch_step_counts.pointer,
-        count_offset,
-    )?;
-    let base_ticks_base = device_pointer_offset(
-        coordinator.buffers.batch_base_ticks.pointer,
-        tick_offset,
-    )?;
+    let step_counts_base =
+        device_pointer_offset(coordinator.buffers.batch_step_counts.pointer, count_offset)?;
+    let base_ticks_base =
+        device_pointer_offset(coordinator.buffers.batch_base_ticks.pointer, tick_offset)?;
     let step = as_u32("GPU shared wavefront step", step_index)?;
     let learning = u32::from(learning_trace);
 
@@ -5415,8 +5408,9 @@ pub(crate) fn train_story_batch_shared_device(
                 }
                 let target_index = target
                     .map(|value| {
-                        output_symbol_to_index(value)
-                            .ok_or_else(|| LeoError::cuda(format!("invalid output target: {value}")))
+                        output_symbol_to_index(value).ok_or_else(|| {
+                            LeoError::cuda(format!("invalid output target: {value}"))
+                        })
                     })
                     .transpose()?;
                 let tick = base_tick.saturating_add(record_index as u64);
@@ -5451,7 +5445,9 @@ pub(crate) fn train_story_batch_shared_device(
 
             pinned_write(lane.host_steps, &device_steps)?;
             chunk_h2d_bytes = chunk_h2d_bytes.saturating_add(
-                (device_steps.len().saturating_mul(mem::size_of::<CudaPersistentStep>())) as u64,
+                (device_steps
+                    .len()
+                    .saturating_mul(mem::size_of::<CudaPersistentStep>())) as u64,
             );
             pointer_tables.push(lane.buffers.persistent_pointer_table.pointer);
             step_buffers.push(lane.buffers.persistent_steps.pointer);
@@ -5507,13 +5503,12 @@ pub(crate) fn train_story_batch_shared_device(
             "GPU shared model block count",
             coordinator.model.config.model.block_count,
         )?;
-        let mut group_index = 0usize;
         let mut compute_timing_started = false;
 
         // Pipeline the first wavefront with the lane uploads. This creates real
         // copy/compute overlap while preserving the logical batch barrier: all
         // physical groups still finish step 0 before the mean delta is applied.
-        for lane_start in (0..lanes.len()).step_by(physical_lane_chunk) {
+        for (group_index, lane_start) in (0..lanes.len()).step_by(physical_lane_chunk).enumerate() {
             let physical_lane_count = physical_lane_chunk.min(lanes.len() - lane_start);
             for lane_index in lane_start..lane_start + physical_lane_count {
                 let count = step_counts[lane_index] as usize;
@@ -5549,14 +5544,16 @@ pub(crate) fn train_story_batch_shared_device(
             if max_chunk_steps != 0 {
                 match launch_shared_wavefront_chunk(
                     coordinator,
-                    lane_start,
-                    physical_lane_count,
-                    0,
-                    model_block_count,
-                    learning_trace,
-                    strength,
-                    batch_scale,
-                    execution_plan,
+                    WavefrontChunkLaunch {
+                        lane_start,
+                        physical_lane_count,
+                        step_index: 0,
+                        model_block_count,
+                        learning_trace,
+                        strength,
+                        batch_scale,
+                        execution_plan,
+                    },
                 )? {
                     WavefrontLaunchKind::Fused => telemetry.fused_launches += 1,
                     WavefrontLaunchKind::Direct { phase_launches } => {
@@ -5566,7 +5563,6 @@ pub(crate) fn train_story_batch_shared_device(
                     }
                 }
             }
-            group_index += 1;
         }
 
         if profile_batch {
@@ -5577,13 +5573,14 @@ pub(crate) fn train_story_batch_shared_device(
             )?;
         }
 
-        if max_chunk_steps != 0 && learning_trace {
-            if coordinator.launch_sparse_apply_and_reset(
+        if max_chunk_steps != 0
+            && learning_trace
+            && coordinator.launch_sparse_apply_and_reset(
                 execution_plan.sparse_apply_blocks,
                 execution_plan.sparse_apply_threads,
-            )? {
-                telemetry.graph_launches = telemetry.graph_launches.saturating_add(1);
-            }
+            )?
+        {
+            telemetry.graph_launches = telemetry.graph_launches.saturating_add(1);
         }
 
         for step_index in 1..max_chunk_steps {
@@ -5591,14 +5588,16 @@ pub(crate) fn train_story_batch_shared_device(
                 let physical_lane_count = physical_lane_chunk.min(lanes.len() - lane_start);
                 match launch_shared_wavefront_chunk(
                     coordinator,
-                    lane_start,
-                    physical_lane_count,
-                    step_index,
-                    model_block_count,
-                    learning_trace,
-                    strength,
-                    batch_scale,
-                    execution_plan,
+                    WavefrontChunkLaunch {
+                        lane_start,
+                        physical_lane_count,
+                        step_index,
+                        model_block_count,
+                        learning_trace,
+                        strength,
+                        batch_scale,
+                        execution_plan,
+                    },
                 )? {
                     WavefrontLaunchKind::Fused => telemetry.fused_launches += 1,
                     WavefrontLaunchKind::Direct { phase_launches } => {
@@ -5669,10 +5668,7 @@ pub(crate) fn train_story_batch_shared_device(
             "cuEventRecord(d2h end)",
         )?;
         let host_wait_started = Instant::now();
-        coordinator.event_synchronize(
-            coordinator.events.d2h_end,
-            "cuEventSynchronize(d2h end)",
-        )?;
+        coordinator.event_synchronize(coordinator.events.d2h_end, "cuEventSynchronize(d2h end)")?;
         let host_wait_ms = host_wait_started.elapsed().as_secs_f32() * 1000.0;
 
         if profile_batch {
@@ -5950,7 +5946,10 @@ fn pinned_write<T: Copy>(buffer: PinnedHostBuffer, values: &[T]) -> LeoResult<()
     Ok(())
 }
 
-fn pinned_read_vec<T: Copy + Default>(buffer: PinnedHostBuffer, elements: usize) -> LeoResult<Vec<T>> {
+fn pinned_read_vec<T: Copy + Default>(
+    buffer: PinnedHostBuffer,
+    elements: usize,
+) -> LeoResult<Vec<T>> {
     let bytes = elements.saturating_mul(mem::size_of::<T>());
     if bytes > buffer.bytes {
         return Err(LeoError::cuda(format!(
@@ -5998,7 +5997,6 @@ fn load_kernels(driver: &DriverFunctions, module: CuModule) -> LeoResult<KernelF
         forward: get_kernel(driver, module, "leo_forward")?,
         capture_training_step: get_kernel(driver, module, "leo_capture_training_step")?,
         train_persistent: get_kernel(driver, module, "leo_train_persistent")?,
-        train_story_batch: get_kernel(driver, module, "leo_train_story_batch")?,
         shared_wavefront_pre: get_kernel(driver, module, "leo_shared_wavefront_pre")?,
         shared_wavefront_fused: get_kernel(driver, module, "leo_shared_wavefront_fused")?,
         shared_select_blocks: get_kernel(driver, module, "leo_shared_select_blocks")?,
@@ -6156,11 +6154,18 @@ fn compile_cuda_kernels_uncached(
     .map_err(|_| LeoError::cuda("invalid CUDA compute capability"))?;
     let include_option = CString::new(format!("--include-path={}", include_directory.display()))
         .map_err(|_| LeoError::cuda("invalid CUDA include directory"))?;
-    let options = [standard.as_ptr(), architecture.as_ptr(), include_option.as_ptr()];
-    let compile = unsafe { (nvrtc.compile_program)(program, options.len() as c_int, options.as_ptr()) };
+    let options = [
+        standard.as_ptr(),
+        architecture.as_ptr(),
+        include_option.as_ptr(),
+    ];
+    let compile =
+        unsafe { (nvrtc.compile_program)(program, options.len() as c_int, options.as_ptr()) };
     if compile != NVRTC_SUCCESS {
         let log = nvrtc_program_log(nvrtc, program);
-        unsafe { (nvrtc.destroy_program)(&mut program); }
+        unsafe {
+            (nvrtc.destroy_program)(&mut program);
+        }
         return Err(LeoError::cuda(format!(
             "NVRTC failed to compile Leo CUDA kernels: {}\n{}",
             nvrtc.error_string(compile),
@@ -6170,7 +6175,9 @@ fn compile_cuda_kernels_uncached(
     let mut ptx_size = 0usize;
     let size_result = unsafe { (nvrtc.get_ptx_size)(program, &mut ptx_size) };
     if size_result != NVRTC_SUCCESS || ptx_size == 0 {
-        unsafe { (nvrtc.destroy_program)(&mut program); }
+        unsafe {
+            (nvrtc.destroy_program)(&mut program);
+        }
         return Err(LeoError::cuda(format!(
             "nvrtcGetPTXSize failed: {}",
             nvrtc.error_string(size_result)
@@ -6178,7 +6185,9 @@ fn compile_cuda_kernels_uncached(
     }
     let mut ptx = vec![0u8; ptx_size];
     let ptx_result = unsafe { (nvrtc.get_ptx)(program, ptx.as_mut_ptr().cast::<c_char>()) };
-    unsafe { (nvrtc.destroy_program)(&mut program); }
+    unsafe {
+        (nvrtc.destroy_program)(&mut program);
+    }
     if ptx_result != NVRTC_SUCCESS {
         return Err(LeoError::cuda(format!(
             "nvrtcGetPTX failed: {}",

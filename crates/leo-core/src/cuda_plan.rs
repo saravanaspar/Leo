@@ -319,12 +319,7 @@ impl CudaExecutionTuner {
         atomic_write(&path, text.as_bytes())
     }
 
-    fn emit_telemetry(
-        &self,
-        sample: CudaBatchTelemetry,
-        work_units: u64,
-        elapsed: Duration,
-    ) {
+    fn emit_telemetry(&self, sample: CudaBatchTelemetry, work_units: u64, elapsed: Duration) {
         eprintln!(
             "{{\"event\":\"cuda_profile\",\"logical_lanes\":{},\"lane_chunk\":{},\"sparse_blocks\":{},\"sparse_threads\":{},\"fused_blocks\":{},\"fused_threads\":{},\"work_units\":{},\"wall_ms\":{},\"h2d_ms\":{},\"compute_ms\":{},\"d2h_ms\":{},\"host_wait_ms\":{},\"h2d_gib_s\":{},\"d2h_gib_s\":{},\"theoretical_occupancy\":{},\"fused_launches\":{},\"direct_phase_launches\":{},\"graph_launches\":{},\"host_visible_bottleneck\":\"{}\"}}",
             self.active_logical_lanes,
@@ -386,7 +381,8 @@ fn sanitize_plan(
     plan.physical_lane_chunk = plan.physical_lane_chunk.clamp(1, logical_lanes.max(1));
     plan.sparse_apply_blocks = plan.sparse_apply_blocks.max(1);
     plan.sparse_apply_threads = nearest_thread_candidate(
-        plan.sparse_apply_threads.min(limits.max_threads_per_sm.max(32)),
+        plan.sparse_apply_threads
+            .min(limits.max_threads_per_sm.max(32)),
     );
     // The fused wavefront contains the forward reduction. Its 256-thread
     // reduction order is part of the FP32 execution contract, so it is not an
@@ -421,10 +417,7 @@ fn build_candidates(
     }
     for multiplier in BLOCK_MULTIPLIERS {
         let mut plan = baseline;
-        plan.sparse_apply_blocks = limits
-            .multiprocessors
-            .saturating_mul(multiplier)
-            .max(1);
+        plan.sparse_apply_blocks = limits.multiprocessors.saturating_mul(multiplier).max(1);
         push_unique(&mut candidates, plan);
     }
     let max_fused = limits.max_fused_blocks(FUSED_WAVEFRONT_THREADS);
@@ -432,7 +425,7 @@ fn build_candidates(
         for divisor in [4u32, 2, 1] {
             let mut plan = baseline;
             plan.fused_wavefront_threads = FUSED_WAVEFRONT_THREADS;
-            plan.fused_wavefront_blocks = ((max_fused + divisor - 1) / divisor).max(1);
+            plan.fused_wavefront_blocks = max_fused.div_ceil(divisor).max(1);
             push_unique(&mut candidates, plan);
         }
     }
@@ -501,9 +494,9 @@ pub(crate) fn cache_root() -> Option<PathBuf> {
             return Some(PathBuf::from(path).join("leo").join("cuda"));
         }
     }
-    env::var_os("HOME").filter(|path| !path.is_empty()).map(|home| {
-        PathBuf::from(home).join(".cache").join("leo").join("cuda")
-    })
+    env::var_os("HOME")
+        .filter(|path| !path.is_empty())
+        .map(|home| PathBuf::from(home).join(".cache").join("leo").join("cuda"))
 }
 
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> LeoResult<()> {
@@ -566,11 +559,21 @@ mod tests {
     fn tuning_searches_multiple_launch_dimensions() {
         let baseline = heuristic_plan(limits(), 64);
         let candidates = build_candidates(limits(), 64, baseline);
-        assert!(candidates.iter().any(|plan| plan.physical_lane_chunk != baseline.physical_lane_chunk));
-        assert!(candidates.iter().any(|plan| plan.sparse_apply_threads != baseline.sparse_apply_threads));
-        assert!(candidates.iter().any(|plan| plan.sparse_apply_blocks != baseline.sparse_apply_blocks));
-        assert!(candidates.iter().any(|plan| plan.fused_wavefront_blocks != baseline.fused_wavefront_blocks));
-        assert!(candidates.iter().all(|plan| plan.fused_wavefront_threads == FUSED_WAVEFRONT_THREADS));
+        assert!(candidates
+            .iter()
+            .any(|plan| plan.physical_lane_chunk != baseline.physical_lane_chunk));
+        assert!(candidates
+            .iter()
+            .any(|plan| plan.sparse_apply_threads != baseline.sparse_apply_threads));
+        assert!(candidates
+            .iter()
+            .any(|plan| plan.sparse_apply_blocks != baseline.sparse_apply_blocks));
+        assert!(candidates
+            .iter()
+            .any(|plan| plan.fused_wavefront_blocks != baseline.fused_wavefront_blocks));
+        assert!(candidates
+            .iter()
+            .all(|plan| plan.fused_wavefront_threads == FUSED_WAVEFRONT_THREADS));
     }
 
     #[test]

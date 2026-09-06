@@ -5,7 +5,7 @@
 //! with persistent model and transient recurrent/eligibility state on device.
 //! Both executors use the same serialized checkpoint representation.
 
-use crate::parallel::{apply_mean_deltas, MergeMetrics, SparseModelDelta};
+use crate::parallel::MergeMetrics;
 use crate::runtime::ParameterChanges;
 use crate::{LeoError, LeoResult, Model, Permission, Runtime, StepMetrics};
 use std::fmt::{Display, Formatter};
@@ -779,7 +779,9 @@ mod tests {
         match BackendRuntime::new(tiny_model(), BackendKind::Gpu) {
             Ok(runtime) => assert_eq!(runtime.resolved_backend(), BackendKind::Gpu),
             Err(error) => {
-                assert!(error.message().contains("CUDA") || error.message().contains("GPU backend"));
+                assert!(
+                    error.message().contains("CUDA") || error.message().contains("GPU backend")
+                );
             }
         }
     }

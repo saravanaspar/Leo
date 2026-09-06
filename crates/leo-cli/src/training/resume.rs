@@ -193,8 +193,9 @@ fn training_resume_digest(
     values: &BTreeMap<String, String>,
     key: &str,
 ) -> LeoResult<ArtifactDigest> {
-    ArtifactDigest::from_hex(training_resume_value(values, key)?)
-        .map_err(|error| LeoError::dataset(format!("invalid training resume digest for {key}: {error}")))
+    ArtifactDigest::from_hex(training_resume_value(values, key)?).map_err(|error| {
+        LeoError::dataset(format!("invalid training resume digest for {key}: {error}"))
+    })
 }
 
 fn training_resume_usize(values: &BTreeMap<String, String>, key: &str) -> LeoResult<usize> {
@@ -220,7 +221,9 @@ fn encode_optional_u64(value: Option<u64>) -> String {
 }
 
 fn encode_optional_digest(value: Option<ArtifactDigest>) -> String {
-    value.map(|value| value.to_string()).unwrap_or_else(|| "-".into())
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".into())
 }
 
 fn encode_optional_usize(value: Option<usize>) -> String {
@@ -250,9 +253,11 @@ fn decode_optional_digest(value: &str) -> LeoResult<Option<ArtifactDigest>> {
     if value == "-" {
         Ok(None)
     } else {
-        ArtifactDigest::from_hex(value)
-            .map(Some)
-            .map_err(|error| LeoError::dataset(format!("invalid optional digest in training resume state: {error}")))
+        ArtifactDigest::from_hex(value).map(Some).map_err(|error| {
+            LeoError::dataset(format!(
+                "invalid optional digest in training resume state: {error}"
+            ))
+        })
     }
 }
 
@@ -291,7 +296,10 @@ fn training_best_path(model_path: &str, parameter_revision: u64) -> PathBuf {
     ))
 }
 
-pub(super) fn save_training_resume_state(path: &Path, state: &TrainingResumeState) -> LeoResult<()> {
+pub(super) fn save_training_resume_state(
+    path: &Path,
+    state: &TrainingResumeState,
+) -> LeoResult<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -311,8 +319,9 @@ pub(super) fn save_training_resume_state(path: &Path, state: &TrainingResumeStat
 }
 
 fn load_training_resume_state(path: &Path) -> LeoResult<TrainingResumeState> {
-    let text = fs::read_to_string(path)
-        .map_err(|error| LeoError::internal(format!("cannot read training resume state: {error}")))?;
+    let text = fs::read_to_string(path).map_err(|error| {
+        LeoError::internal(format!("cannot read training resume state: {error}"))
+    })?;
     TrainingResumeState::decode(&text)
 }
 
@@ -601,7 +610,6 @@ pub(super) fn cleanup_training_resume_artifacts(model_path: &str) -> LeoResult<(
     Ok(())
 }
 
-
 pub(crate) fn advance_checkpoint_deadline(
     mut deadline: Duration,
     elapsed: Duration,
@@ -612,4 +620,3 @@ pub(crate) fn advance_checkpoint_deadline(
     }
     deadline
 }
-

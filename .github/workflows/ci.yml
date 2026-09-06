@@ -18,4 +18,4 @@ jobs:
       - name: Validate repository
         env:
           CI: '1'
-        run: ./scripts/check.sh
+        run: bash ./scripts/check.sh

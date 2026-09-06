@@ -48,7 +48,9 @@ impl StoryBatchPrefetcher {
         purpose: &'static str,
     ) -> LeoResult<Self> {
         let mut dataset = dataset.try_clone().map_err(|error| {
-            LeoError::internal(format!("could not clone {purpose} dataset for prefetch: {error}"))
+            LeoError::internal(format!(
+                "could not clone {purpose} dataset for prefetch: {error}"
+            ))
         })?;
         let (request_tx, request_rx) = sync_channel::<StoryBatchRequest>(1);
         let (result_tx, result_rx) = sync_channel::<LeoResult<StoryBatchResult>>(1);
@@ -70,7 +72,9 @@ impl StoryBatchPrefetcher {
                 }
             })
             .map_err(|error| {
-                LeoError::internal(format!("could not start {purpose} dataset prefetcher: {error}"))
+                LeoError::internal(format!(
+                    "could not start {purpose} dataset prefetcher: {error}"
+                ))
             })?;
         Ok(Self {
             requests: Some(request_tx),
@@ -146,4 +150,3 @@ pub(crate) fn read_story_batch(
 
     Ok((stories, next_position, input_bytes))
 }
-

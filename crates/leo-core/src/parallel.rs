@@ -375,7 +375,9 @@ fn context_deltas_for_slots(
     let mut result = Vec::with_capacity(slots.len());
     for &slot in slots {
         if slot >= trained.context.keys.len() {
-            return Err(LeoError::internal("tracked context slot is outside the model"));
+            return Err(LeoError::internal(
+                "tracked context slot is outside the model",
+            ));
         }
         let key = trained.context.keys[slot];
         if key == 0 {
