@@ -658,6 +658,7 @@ struct KernelFunctions {
     capture_training_step: CuFunction,
     train_persistent: CuFunction,
     advance_frozen_persistent: CuFunction,
+    advance_frozen_cooperative: CuFunction,
     shared_wavefront_pre: CuFunction,
     shared_wavefront_fused: CuFunction,
     shared_select_blocks: CuFunction,
@@ -803,6 +804,7 @@ struct SharedCuda {
     module: CuModule,
     kernels: KernelFunctions,
     persistent_grid_blocks: c_uint,
+    frozen_grid_blocks: c_uint,
     compute_major: c_int,
     compute_minor: c_int,
     multiprocessor_count: u32,
@@ -1516,6 +1518,14 @@ impl CudaRuntime {
             512,
             "fused wavefront 512",
         )?;
+        let frozen_grid_blocks = cooperative_grid_capacity(
+            &driver,
+            kernels.advance_frozen_cooperative,
+            cooperative_launch != 0,
+            multiprocessor_count,
+            PERSISTENT_THREADS as c_int,
+            "cooperative frozen replay prefix",
+        )?;
         let persistent_grid_blocks = if cooperative_launch != 0 && multiprocessor_count > 0 {
             let mut active_blocks_per_sm = 0;
             driver.check(
@@ -1543,6 +1553,7 @@ impl CudaRuntime {
             module,
             kernels,
             persistent_grid_blocks,
+            frozen_grid_blocks,
             compute_major,
             compute_minor,
             multiprocessor_count: multiprocessor_count.max(1) as u32,
@@ -2587,16 +2598,30 @@ impl CudaRuntime {
                 param(&mut tick),
             ];
 
-            // Frozen replay prefixes are sequential in time, but they do not
-            // need output probabilities, loss records, surrogate caches, or
-            // context projections. One persistent block advances exactly the
-            // recurrent/context-history state and avoids a D2H record per byte.
-            self.launch_exact(
-                self.shared.kernels.advance_frozen_persistent,
-                1,
-                PERSISTENT_THREADS,
-                &mut parameters,
+            // Frozen replay prefixes are sequential in time. On cooperative
+            // devices, spread independent model-block selection across the
+            // grid while preserving the exact v1 phase/reduction order. Older
+            // devices retain the original one-block persistent fallback.
+            let model_blocks = as_u32(
+                "frozen replay model block count",
+                self.model.config.model.block_count,
             )?;
+            let frozen_blocks = self.shared.frozen_grid_blocks.min(model_blocks).max(1);
+            if self.shared.cooperative_launch && frozen_blocks > 1 {
+                self.launch_cooperative_exact(
+                    self.shared.kernels.advance_frozen_cooperative,
+                    frozen_blocks,
+                    PERSISTENT_THREADS,
+                    &mut parameters,
+                )?;
+            } else {
+                self.launch_exact(
+                    self.shared.kernels.advance_frozen_persistent,
+                    1,
+                    PERSISTENT_THREADS,
+                    &mut parameters,
+                )?;
+            }
             self.synchronize()?;
             self.current_tick = self.current_tick.saturating_add(chunk.len() as u64);
         }
@@ -6063,6 +6088,7 @@ fn load_kernels(driver: &DriverFunctions, module: CuModule) -> LeoResult<KernelF
         capture_training_step: get_kernel(driver, module, "leo_capture_training_step")?,
         train_persistent: get_kernel(driver, module, "leo_train_persistent")?,
         advance_frozen_persistent: get_kernel(driver, module, "leo_advance_frozen_persistent")?,
+        advance_frozen_cooperative: get_kernel(driver, module, "leo_advance_frozen_cooperative")?,
         shared_wavefront_pre: get_kernel(driver, module, "leo_shared_wavefront_pre")?,
         shared_wavefront_fused: get_kernel(driver, module, "leo_shared_wavefront_fused")?,
         shared_select_blocks: get_kernel(driver, module, "leo_shared_select_blocks")?,

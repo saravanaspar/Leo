@@ -142,6 +142,10 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("fn advance_frozen_batch", backend)
         self.assertIn("leo_advance_frozen_persistent", cuda)
         self.assertIn("leo_advance_frozen_persistent", kernels)
+        self.assertIn("leo_advance_frozen_cooperative", cuda)
+        self.assertIn("leo_advance_frozen_cooperative", kernels)
+        self.assertIn("frozen_grid_blocks", cuda)
+        self.assertIn("launch_cooperative_exact", cuda)
         frozen_kernel = kernels.split(
             'extern "C" __global__ void leo_advance_frozen_persistent', 1
         )[0].rsplit("__device__ void leo_advance_frozen_story_block", 1)[1]
@@ -150,6 +154,17 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertNotIn("leo_p_forward", frozen_kernel)
         self.assertNotIn("leo_p_capture_training_step", frozen_kernel)
         self.assertNotIn("leo_p_cache_surrogate", frozen_kernel)
+        cooperative = kernels.split(
+            'extern "C" __global__ void leo_advance_frozen_cooperative', 1
+        )[1].split('extern "C" __global__ void leo_train_persistent', 1)[0]
+        self.assertIn("cooperative_groups::this_grid()", cooperative)
+        self.assertGreaterEqual(cooperative.count("grid.sync()"), 3)
+        self.assertIn("leo_p_select_model_block", cooperative)
+        self.assertIn("leo_p_context_advance_history", cooperative)
+        self.assertIn("leo_p_select_global", cooperative)
+        self.assertIn("leo_p_post_and_emit", cooperative)
+        self.assertNotIn("leo_p_forward", cooperative)
+        self.assertNotIn("leo_p_capture_training_step", cooperative)
         self.assertIn("runtime.model().config.replay.fraction", training)
         self.assertIn("runtime.model().config.replay.segment_bytes", training)
         self.assertIn("let cleanup_after = index + 1 == ranges.len();", training)

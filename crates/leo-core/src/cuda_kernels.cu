@@ -1687,12 +1687,17 @@ __device__ void leo_p_context_resolve_shared(
     counters->context_probes = probe_sum;
 }
 
-__device__ void leo_p_select_blocks(const unsigned long long* p, unsigned long long tick) {
+__device__ __forceinline__ void leo_p_select_model_block(
+    const unsigned long long* p,
+    unsigned long long tick,
+    unsigned int model_block
+) {
     const LeoConfig* cfg = leo_p_cptr<LeoConfig>(p, LEO_P_CONFIG);
+    if (model_block >= cfg->block_count) return;
+    const unsigned long long tag = tick + 1ULL;
     const float* threshold = leo_p_cptr<float>(p, LEO_P_THRESHOLD);
     const float* excitability = leo_p_cptr<float>(p, LEO_P_EXCITABILITY);
     float* membrane = leo_p_ptr<float>(p, LEO_P_MEMBRANE);
-    float* activation = leo_p_ptr<float>(p, LEO_P_ACTIVATION);
     float* fatigue = leo_p_ptr<float>(p, LEO_P_FATIGUE);
     unsigned long long* refractory_until = leo_p_ptr<unsigned long long>(p, LEO_P_REFRACTORY_UNTIL);
     float* branches = leo_p_ptr<float>(p, LEO_P_BRANCHES);
@@ -1709,95 +1714,106 @@ __device__ void leo_p_select_blocks(const unsigned long long* p, unsigned long l
     float* winner_value = leo_p_ptr<float>(p, LEO_P_BLOCK_WINNER_VALUE);
     float* block_cutoff = leo_p_ptr<float>(p, LEO_P_BLOCK_CUTOFF);
     LeoStepCounters* counters = leo_p_ptr<LeoStepCounters>(p, LEO_P_COUNTERS);
-    const unsigned long long tag = tick + 1ULL;
+
+    for (unsigned int local = threadIdx.x; local < cfg->neurons_per_block; local += blockDim.x) {
+        const unsigned int neuron = model_block * cfg->neurons_per_block + local;
+        float candidate = 0.0f;
+        if (touched_epoch[neuron] == tag) {
+            const unsigned long long branch_elapsed = tick >= branch_last_tick[neuron]
+                ? tick - branch_last_tick[neuron] : 0ULL;
+            const unsigned long long base = (unsigned long long)neuron * 4ULL;
+            if (branch_elapsed > 0ULL) {
+                const float decay = leo_decay(cfg->branch_decay, branch_elapsed);
+                for (unsigned int branch = 0U; branch < 4U; ++branch) branches[base + branch] *= decay;
+                branch_last_tick[neuron] = tick;
+            }
+            for (unsigned int branch = 0U; branch < 4U; ++branch) {
+                branches[base + branch] += branch_delta[base + branch];
+                branch_delta[base + branch] = 0.0f;
+            }
+            const unsigned long long neuron_elapsed = tick >= neuron_last_tick[neuron]
+                ? tick - neuron_last_tick[neuron] : 0ULL;
+            if (neuron_elapsed > 0ULL) {
+                membrane[neuron] *= leo_decay(cfg->membrane_decay, neuron_elapsed);
+                fatigue[neuron] *= leo_decay(cfg->fatigue_decay, neuron_elapsed);
+                adaptation_fast[neuron] *= leo_decay(cfg->adaptation_fast_decay, neuron_elapsed);
+                adaptation_medium[neuron] *= leo_decay(cfg->adaptation_medium_decay, neuron_elapsed);
+                adaptation_slow[neuron] *= leo_decay(cfg->adaptation_slow_decay, neuron_elapsed);
+                neuron_last_tick[neuron] = tick;
+            }
+            if (refractory_until[neuron] <= tick) {
+                const float gate = leo_clamp(branches[base + 3ULL], 0.0f, 1.0f);
+                const float evidence = branches[base] + branches[base + 2ULL] * gate + branches[base + 1ULL];
+                const float adaptation = adaptation_fast[neuron] + adaptation_medium[neuron] + adaptation_slow[neuron];
+                const float drive = excitability[neuron] * evidence - fatigue[neuron] - adaptation - *population_inhibition;
+                membrane[neuron] += drive;
+                candidate = leo_clamp(membrane[neuron] - threshold[neuron], 0.0f, 1.0f);
+                if (candidate > 0.0f) atomicAdd(&counters->suprathreshold, 1U);
+            }
+        }
+        candidate_activation[neuron] = candidate;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0U) {
+        const unsigned int rotation = (unsigned int)(tick % (unsigned long long)cfg->neuron_count);
+        const unsigned int keep = cfg->max_active_per_block;
+        float top_value[LEO_MAX_BLOCK_WINNERS + 1];
+        unsigned int top_neuron[LEO_MAX_BLOCK_WINNERS + 1];
+        for (unsigned int i = 0U; i <= keep; ++i) {
+            top_value[i] = -1.0f;
+            top_neuron[i] = 0U;
+        }
+        unsigned int positive = 0U;
+        const unsigned int start = model_block * cfg->neurons_per_block;
+        for (unsigned int local = 0U; local < cfg->neurons_per_block; ++local) {
+            const unsigned int candidate_neuron = start + local;
+            const float value = candidate_activation[candidate_neuron];
+            if (value <= 0.0f) continue;
+            positive += 1U;
+            unsigned int position = keep;
+            for (unsigned int scan = 0U; scan <= keep; ++scan) {
+                if (top_value[scan] < 0.0f || leo_better(
+                    value,
+                    candidate_neuron,
+                    top_value[scan],
+                    top_neuron[scan],
+                    rotation,
+                    cfg->neuron_count
+                )) {
+                    position = scan;
+                    break;
+                }
+            }
+            if (position <= keep) {
+                for (unsigned int move = keep; move > position; --move) {
+                    top_value[move] = top_value[move - 1U];
+                    top_neuron[move] = top_neuron[move - 1U];
+                }
+                top_value[position] = value;
+                top_neuron[position] = candidate_neuron;
+            }
+        }
+        const unsigned int winner_count = positive < keep ? positive : keep;
+        const unsigned int winner_base = model_block * keep;
+        for (unsigned int i = 0U; i < keep; ++i) {
+            if (i < winner_count) {
+                winner_neuron[winner_base + i] = top_neuron[i];
+                winner_value[winner_base + i] = top_value[i];
+            } else {
+                winner_neuron[winner_base + i] = 0U;
+                winner_value[winner_base + i] = -1.0f;
+            }
+        }
+        block_cutoff[model_block] = positive > keep ? top_value[keep] : 0.0f;
+        atomicAdd(&counters->block_selected, winner_count);
+    }
+}
+
+__device__ void leo_p_select_blocks(const unsigned long long* p, unsigned long long tick) {
+    const LeoConfig* cfg = leo_p_cptr<LeoConfig>(p, LEO_P_CONFIG);
     for (unsigned int model_block = 0U; model_block < cfg->block_count; ++model_block) {
-        for (unsigned int local = threadIdx.x; local < cfg->neurons_per_block; local += blockDim.x) {
-            const unsigned int neuron = model_block * cfg->neurons_per_block + local;
-            float candidate = 0.0f;
-            if (touched_epoch[neuron] == tag) {
-                const unsigned long long branch_elapsed = tick >= branch_last_tick[neuron]
-                    ? tick - branch_last_tick[neuron] : 0ULL;
-                const unsigned long long base = (unsigned long long)neuron * 4ULL;
-                if (branch_elapsed > 0ULL) {
-                    const float decay = leo_decay(cfg->branch_decay, branch_elapsed);
-                    for (unsigned int branch = 0U; branch < 4U; ++branch) branches[base + branch] *= decay;
-                    branch_last_tick[neuron] = tick;
-                }
-                for (unsigned int branch = 0U; branch < 4U; ++branch) {
-                    branches[base + branch] += branch_delta[base + branch];
-                    branch_delta[base + branch] = 0.0f;
-                }
-                const unsigned long long neuron_elapsed = tick >= neuron_last_tick[neuron]
-                    ? tick - neuron_last_tick[neuron] : 0ULL;
-                if (neuron_elapsed > 0ULL) {
-                    membrane[neuron] *= leo_decay(cfg->membrane_decay, neuron_elapsed);
-                    fatigue[neuron] *= leo_decay(cfg->fatigue_decay, neuron_elapsed);
-                    adaptation_fast[neuron] *= leo_decay(cfg->adaptation_fast_decay, neuron_elapsed);
-                    adaptation_medium[neuron] *= leo_decay(cfg->adaptation_medium_decay, neuron_elapsed);
-                    adaptation_slow[neuron] *= leo_decay(cfg->adaptation_slow_decay, neuron_elapsed);
-                    neuron_last_tick[neuron] = tick;
-                }
-                if (refractory_until[neuron] <= tick) {
-                    const float gate = leo_clamp(branches[base + 3ULL], 0.0f, 1.0f);
-                    const float evidence = branches[base] + branches[base + 2ULL] * gate + branches[base + 1ULL];
-                    const float adaptation = adaptation_fast[neuron] + adaptation_medium[neuron] + adaptation_slow[neuron];
-                    const float drive = excitability[neuron] * evidence - fatigue[neuron] - adaptation - *population_inhibition;
-                    membrane[neuron] += drive;
-                    candidate = leo_clamp(membrane[neuron] - threshold[neuron], 0.0f, 1.0f);
-                    if (candidate > 0.0f) atomicAdd(&counters->suprathreshold, 1U);
-                }
-            }
-            candidate_activation[neuron] = candidate;
-        }
-        __syncthreads();
-        if (threadIdx.x == 0U) {
-            const unsigned int rotation = (unsigned int)(tick % (unsigned long long)cfg->neuron_count);
-            const unsigned int keep = cfg->max_active_per_block;
-            float top_value[LEO_MAX_BLOCK_WINNERS + 1];
-            unsigned int top_neuron[LEO_MAX_BLOCK_WINNERS + 1];
-            for (unsigned int i = 0U; i <= keep; ++i) {
-                top_value[i] = -1.0f;
-                top_neuron[i] = 0U;
-            }
-            unsigned int positive = 0U;
-            const unsigned int start = model_block * cfg->neurons_per_block;
-            for (unsigned int local = 0U; local < cfg->neurons_per_block; ++local) {
-                const unsigned int candidate_neuron = start + local;
-                const float value = candidate_activation[candidate_neuron];
-                if (value <= 0.0f) continue;
-                positive += 1U;
-                unsigned int position = keep;
-                for (unsigned int scan = 0U; scan <= keep; ++scan) {
-                    if (top_value[scan] < 0.0f || leo_better(
-                        value, candidate_neuron, top_value[scan], top_neuron[scan], rotation, cfg->neuron_count
-                    )) {
-                        position = scan;
-                        break;
-                    }
-                }
-                if (position <= keep) {
-                    for (unsigned int move = keep; move > position; --move) {
-                        top_value[move] = top_value[move - 1U];
-                        top_neuron[move] = top_neuron[move - 1U];
-                    }
-                    top_value[position] = value;
-                    top_neuron[position] = candidate_neuron;
-                }
-            }
-            const unsigned int winner_count = positive < keep ? positive : keep;
-            const unsigned int winner_base = model_block * keep;
-            for (unsigned int i = 0U; i < keep; ++i) {
-                if (i < winner_count) {
-                    winner_neuron[winner_base + i] = top_neuron[i];
-                    winner_value[winner_base + i] = top_value[i];
-                } else {
-                    winner_neuron[winner_base + i] = 0U;
-                    winner_value[winner_base + i] = -1.0f;
-                }
-            }
-            block_cutoff[model_block] = positive > keep ? top_value[keep] : 0.0f;
-            atomicAdd(&counters->block_selected, winner_count);
-        }
+        leo_p_select_model_block(p, tick, model_block);
         __syncthreads();
     }
 }
@@ -3005,6 +3021,66 @@ extern "C" __global__ void leo_advance_frozen_persistent(
     );
 }
 
+
+// Cooperative frozen replay-prefix advancement. Frozen prefix state is exactly
+// the same as leo_advance_frozen_persistent, but independent model blocks are
+// evaluated by separate CUDA blocks. Grid barriers preserve the original phase
+// order, and block-local arithmetic/order within each model block is unchanged.
+extern "C" __global__ void leo_advance_frozen_cooperative(
+    const unsigned long long* pointers,
+    const LeoPersistentStep* steps,
+    unsigned int step_count,
+    unsigned long long base_tick
+) {
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+    __shared__ float shared_values[LEO_GLOBAL_SORT];
+    __shared__ unsigned int shared_neurons[LEO_GLOBAL_SORT];
+    const LeoConfig* cfg = leo_p_cptr<LeoConfig>(pointers, LEO_P_CONFIG);
+    unsigned int* recurrent_list = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_LIST);
+    unsigned int* recurrent_count = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_COUNT);
+    unsigned int* input_list = leo_p_ptr<unsigned int>(pointers, LEO_P_INPUT_ELIGIBLE_LIST);
+    unsigned int* input_count = leo_p_ptr<unsigned int>(pointers, LEO_P_INPUT_ELIGIBLE_COUNT);
+
+    for (unsigned int step_index = 0U; step_index < step_count; ++step_index) {
+        const unsigned int symbol = steps[step_index].symbol;
+        const unsigned long long tick = base_tick + (unsigned long long)step_index;
+
+        // Event delivery/input injection operate on sparse worklists. One block
+        // preserves their established atomic/update order exactly.
+        if (blockIdx.x == 0U) {
+            leo_p_start_tick(pointers, tick);
+            __syncthreads();
+            leo_p_deliver_events(pointers, tick, false, recurrent_list, recurrent_count);
+            __syncthreads();
+            leo_p_inject_symbol(pointers, tick, symbol, false, input_list, input_count);
+            __syncthreads();
+            leo_p_context_advance_history(pointers, symbol);
+            __syncthreads();
+        }
+        grid.sync();
+
+        // Model blocks are independent until global winner selection, so this
+        // phase can use the whole cooperative grid without changing FP32 order.
+        for (unsigned int model_block = blockIdx.x;
+             model_block < cfg->block_count;
+             model_block += gridDim.x) {
+            leo_p_select_model_block(pointers, tick, model_block);
+            __syncthreads();
+        }
+        grid.sync();
+
+        // Global selection and recurrent emission retain the exact one-block
+        // reduction/update order used by the v1 reference persistent path.
+        if (blockIdx.x == 0U) {
+            leo_p_select_global(pointers, tick, shared_values, shared_neurons);
+            __syncthreads();
+            leo_p_post_and_emit(pointers, tick);
+            __syncthreads();
+        }
+        grid.sync();
+    }
+}
+
 extern "C" __global__ void leo_train_persistent(
     const unsigned long long* pointers,
     const LeoPersistentStep* steps,
@@ -3103,120 +3179,7 @@ __device__ __forceinline__ void leo_shared_phase_select_block(
     const LeoConfig* cfg = leo_p_cptr<LeoConfig>(p, LEO_P_CONFIG);
     if (model_block >= cfg->block_count) return;
     const unsigned long long tick = base_ticks[lane] + (unsigned long long)step_index;
-    const unsigned long long tag = tick + 1ULL;
-    const float* threshold = leo_p_cptr<float>(p, LEO_P_THRESHOLD);
-    const float* excitability = leo_p_cptr<float>(p, LEO_P_EXCITABILITY);
-    float* membrane = leo_p_ptr<float>(p, LEO_P_MEMBRANE);
-    float* fatigue = leo_p_ptr<float>(p, LEO_P_FATIGUE);
-    unsigned long long* refractory_until = leo_p_ptr<unsigned long long>(p, LEO_P_REFRACTORY_UNTIL);
-    float* branches = leo_p_ptr<float>(p, LEO_P_BRANCHES);
-    float* branch_delta = leo_p_ptr<float>(p, LEO_P_BRANCH_DELTA);
-    unsigned long long* branch_last_tick = leo_p_ptr<unsigned long long>(p, LEO_P_BRANCH_LAST_TICK);
-    unsigned long long* neuron_last_tick = leo_p_ptr<unsigned long long>(p, LEO_P_NEURON_LAST_TICK);
-    float* adaptation_fast = leo_p_ptr<float>(p, LEO_P_ADAPTATION_FAST);
-    float* adaptation_medium = leo_p_ptr<float>(p, LEO_P_ADAPTATION_MEDIUM);
-    float* adaptation_slow = leo_p_ptr<float>(p, LEO_P_ADAPTATION_SLOW);
-    const unsigned long long* touched_epoch = leo_p_cptr<unsigned long long>(p, LEO_P_TOUCHED_EPOCH);
-    const float* population_inhibition = leo_p_cptr<float>(p, LEO_P_POPULATION_INHIBITION);
-    float* candidate_activation = leo_p_ptr<float>(p, LEO_P_CANDIDATE_ACTIVATION);
-    unsigned int* winner_neuron = leo_p_ptr<unsigned int>(p, LEO_P_BLOCK_WINNER_NEURON);
-    float* winner_value = leo_p_ptr<float>(p, LEO_P_BLOCK_WINNER_VALUE);
-    float* block_cutoff = leo_p_ptr<float>(p, LEO_P_BLOCK_CUTOFF);
-    LeoStepCounters* counters = leo_p_ptr<LeoStepCounters>(p, LEO_P_COUNTERS);
-
-    for (unsigned int local = threadIdx.x; local < cfg->neurons_per_block; local += blockDim.x) {
-        const unsigned int neuron = model_block * cfg->neurons_per_block + local;
-        float candidate = 0.0f;
-        if (touched_epoch[neuron] == tag) {
-            const unsigned long long branch_elapsed = tick >= branch_last_tick[neuron]
-                ? tick - branch_last_tick[neuron] : 0ULL;
-            const unsigned long long base = (unsigned long long)neuron * 4ULL;
-            if (branch_elapsed > 0ULL) {
-                const float decay = leo_decay(cfg->branch_decay, branch_elapsed);
-                for (unsigned int branch = 0U; branch < 4U; ++branch) branches[base + branch] *= decay;
-                branch_last_tick[neuron] = tick;
-            }
-            for (unsigned int branch = 0U; branch < 4U; ++branch) {
-                branches[base + branch] += branch_delta[base + branch];
-                branch_delta[base + branch] = 0.0f;
-            }
-            const unsigned long long neuron_elapsed = tick >= neuron_last_tick[neuron]
-                ? tick - neuron_last_tick[neuron] : 0ULL;
-            if (neuron_elapsed > 0ULL) {
-                membrane[neuron] *= leo_decay(cfg->membrane_decay, neuron_elapsed);
-                fatigue[neuron] *= leo_decay(cfg->fatigue_decay, neuron_elapsed);
-                adaptation_fast[neuron] *= leo_decay(cfg->adaptation_fast_decay, neuron_elapsed);
-                adaptation_medium[neuron] *= leo_decay(cfg->adaptation_medium_decay, neuron_elapsed);
-                adaptation_slow[neuron] *= leo_decay(cfg->adaptation_slow_decay, neuron_elapsed);
-                neuron_last_tick[neuron] = tick;
-            }
-            if (refractory_until[neuron] <= tick) {
-                const float gate = leo_clamp(branches[base + 3ULL], 0.0f, 1.0f);
-                const float evidence = branches[base] + branches[base + 2ULL] * gate + branches[base + 1ULL];
-                const float adaptation = adaptation_fast[neuron] + adaptation_medium[neuron] + adaptation_slow[neuron];
-                const float drive = excitability[neuron] * evidence - fatigue[neuron] - adaptation - *population_inhibition;
-                membrane[neuron] += drive;
-                candidate = leo_clamp(membrane[neuron] - threshold[neuron], 0.0f, 1.0f);
-                if (candidate > 0.0f) atomicAdd(&counters->suprathreshold, 1U);
-            }
-        }
-        candidate_activation[neuron] = candidate;
-    }
-    __syncthreads();
-
-    if (threadIdx.x == 0U) {
-        const unsigned int rotation = (unsigned int)(tick % (unsigned long long)cfg->neuron_count);
-        const unsigned int keep = cfg->max_active_per_block;
-        float top_value[LEO_MAX_BLOCK_WINNERS + 1];
-        unsigned int top_neuron[LEO_MAX_BLOCK_WINNERS + 1];
-        for (unsigned int i = 0U; i <= keep; ++i) {
-            top_value[i] = -1.0f;
-            top_neuron[i] = 0U;
-        }
-        unsigned int positive = 0U;
-        const unsigned int start = model_block * cfg->neurons_per_block;
-        for (unsigned int local = 0U; local < cfg->neurons_per_block; ++local) {
-            const unsigned int candidate_neuron = start + local;
-            const float value = candidate_activation[candidate_neuron];
-            if (value <= 0.0f) continue;
-            positive += 1U;
-            unsigned int position = keep;
-            for (unsigned int scan = 0U; scan <= keep; ++scan) {
-                if (top_value[scan] < 0.0f || leo_better(
-                    value,
-                    candidate_neuron,
-                    top_value[scan],
-                    top_neuron[scan],
-                    rotation,
-                    cfg->neuron_count
-                )) {
-                    position = scan;
-                    break;
-                }
-            }
-            if (position <= keep) {
-                for (unsigned int move = keep; move > position; --move) {
-                    top_value[move] = top_value[move - 1U];
-                    top_neuron[move] = top_neuron[move - 1U];
-                }
-                top_value[position] = value;
-                top_neuron[position] = candidate_neuron;
-            }
-        }
-        const unsigned int winner_count = positive < keep ? positive : keep;
-        const unsigned int winner_base = model_block * keep;
-        for (unsigned int i = 0U; i < keep; ++i) {
-            if (i < winner_count) {
-                winner_neuron[winner_base + i] = top_neuron[i];
-                winner_value[winner_base + i] = top_value[i];
-            } else {
-                winner_neuron[winner_base + i] = 0U;
-                winner_value[winner_base + i] = -1.0f;
-            }
-        }
-        block_cutoff[model_block] = positive > keep ? top_value[keep] : 0.0f;
-        atomicAdd(&counters->block_selected, winner_count);
-    }
+    leo_p_select_model_block(p, tick, model_block);
 }
 
 __device__ __forceinline__ void leo_shared_phase_post_select_lane(
