@@ -1,7 +1,7 @@
 # Leo v1.0.0
 
 <p align="center">
-  <strong>A sparse recurrent byte-learning system with a CPU reference backend and a custom NVIDIA CUDA backend.</strong>
+  <strong>Open-source AI source code for a sparse recurrent byte-learning system with a CPU reference backend and a custom NVIDIA CUDA backend.</strong>
 </p>
 
 <p align="center">
@@ -23,7 +23,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Current public development and quality testing is specifically centered on the [TinyStories dataset](https://huggingface.co/datasets/roneneldan/TinyStories).** Leo is research-oriented software. Passing repository tests proves implementation invariants; it does not by itself prove model quality, generalization, or production readiness.
+> **Current public development and quality testing is specifically centered on the [TinyStories dataset](https://huggingface.co/datasets/roneneldan/TinyStories).** Leo is research-oriented AI source code. Passing repository tests proves implementation invariants; it does not by itself prove model quality, generalization, or production readiness.
 
 Leo v1.0.0 is a clean durability baseline for fresh training and long-lived experiments. It keeps **FP32 learning semantics**, **30% bounded-surprise replay** in the standard configurations, strict artifact identity, checkpoint/resume safety, a CPU reference path, and execution-only CUDA optimization.
 
@@ -171,7 +171,7 @@ These values come from `scripts/data.sh`. Prepared artifacts record source repos
 </details>
 
 > [!CAUTION]
-> TinyStories is an **external dataset** and is not covered by Leo's Apache-2.0 software license. The upstream dataset card currently lists `cdla-sharing-1.0`; always review the current dataset card and terms before downloading, redistributing, or using it in another context.
+> TinyStories is an **external dataset** and is not covered by the Apache-2.0 license that applies to Leo's source code. The upstream dataset card currently lists `cdla-sharing-1.0`; always review the current dataset card and terms before downloading, redistributing, or using it in another context.
 
 See [docs/TESTING.md](docs/TESTING.md) for the full validation ladder and [docs/REPRODUCIBILITY.md](docs/REPRODUCIBILITY.md) for experiment identity guidance.
 
