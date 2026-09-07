@@ -2600,10 +2600,7 @@ impl CudaRuntime {
         Ok(())
     }
 
-    pub(crate) fn advance_frozen_batch(
-        &mut self,
-        steps: &[(u32, Option<u32>)],
-    ) -> LeoResult<()> {
+    pub(crate) fn advance_frozen_batch(&mut self, steps: &[(u32, Option<u32>)]) -> LeoResult<()> {
         if steps.is_empty() {
             return Ok(());
         }
@@ -5764,10 +5761,7 @@ pub(crate) fn train_story_batch_shared_device(
         // Pipeline the first wavefront with the lane uploads. This creates real
         // copy/compute overlap while preserving the logical batch barrier: all
         // physical groups still finish step 0 before the mean delta is applied.
-        for (group_index, lane_start) in (0..lanes.len())
-            .step_by(physical_lane_chunk)
-            .enumerate()
-        {
+        for (group_index, lane_start) in (0..lanes.len()).step_by(physical_lane_chunk).enumerate() {
             let physical_lane_count = physical_lane_chunk.min(lanes.len() - lane_start);
             for lane_index in lane_start..lane_start + physical_lane_count {
                 let count = step_counts[lane_index] as usize;
