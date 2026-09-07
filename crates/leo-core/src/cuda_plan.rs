@@ -10,17 +10,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-const PROFILE_SCHEMA: u32 = 3;
+const PROFILE_SCHEMA: u32 = 4;
 const OBSERVATIONS_PER_CANDIDATE: u32 = 2;
 const PROFILE_SAMPLE_INTERVAL: u64 = 128;
 const LANE_CANDIDATES: [usize; 6] = [8, 16, 32, 64, 96, 128];
 const SPARSE_THREAD_CANDIDATES: [u32; 3] = [128, 256, 512];
 const FUSED_WAVEFRONT_THREADS: u32 = 256;
-const BLOCK_MULTIPLIERS: [u32; 3] = [1, 2, 4];
 static CACHE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -119,7 +119,7 @@ impl CandidateScore {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct TelemetryAggregate {
     samples: u32,
     h2d_ms: f64,
@@ -156,13 +156,25 @@ impl TelemetryAggregate {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedCandidateProgress {
+    plan: CudaExecutionPlan,
+    weighted_work: f64,
+    seconds: f64,
+    observations: u32,
+    telemetry: TelemetryAggregate,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedCudaProfile {
     schema: u32,
     key: String,
     logical_lanes: usize,
+    complete: bool,
     plan: CudaExecutionPlan,
     measured_work_per_second: f64,
+    candidate_index: usize,
+    progress: Vec<PersistedCandidateProgress>,
 }
 
 pub(crate) struct CudaExecutionTuner {
@@ -231,20 +243,25 @@ impl CudaExecutionTuner {
             return;
         }
 
-        let score = self.scores.entry(self.plan).or_default();
-        score.weighted_work += work_units as f64;
-        score.seconds += elapsed.as_secs_f64();
-        score.observations = score.observations.saturating_add(1);
-        if let Some(sample) = telemetry {
-            score.telemetry.add(sample);
-        }
-        if score.observations < OBSERVATIONS_PER_CANDIDATE {
+        let observations = {
+            let score = self.scores.entry(self.plan).or_default();
+            score.weighted_work += work_units as f64;
+            score.seconds += elapsed.as_secs_f64();
+            score.observations = score.observations.saturating_add(1);
+            if let Some(sample) = telemetry {
+                score.telemetry.add(sample);
+            }
+            score.observations
+        };
+        if observations < OBSERVATIONS_PER_CANDIDATE {
+            self.persist_progress_best_effort();
             return;
         }
 
         if self.candidate_index + 1 < self.candidates.len() {
             self.candidate_index += 1;
             self.plan = self.candidates[self.candidate_index];
+            self.persist_progress_best_effort();
             return;
         }
 
@@ -261,7 +278,9 @@ impl CudaExecutionTuner {
         if let Some((best_plan, throughput)) = best {
             self.plan = best_plan;
             self.tuning_complete = true;
-            let _ = self.persist_profile(throughput);
+            if let Err(error) = self.persist_profile(true, throughput) {
+                emit_cache_error(&error);
+            }
             self.emit_tuning_summary(throughput);
         }
     }
@@ -280,9 +299,13 @@ impl CudaExecutionTuner {
         self.tuning_complete = false;
 
         if let Some(profile) = self.load_profile(logical_lanes) {
-            self.plan = sanitize_plan(profile.plan, self.limits, logical_lanes);
-            self.candidates = vec![self.plan];
-            self.tuning_complete = true;
+            if profile.complete {
+                self.plan = sanitize_plan(profile.plan, self.limits, logical_lanes);
+                self.candidates = vec![self.plan];
+                self.tuning_complete = true;
+            } else {
+                self.restore_progress(profile, logical_lanes);
+            }
         }
     }
 
@@ -302,17 +325,75 @@ impl CudaExecutionTuner {
             .then_some(profile)
     }
 
-    fn persist_profile(&self, throughput: f64) -> LeoResult<()> {
+    fn restore_progress(&mut self, profile: PersistedCudaProfile, logical_lanes: usize) {
+        for saved in profile.progress {
+            let plan = sanitize_plan(saved.plan, self.limits, logical_lanes);
+            if !self.candidates.contains(&plan) {
+                continue;
+            }
+            self.scores.insert(
+                plan,
+                CandidateScore {
+                    weighted_work: saved.weighted_work,
+                    seconds: saved.seconds,
+                    observations: saved.observations.min(OBSERVATIONS_PER_CANDIDATE),
+                    telemetry: saved.telemetry,
+                },
+            );
+        }
+
+        let restored_plan = sanitize_plan(profile.plan, self.limits, logical_lanes);
+        self.candidate_index = self
+            .candidates
+            .iter()
+            .position(|candidate| *candidate == restored_plan)
+            .unwrap_or_else(|| {
+                profile
+                    .candidate_index
+                    .min(self.candidates.len().saturating_sub(1))
+            });
+        self.plan = self.candidates[self.candidate_index];
+        self.tuning_complete = false;
+        eprintln!(
+            "{{\"event\":\"cuda_autotune_resumed\",\"logical_lanes\":{},\"candidate_index\":{},\"candidate_count\":{},\"restored_scores\":{}}}",
+            logical_lanes,
+            self.candidate_index,
+            self.candidates.len(),
+            self.scores.len(),
+        );
+    }
+
+    fn persist_progress_best_effort(&self) {
+        if let Err(error) = self.persist_profile(false, 0.0) {
+            emit_cache_error(&error);
+        }
+    }
+
+    fn persist_profile(&self, complete: bool, throughput: f64) -> LeoResult<()> {
         let logical_lanes = self.active_logical_lanes.max(1);
         let Some(path) = self.profile_path(logical_lanes) else {
             return Ok(());
         };
+        let progress = self
+            .scores
+            .iter()
+            .map(|(plan, score)| PersistedCandidateProgress {
+                plan: *plan,
+                weighted_work: score.weighted_work,
+                seconds: score.seconds,
+                observations: score.observations,
+                telemetry: score.telemetry.clone(),
+            })
+            .collect();
         let profile = PersistedCudaProfile {
             schema: PROFILE_SCHEMA,
             key: self.key.clone(),
             logical_lanes,
+            complete,
             plan: self.plan,
             measured_work_per_second: throughput,
+            candidate_index: self.candidate_index,
+            progress,
         };
         let text = toml::to_string(&profile)
             .map_err(|error| LeoError::cuda(format!("could not encode CUDA profile: {error}")))?;
@@ -361,6 +442,13 @@ impl CudaExecutionTuner {
     }
 }
 
+fn emit_cache_error(error: &LeoError) {
+    eprintln!(
+        "{{\"event\":\"cuda_autotune_cache_error\",\"message\":\"{}\"}}",
+        error.message().replace('\\', "\\\\").replace('"', "\\\"")
+    );
+}
+
 fn heuristic_plan(limits: CudaTuningLimits, logical_lanes: usize) -> CudaExecutionPlan {
     let sparse_threads = 256;
     let fused_threads = FUSED_WAVEFRONT_THREADS;
@@ -402,7 +490,12 @@ fn build_candidates(
     logical_lanes: usize,
     baseline: CudaExecutionPlan,
 ) -> Vec<CudaExecutionPlan> {
-    let mut candidates = Vec::with_capacity(24);
+    // Exact v1 story batching no longer performs a per-byte sparse apply/reset,
+    // so sparse_apply_* is legacy execution metadata rather than an active
+    // tuning dimension. Search only dimensions that affect this fast path: the
+    // number of concurrently staged story lanes and the cooperative fused-grid
+    // width. This keeps online tuning short and makes persisted progress useful.
+    let mut candidates = Vec::with_capacity(16);
     push_unique(&mut candidates, baseline);
 
     for lane in LANE_CANDIDATES {
@@ -410,50 +503,25 @@ fn build_candidates(
         plan.physical_lane_chunk = lane.min(logical_lanes).max(1);
         push_unique(&mut candidates, plan);
     }
-    for threads in SPARSE_THREAD_CANDIDATES {
-        let mut plan = baseline;
-        plan.sparse_apply_threads = threads;
-        push_unique(&mut candidates, plan);
-    }
-    for multiplier in BLOCK_MULTIPLIERS {
-        let mut plan = baseline;
-        plan.sparse_apply_blocks = limits.multiprocessors.saturating_mul(multiplier).max(1);
-        push_unique(&mut candidates, plan);
-    }
+
     let max_fused = limits.max_fused_blocks(FUSED_WAVEFRONT_THREADS);
     if max_fused > 0 {
         for divisor in [4u32, 2, 1] {
             let mut plan = baseline;
-            plan.fused_wavefront_threads = FUSED_WAVEFRONT_THREADS;
             plan.fused_wavefront_blocks = max_fused.div_ceil(divisor).max(1);
             push_unique(&mut candidates, plan);
         }
-    }
 
-    // A small deterministic mixed set catches interaction effects without an
-    // expensive Cartesian search that would burn many production batches.
-    for index in 0..8usize {
-        let lane = LANE_CANDIDATES[index % LANE_CANDIDATES.len()]
-            .min(logical_lanes)
-            .max(1);
-        let sparse_threads = SPARSE_THREAD_CANDIDATES[index % SPARSE_THREAD_CANDIDATES.len()];
-        let fused_threads = FUSED_WAVEFRONT_THREADS;
-        let sparse_multiplier = BLOCK_MULTIPLIERS[(index + 2) % BLOCK_MULTIPLIERS.len()];
-        let mut plan = CudaExecutionPlan {
-            physical_lane_chunk: lane,
-            sparse_apply_blocks: limits
-                .multiprocessors
-                .saturating_mul(sparse_multiplier)
-                .max(1),
-            sparse_apply_threads: sparse_threads,
-            fused_wavefront_blocks: limits.max_fused_blocks(fused_threads),
-            fused_wavefront_threads: fused_threads,
-        };
-        let max_fused = limits.max_fused_blocks(fused_threads);
-        if index % 2 == 1 && max_fused > 1 {
-            plan.fused_wavefront_blocks = ((max_fused + 1) / 2).max(1);
+        // A small deterministic interaction set catches lane/grid coupling
+        // without spending production batches on dimensions that are inactive
+        // in the exact story-batch path.
+        let half_grid = max_fused.div_ceil(2).max(1);
+        for lane in LANE_CANDIDATES {
+            let mut plan = baseline;
+            plan.physical_lane_chunk = lane.min(logical_lanes).max(1);
+            plan.fused_wavefront_blocks = half_grid;
+            push_unique(&mut candidates, plan);
         }
-        push_unique(&mut candidates, plan);
     }
 
     candidates
@@ -511,19 +579,44 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> LeoResult<()> {
     })?;
     let sequence = CACHE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), sequence));
-    fs::write(&tmp, bytes).map_err(|error| {
+    let mut file = fs::File::create(&tmp).map_err(|error| {
+        LeoError::cuda(format!(
+            "could not create CUDA cache {}: {error}",
+            tmp.display()
+        ))
+    })?;
+    file.write_all(bytes).map_err(|error| {
         LeoError::cuda(format!(
             "could not write CUDA cache {}: {error}",
             tmp.display()
         ))
     })?;
+    file.sync_all().map_err(|error| {
+        LeoError::cuda(format!(
+            "could not sync CUDA cache {}: {error}",
+            tmp.display()
+        ))
+    })?;
+    drop(file);
     fs::rename(&tmp, path).map_err(|error| {
         let _ = fs::remove_file(&tmp);
         LeoError::cuda(format!(
             "could not publish CUDA cache {}: {error}",
             path.display()
         ))
-    })
+    })?;
+    #[cfg(unix)]
+    {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                LeoError::cuda(format!(
+                    "could not sync CUDA cache directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -556,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn tuning_searches_multiple_launch_dimensions() {
+    fn tuning_searches_only_dimensions_used_by_exact_story_batch() {
         let baseline = heuristic_plan(limits(), 64);
         let candidates = build_candidates(limits(), 64, baseline);
         assert!(candidates
@@ -564,10 +657,10 @@ mod tests {
             .any(|plan| plan.physical_lane_chunk != baseline.physical_lane_chunk));
         assert!(candidates
             .iter()
-            .any(|plan| plan.sparse_apply_threads != baseline.sparse_apply_threads));
+            .all(|plan| plan.sparse_apply_threads == baseline.sparse_apply_threads));
         assert!(candidates
             .iter()
-            .any(|plan| plan.sparse_apply_blocks != baseline.sparse_apply_blocks));
+            .all(|plan| plan.sparse_apply_blocks == baseline.sparse_apply_blocks));
         assert!(candidates
             .iter()
             .any(|plan| plan.fused_wavefront_blocks != baseline.fused_wavefront_blocks));
@@ -584,5 +677,42 @@ mod tests {
         assert!(partial.physical_lane_chunk <= 7);
         assert!(full.physical_lane_chunk <= 64);
         assert_eq!(tuner.active_logical_lanes, 64);
+    }
+    #[test]
+    fn incomplete_profile_resumes_candidate_progress() {
+        let root = std::env::temp_dir().join(format!(
+            "leo-cuda-plan-resume-{}-{}",
+            std::process::id(),
+            CACHE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        let mut first = CudaExecutionTuner::new("resume-test".to_string(), limits());
+        first.profile_root = Some(root.clone());
+        let plan = first.plan_for(16);
+        first.observe_batch(
+            16,
+            128,
+            Duration::from_millis(10),
+            Some(CudaBatchTelemetry::default()),
+        );
+        assert!(!first.tuning_complete);
+        assert_eq!(
+            first.scores.get(&plan).map(|score| score.observations),
+            Some(1)
+        );
+
+        let mut resumed = CudaExecutionTuner::new("resume-test".to_string(), limits());
+        resumed.profile_root = Some(root.clone());
+        assert_eq!(resumed.plan_for(16), plan);
+        assert_eq!(
+            resumed.scores.get(&plan).map(|score| score.observations),
+            Some(1)
+        );
+        resumed.observe_batch(16, 128, Duration::from_millis(10), None);
+        assert_eq!(resumed.candidate_index, 1);
+        assert_ne!(resumed.plan, plan);
+
+        let _ = fs::remove_dir_all(root);
     }
 }

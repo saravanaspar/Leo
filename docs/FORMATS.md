@@ -1,6 +1,6 @@
-# Leo v1.0.0 artifact formats
+# Leo v1.0.1 artifact formats
 
-v1.0.0 intentionally establishes a clean artifact baseline. Pre-v1 experimental artifacts are not read by the v1 runtime; fresh training is the supported migration path for this release.
+v1.0.0 established the clean v1 artifact baseline. v1.0.1 preserves the same dataset/checkpoint schema versions and `PSCLS100` checkpoint format. Pre-v1 experimental artifacts are not read by the v1 runtime; fresh training remains the supported migration path for those artifacts.
 
 ## Checkpoint: PSCLS100
 

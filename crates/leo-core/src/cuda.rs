@@ -10,7 +10,10 @@ use crate::cuda_plan::{
     atomic_write, cache_root, CudaBatchTelemetry, CudaExecutionPlan, CudaExecutionTuner,
     CudaTuningLimits,
 };
-use crate::parallel::MergeMetrics;
+use crate::parallel::{
+    apply_mean_deltas, merged_parameter_changes, MergeMetrics, SparseModelDelta, StatisticsDelta,
+    TrackedModelValues,
+};
 use crate::runtime::ParameterChanges;
 use crate::symbols::{
     is_input_symbol, output_index_to_symbol, output_symbol_to_index, BEGIN_DOCUMENT, END_DOCUMENT,
@@ -70,6 +73,17 @@ fn cuda_kernel_source() -> String {
     source.push('\n');
     source.push_str(CUDA_KERNEL_BODY);
     source
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CudaPhaseProfileReport {
+    logical_lanes: usize,
+    fused_launches_total: u64,
+    sample_stride: u64,
+    planned_fused_blocks: u32,
+    geometry_skipped_samples: u64,
+    sampled_grid_blocks_max: u32,
+    skipped_grid_blocks_max: u32,
 }
 
 fn cuda_phase_profile_sample_stride() -> Option<u64> {
@@ -243,6 +257,7 @@ type CuMemcpyHtoD = unsafe extern "C" fn(CuDevicePtr, *const c_void, usize) -> c
 type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, CuDevicePtr, usize) -> c_int;
 type CuMemcpyHtoDAsync = unsafe extern "C" fn(CuDevicePtr, *const c_void, usize, CuStream) -> c_int;
 type CuMemcpyDtoHAsync = unsafe extern "C" fn(*mut c_void, CuDevicePtr, usize, CuStream) -> c_int;
+type CuMemcpyDtoDAsync = unsafe extern "C" fn(CuDevicePtr, CuDevicePtr, usize, CuStream) -> c_int;
 type CuLaunchKernel = unsafe extern "C" fn(
     CuFunction,
     c_uint,
@@ -426,6 +441,7 @@ struct DriverFunctions {
     memcpy_dtoh: CuMemcpyDtoH,
     memcpy_htod_async: CuMemcpyHtoDAsync,
     memcpy_dtoh_async: CuMemcpyDtoHAsync,
+    memcpy_dtod_async: CuMemcpyDtoDAsync,
     launch_kernel: CuLaunchKernel,
     launch_cooperative_kernel: CuLaunchCooperativeKernel,
     occupancy_max_active_blocks_per_multiprocessor: CuOccupancyMaxActiveBlocksPerMultiprocessor,
@@ -544,6 +560,11 @@ impl DriverFunctions {
                 library,
                 &["cuMemcpyDtoHAsync_v2", "cuMemcpyDtoHAsync"],
                 CuMemcpyDtoHAsync
+            ),
+            memcpy_dtod_async: load_function!(
+                library,
+                &["cuMemcpyDtoDAsync_v2", "cuMemcpyDtoDAsync"],
+                CuMemcpyDtoDAsync
             ),
             launch_kernel: load_function!(library, &["cuLaunchKernel"], CuLaunchKernel),
             launch_cooperative_kernel: load_function!(
@@ -1291,14 +1312,21 @@ pub(crate) struct CudaRuntime {
 
 unsafe impl Send for CudaRuntime {}
 
-/// Lightweight Stage 3 story lane. Model/topology tensors stay owned by the
-/// canonical `CudaRuntime`; a lane owns only recurrent, eligibility, context
-/// history, selection, and metric state. This removes the ~123 MiB model copy
-/// that Stage 2 allocated for every story.
+/// Exact logical-story lane for the shared CUDA wavefront executor.
+///
+/// Immutable topology/configuration tensors stay owned by the canonical
+/// `CudaRuntime`. Each lane owns the mutable learned parameters plus its
+/// recurrent/eligibility/context-history state so one story can never observe
+/// another story's updates before the canonical batch-end mean barrier.
+/// This is intentionally much lighter than cloning a complete CUDA runtime per
+/// worker: static topology, launch infrastructure, scratch planning, streams,
+/// modules, and the canonical model remain shared.
 pub(crate) struct CudaBatchLane {
     shared: Arc<SharedCuda>,
     buffers: Buffers,
     current_tick: u64,
+    /// Canonical parameter revision currently mirrored by the lane before story-local updates.
+    model_revision: u64,
     host_pointer_table: PinnedHostBuffer,
     host_steps: PinnedHostBuffer,
     host_records: PinnedHostBuffer,
@@ -1310,6 +1338,30 @@ impl CudaBatchLane {
     fn owned_buffers(&self) -> Vec<DeviceBuffer> {
         let b = self.buffers;
         vec![
+            b.threshold,
+            b.recurrent_weight,
+            b.input_weight,
+            b.output_weight,
+            b.output_bias,
+            b.context_keys,
+            b.context_embeddings,
+            b.context_observations,
+            b.context_output_weight,
+            b.changed_threshold_marks,
+            b.changed_threshold_list,
+            b.changed_threshold_count,
+            b.changed_recurrent_marks,
+            b.changed_recurrent_list,
+            b.changed_recurrent_count,
+            b.changed_input_marks,
+            b.changed_input_list,
+            b.changed_input_count,
+            b.changed_output_marks,
+            b.changed_output_list,
+            b.changed_output_count,
+            b.changed_context_marks,
+            b.changed_context_list,
+            b.changed_context_count,
             b.membrane,
             b.activation,
             b.fatigue,
@@ -1732,9 +1784,52 @@ impl CudaRuntime {
             .saturating_mul(self.model.config.model.max_active_per_block);
         let context_dim = self.model.config.context.embedding_dim;
         let max_order = self.model.config.context.max_order;
+        let context_slots = max_order.saturating_mul(self.model.config.context.slots_per_order);
         let ring_records = RING_BUCKETS.saturating_mul(active);
         let ring_weights = ring_records.saturating_mul(self.model.recurrent.capacity_per_neuron);
-        let mut b = Buffers::default();
+
+        // Construct the owner before the first fallible allocation. If any
+        // device or pinned-host allocation fails, `CudaBatchLane::drop` frees
+        // every buffer acquired so far instead of leaking a partial lane.
+        let mut lane = CudaBatchLane {
+            shared: Arc::clone(&self.shared),
+            buffers: Buffers::default(),
+            current_tick: 0,
+            model_revision: self.model.parameter_revision,
+            host_pointer_table: PinnedHostBuffer::default(),
+            host_steps: PinnedHostBuffer::default(),
+            host_records: PinnedHostBuffer::default(),
+        };
+        let b = &mut lane.buffers;
+
+        // Exact logical-batch semantics require every story to evolve its own
+        // learned parameter image until the one canonical batch-end mean. Keep
+        // topology/configuration shared; duplicate only mutable learned state.
+        b.threshold = self.allocate_f32(n)?;
+        b.recurrent_weight = self.allocate_f32(recurrent)?;
+        b.input_weight = self.allocate_f32(input)?;
+        b.output_weight = self.allocate_f32(n.saturating_mul(OUTPUT_CLASSES))?;
+        b.output_bias = self.allocate_f32(OUTPUT_CLASSES)?;
+        b.context_keys = self.allocate_u64(context_slots)?;
+        b.context_embeddings = self.allocate_f32(context_slots.saturating_mul(context_dim))?;
+        b.context_observations = self.allocate_u32(context_slots)?;
+        b.context_output_weight = self.allocate_f32(OUTPUT_CLASSES.saturating_mul(context_dim))?;
+
+        b.changed_threshold_marks = self.allocate_u32(n)?;
+        b.changed_threshold_list = self.allocate_u32(n)?;
+        b.changed_threshold_count = self.allocate_u32(1)?;
+        b.changed_recurrent_marks = self.allocate_u32(recurrent)?;
+        b.changed_recurrent_list = self.allocate_u32(recurrent)?;
+        b.changed_recurrent_count = self.allocate_u32(1)?;
+        b.changed_input_marks = self.allocate_u32(input)?;
+        b.changed_input_list = self.allocate_u32(input)?;
+        b.changed_input_count = self.allocate_u32(1)?;
+        b.changed_output_marks = self.allocate_u32(n)?;
+        b.changed_output_list = self.allocate_u32(n)?;
+        b.changed_output_count = self.allocate_u32(1)?;
+        b.changed_context_marks = self.allocate_u32(context_slots)?;
+        b.changed_context_list = self.allocate_u32(context_slots)?;
+        b.changed_context_count = self.allocate_u32(1)?;
 
         b.membrane = self.allocate_f32(n)?;
         b.activation = self.allocate_f32(n)?;
@@ -1819,31 +1914,39 @@ impl CudaRuntime {
         )?;
         b.persistent_pointer_table = self.allocate_u64(PERSISTENT_POINTER_COUNT)?;
 
-        let mut lane = CudaBatchLane {
-            shared: Arc::clone(&self.shared),
-            buffers: b,
-            current_tick: 0,
-            host_pointer_table: self.allocate_pinned_host(
-                PERSISTENT_POINTER_COUNT.saturating_mul(mem::size_of::<CuDevicePtr>()),
-            )?,
-            host_steps: self.allocate_pinned_host(
-                TRAINING_STEP_BATCH_CAPACITY.saturating_mul(mem::size_of::<CudaPersistentStep>()),
-            )?,
-            host_records: self.allocate_pinned_host(
-                TRAINING_STEP_BATCH_CAPACITY
-                    .saturating_mul(mem::size_of::<CudaTrainingStepRecord>()),
-            )?,
-        };
-        self.reset_shared_batch_lane(&mut lane)?;
-        let pointer_table = self.shared_batch_pointer_table(&lane);
-        pinned_write(lane.host_pointer_table, &pointer_table)?;
-        self.copy_pinned_to_device_async::<CuDevicePtr>(
-            lane.buffers.persistent_pointer_table,
-            lane.host_pointer_table,
-            PERSISTENT_POINTER_COUNT,
+        lane.host_pointer_table = self.allocate_pinned_host(
+            PERSISTENT_POINTER_COUNT.saturating_mul(mem::size_of::<CuDevicePtr>()),
         )?;
+        lane.host_steps = self.allocate_pinned_host(
+            TRAINING_STEP_BATCH_CAPACITY.saturating_mul(mem::size_of::<CudaPersistentStep>()),
+        )?;
+        lane.host_records = self.allocate_pinned_host(
+            TRAINING_STEP_BATCH_CAPACITY.saturating_mul(mem::size_of::<CudaTrainingStepRecord>()),
+        )?;
+        self.copy_canonical_parameters_to_batch_lane_async(&lane)?;
+        self.reset_shared_batch_lane(&mut lane)?;
+        self.refresh_shared_batch_pointer_table_async(&lane)?;
         self.synchronize()?;
         Ok(lane)
+    }
+
+    fn copy_canonical_parameters_to_batch_lane_async(&self, lane: &CudaBatchLane) -> LeoResult<()> {
+        let source = self.buffers;
+        let target = lane.buffers;
+        for (dst, src) in [
+            (target.threshold, source.threshold),
+            (target.recurrent_weight, source.recurrent_weight),
+            (target.input_weight, source.input_weight),
+            (target.output_weight, source.output_weight),
+            (target.output_bias, source.output_bias),
+            (target.context_keys, source.context_keys),
+            (target.context_embeddings, source.context_embeddings),
+            (target.context_observations, source.context_observations),
+            (target.context_output_weight, source.context_output_weight),
+        ] {
+            self.copy_device_to_device_async_on(dst, src, self.transfer_stream)?;
+        }
+        Ok(())
     }
 
     fn reset_shared_batch_lane(&self, lane: &mut CudaBatchLane) -> LeoResult<()> {
@@ -1870,6 +1973,16 @@ impl CudaRuntime {
             b.block_cutoff,
             b.population_cutoff,
             b.population_inhibition,
+            b.changed_threshold_marks,
+            b.changed_threshold_count,
+            b.changed_recurrent_marks,
+            b.changed_recurrent_count,
+            b.changed_input_marks,
+            b.changed_input_count,
+            b.changed_output_marks,
+            b.changed_output_count,
+            b.changed_context_marks,
+            b.changed_context_count,
             b.recurrent_branch_sensitivity,
             b.recurrent_membrane_sensitivity,
             b.recurrent_fatigue_sensitivity,
@@ -1919,6 +2032,36 @@ impl CudaRuntime {
     ) -> [CuDevicePtr; PERSISTENT_POINTER_COUNT] {
         let mut pointers = self.persistent_pointer_table();
         let b = lane.buffers;
+        pointers[PersistentPointer::Threshold.index()] = b.threshold.pointer;
+        pointers[PersistentPointer::RecurrentWeight.index()] = b.recurrent_weight.pointer;
+        pointers[PersistentPointer::InputWeight.index()] = b.input_weight.pointer;
+        pointers[PersistentPointer::OutputWeight.index()] = b.output_weight.pointer;
+        pointers[PersistentPointer::OutputBias.index()] = b.output_bias.pointer;
+        pointers[PersistentPointer::ContextKeys.index()] = b.context_keys.pointer;
+        pointers[PersistentPointer::ContextEmbeddings.index()] = b.context_embeddings.pointer;
+        pointers[PersistentPointer::ContextObservations.index()] = b.context_observations.pointer;
+        pointers[PersistentPointer::ContextOutputWeight.index()] = b.context_output_weight.pointer;
+        pointers[PersistentPointer::ChangedThresholdMarks.index()] =
+            b.changed_threshold_marks.pointer;
+        pointers[PersistentPointer::ChangedThresholdList.index()] =
+            b.changed_threshold_list.pointer;
+        pointers[PersistentPointer::ChangedThresholdCount.index()] =
+            b.changed_threshold_count.pointer;
+        pointers[PersistentPointer::ChangedRecurrentMarks.index()] =
+            b.changed_recurrent_marks.pointer;
+        pointers[PersistentPointer::ChangedRecurrentList.index()] =
+            b.changed_recurrent_list.pointer;
+        pointers[PersistentPointer::ChangedRecurrentCount.index()] =
+            b.changed_recurrent_count.pointer;
+        pointers[PersistentPointer::ChangedInputMarks.index()] = b.changed_input_marks.pointer;
+        pointers[PersistentPointer::ChangedInputList.index()] = b.changed_input_list.pointer;
+        pointers[PersistentPointer::ChangedInputCount.index()] = b.changed_input_count.pointer;
+        pointers[PersistentPointer::ChangedOutputMarks.index()] = b.changed_output_marks.pointer;
+        pointers[PersistentPointer::ChangedOutputList.index()] = b.changed_output_list.pointer;
+        pointers[PersistentPointer::ChangedOutputCount.index()] = b.changed_output_count.pointer;
+        pointers[PersistentPointer::ChangedContextMarks.index()] = b.changed_context_marks.pointer;
+        pointers[PersistentPointer::ChangedContextList.index()] = b.changed_context_list.pointer;
+        pointers[PersistentPointer::ChangedContextCount.index()] = b.changed_context_count.pointer;
         pointers[PersistentPointer::Membrane.index()] = b.membrane.pointer;
         pointers[PersistentPointer::Activation.index()] = b.activation.pointer;
         pointers[PersistentPointer::Fatigue.index()] = b.fatigue.pointer;
@@ -2012,6 +2155,17 @@ impl CudaRuntime {
         pointers[PersistentPointer::ErrorFlag.index()] = b.error_flag.pointer;
         pointers[PersistentPointer::TrainingStepRecords.index()] = b.training_step_records.pointer;
         pointers
+    }
+
+    fn refresh_shared_batch_pointer_table_async(&self, lane: &CudaBatchLane) -> LeoResult<()> {
+        let pointer_table = self.shared_batch_pointer_table(lane);
+        pinned_write(lane.host_pointer_table, &pointer_table)?;
+        self.copy_pinned_to_device_async_on::<CuDevicePtr>(
+            lane.buffers.persistent_pointer_table,
+            lane.host_pointer_table,
+            PERSISTENT_POINTER_COUNT,
+            self.transfer_stream,
+        )
     }
 
     fn batch_delta_pointer_table(&self) -> [CuDevicePtr; BATCH_DELTA_POINTER_COUNT] {
@@ -2615,6 +2769,12 @@ impl CudaRuntime {
             self.upload_full_model()?;
         }
 
+        // Frozen replay does not mutate the pointer topology (no learning or
+        // eligibility-list swapping), so upload the invariant pointer table
+        // once for the whole prefix instead of once per 4096-step chunk.
+        let pointer_table = self.persistent_pointer_table();
+        self.copy_to_device(self.buffers.persistent_pointer_table, &pointer_table)?;
+
         for chunk in steps.chunks(TRAINING_STEP_BATCH_CAPACITY) {
             let base_tick = self.current_tick;
             let mut device_steps = Vec::with_capacity(chunk.len());
@@ -2632,8 +2792,6 @@ impl CudaRuntime {
                 });
             }
 
-            let pointer_table = self.persistent_pointer_table();
-            self.copy_to_device(self.buffers.persistent_pointer_table, &pointer_table)?;
             self.copy_to_device(self.buffers.persistent_steps, &device_steps)?;
 
             let mut pointers = self.buffers.persistent_pointer_table.pointer;
@@ -4459,6 +4617,392 @@ impl CudaRuntime {
         Ok(())
     }
 
+    fn snapshot_batch_lane_values(
+        &mut self,
+        lane: &CudaBatchLane,
+        output_bias_dirty: bool,
+        context_output_dirty: bool,
+        revision_increment: u64,
+        statistics: StatisticsDelta,
+    ) -> LeoResult<(ParameterChanges, TrackedModelValues)> {
+        let b = lane.buffers;
+        let threshold =
+            self.read_change_list(b.changed_threshold_list, b.changed_threshold_count)?;
+        let recurrent_weight =
+            self.read_change_list(b.changed_recurrent_list, b.changed_recurrent_count)?;
+        let input_weight = self.read_change_list(b.changed_input_list, b.changed_input_count)?;
+        let output_neurons =
+            self.read_change_list(b.changed_output_list, b.changed_output_count)?;
+        let context_slots =
+            self.read_change_list(b.changed_context_list, b.changed_context_count)?;
+        let changes = ParameterChanges {
+            threshold,
+            recurrent_weight,
+            input_weight,
+            output_neurons,
+            context_slots,
+            output_bias_dirty,
+            context_output_dirty,
+        };
+        let scratch = self.buffers;
+
+        if !changes.threshold.is_empty() {
+            self.launch_gather_f32(
+                b.threshold,
+                b.changed_threshold_list,
+                b.changed_threshold_count,
+                scratch.gather_threshold,
+                changes.threshold.len(),
+            )?;
+        }
+        if !changes.recurrent_weight.is_empty() {
+            self.launch_gather_f32(
+                b.recurrent_weight,
+                b.changed_recurrent_list,
+                b.changed_recurrent_count,
+                scratch.gather_recurrent,
+                changes.recurrent_weight.len(),
+            )?;
+        }
+        if !changes.input_weight.is_empty() {
+            self.launch_gather_f32(
+                b.input_weight,
+                b.changed_input_list,
+                b.changed_input_count,
+                scratch.gather_input,
+                changes.input_weight.len(),
+            )?;
+        }
+        if !changes.output_neurons.is_empty() {
+            let mut source = b.output_weight.pointer;
+            let mut indices = b.changed_output_list.pointer;
+            let mut count = b.changed_output_count.pointer;
+            let mut output = scratch.gather_output.pointer;
+            let mut params = [
+                param(&mut source),
+                param(&mut indices),
+                param(&mut count),
+                param(&mut output),
+            ];
+            self.launch(
+                self.shared.kernels.gather_output,
+                changes.output_neurons.len().saturating_mul(OUTPUT_CLASSES),
+                THREADS,
+                &mut params,
+            )?;
+        }
+        if !changes.context_slots.is_empty() {
+            let mut keys = b.context_keys.pointer;
+            let mut observations = b.context_observations.pointer;
+            let mut embeddings = b.context_embeddings.pointer;
+            let mut embedding_dim = as_u32(
+                "context embedding dim",
+                self.model.config.context.embedding_dim,
+            )?;
+            let mut indices = b.changed_context_list.pointer;
+            let mut count = b.changed_context_count.pointer;
+            let mut out_keys = scratch.gather_context_keys.pointer;
+            let mut out_obs = scratch.gather_context_observations.pointer;
+            let mut out_embeddings = scratch.gather_context_embeddings.pointer;
+            let mut params = [
+                param(&mut keys),
+                param(&mut observations),
+                param(&mut embeddings),
+                param(&mut embedding_dim),
+                param(&mut indices),
+                param(&mut count),
+                param(&mut out_keys),
+                param(&mut out_obs),
+                param(&mut out_embeddings),
+            ];
+            self.launch(
+                self.shared.kernels.gather_context,
+                changes
+                    .context_slots
+                    .len()
+                    .saturating_mul(self.model.config.context.embedding_dim)
+                    .max(changes.context_slots.len()),
+                THREADS,
+                &mut params,
+            )?;
+        }
+        self.synchronize()?;
+
+        let mut values = TrackedModelValues {
+            revision_increment,
+            statistics,
+            ..TrackedModelValues::default()
+        };
+        values.threshold = vec![0.0; changes.threshold.len()];
+        values.recurrent_weight = vec![0.0; changes.recurrent_weight.len()];
+        values.input_weight = vec![0.0; changes.input_weight.len()];
+        values.output_weight_by_neuron =
+            vec![0.0; changes.output_neurons.len().saturating_mul(OUTPUT_CLASSES)];
+        values.context_keys = vec![0; changes.context_slots.len()];
+        values.context_observations = vec![0; changes.context_slots.len()];
+        let context_dim = self.model.config.context.embedding_dim;
+        values.context_embeddings =
+            vec![0.0; changes.context_slots.len().saturating_mul(context_dim)];
+
+        if !values.threshold.is_empty() {
+            self.copy_from_device_prefix(scratch.gather_threshold, &mut values.threshold)?;
+        }
+        if !values.recurrent_weight.is_empty() {
+            self.copy_from_device_prefix(scratch.gather_recurrent, &mut values.recurrent_weight)?;
+        }
+        if !values.input_weight.is_empty() {
+            self.copy_from_device_prefix(scratch.gather_input, &mut values.input_weight)?;
+        }
+        if !values.output_weight_by_neuron.is_empty() {
+            self.copy_from_device_prefix(
+                scratch.gather_output,
+                &mut values.output_weight_by_neuron,
+            )?;
+        }
+        if output_bias_dirty {
+            let mut output_bias = vec![0.0; OUTPUT_CLASSES];
+            self.copy_from_device(b.output_bias, &mut output_bias)?;
+            values.output_bias = Some(output_bias);
+        }
+        if !values.context_keys.is_empty() {
+            self.copy_from_device_prefix(scratch.gather_context_keys, &mut values.context_keys)?;
+            self.copy_from_device_prefix(
+                scratch.gather_context_observations,
+                &mut values.context_observations,
+            )?;
+            self.copy_from_device_prefix(
+                scratch.gather_context_embeddings,
+                &mut values.context_embeddings,
+            )?;
+        }
+        if context_output_dirty {
+            let mut context_output = vec![0.0; self.model.context.output_weights.len()];
+            self.copy_from_device(b.context_output_weight, &mut context_output)?;
+            values.context_output_weight = Some(context_output);
+        }
+
+        for (marks, list, count, changed_count) in [
+            (
+                b.changed_threshold_marks,
+                b.changed_threshold_list,
+                b.changed_threshold_count,
+                changes.threshold.len(),
+            ),
+            (
+                b.changed_recurrent_marks,
+                b.changed_recurrent_list,
+                b.changed_recurrent_count,
+                changes.recurrent_weight.len(),
+            ),
+            (
+                b.changed_input_marks,
+                b.changed_input_list,
+                b.changed_input_count,
+                changes.input_weight.len(),
+            ),
+            (
+                b.changed_output_marks,
+                b.changed_output_list,
+                b.changed_output_count,
+                changes.output_neurons.len(),
+            ),
+            (
+                b.changed_context_marks,
+                b.changed_context_list,
+                b.changed_context_count,
+                changes.context_slots.len(),
+            ),
+        ] {
+            self.clear_change_list(marks, list, count, changed_count)?;
+        }
+        self.synchronize()?;
+        Ok((changes, values))
+    }
+
+    /// Upload sparse values from the canonical host mirror into this runtime's
+    /// resident canonical CUDA parameter buffers. This deliberately does not
+    /// clone the complete model and does not touch transient state.
+    fn upload_current_sparse_model(&mut self, changes: &ParameterChanges) -> LeoResult<()> {
+        let b = self.buffers;
+        let to_u32 = |label: &str, indices: &[usize]| -> LeoResult<Vec<u32>> {
+            indices.iter().map(|&value| as_u32(label, value)).collect()
+        };
+
+        let threshold_indices = to_u32("threshold", &changes.threshold)?;
+        let threshold_values = changes
+            .threshold
+            .iter()
+            .map(|&index| self.model.neurons.threshold[index])
+            .collect::<Vec<_>>();
+        let recurrent_indices = to_u32("recurrent", &changes.recurrent_weight)?;
+        let recurrent_values = changes
+            .recurrent_weight
+            .iter()
+            .map(|&index| self.model.recurrent.weight[index])
+            .collect::<Vec<_>>();
+        let input_indices = to_u32("input", &changes.input_weight)?;
+        let input_values = changes
+            .input_weight
+            .iter()
+            .map(|&index| self.model.input.weights[index])
+            .collect::<Vec<_>>();
+        let output_indices = to_u32("output neuron", &changes.output_neurons)?;
+        let neuron_count = self.model.neuron_count();
+        let mut output_values =
+            Vec::with_capacity(changes.output_neurons.len().saturating_mul(OUTPUT_CLASSES));
+        for &neuron in &changes.output_neurons {
+            if neuron >= neuron_count {
+                return Err(LeoError::cuda(
+                    "output neuron sparse upload index is out of range",
+                ));
+            }
+            for output in 0..OUTPUT_CLASSES {
+                output_values.push(self.model.output.weights[output * neuron_count + neuron]);
+            }
+        }
+        let context_indices = to_u32("context slot", &changes.context_slots)?;
+        let dim = self.model.config.context.embedding_dim;
+        let mut context_keys = Vec::with_capacity(changes.context_slots.len());
+        let mut context_observations = Vec::with_capacity(changes.context_slots.len());
+        let mut context_embeddings =
+            Vec::with_capacity(changes.context_slots.len().saturating_mul(dim));
+        for &slot in &changes.context_slots {
+            if slot >= self.model.context.keys.len() {
+                return Err(LeoError::cuda("context sparse upload slot is out of range"));
+            }
+            context_keys.push(self.model.context.keys[slot]);
+            context_observations.push(self.model.context.observations[slot]);
+            let start = slot * dim;
+            context_embeddings
+                .extend_from_slice(&self.model.context.embeddings[start..start + dim]);
+        }
+        let output_bias = changes
+            .output_bias_dirty
+            .then(|| self.model.output.bias.clone());
+        let context_output = changes
+            .context_output_dirty
+            .then(|| self.model.context.output_weights.clone());
+
+        let scatter_f32 = |target: DeviceBuffer,
+                           index_buffer: DeviceBuffer,
+                           value_buffer: DeviceBuffer,
+                           indices: &[u32],
+                           values: &[f32],
+                           label: &str|
+         -> LeoResult<()> {
+            if indices.is_empty() {
+                return Ok(());
+            }
+            self.copy_to_device(index_buffer, indices)?;
+            self.copy_to_device(value_buffer, values)?;
+            let mut target_ptr = target.pointer;
+            let mut indices_ptr = index_buffer.pointer;
+            let mut count = as_u32(label, indices.len())?;
+            let mut values_ptr = value_buffer.pointer;
+            let mut params = [
+                param(&mut target_ptr),
+                param(&mut indices_ptr),
+                param(&mut count),
+                param(&mut values_ptr),
+            ];
+            self.launch(
+                self.shared.kernels.scatter_f32,
+                indices.len(),
+                THREADS,
+                &mut params,
+            )
+        };
+        scatter_f32(
+            b.threshold,
+            b.changed_threshold_list,
+            b.gather_threshold,
+            &threshold_indices,
+            &threshold_values,
+            "threshold count",
+        )?;
+        scatter_f32(
+            b.recurrent_weight,
+            b.changed_recurrent_list,
+            b.gather_recurrent,
+            &recurrent_indices,
+            &recurrent_values,
+            "recurrent count",
+        )?;
+        scatter_f32(
+            b.input_weight,
+            b.changed_input_list,
+            b.gather_input,
+            &input_indices,
+            &input_values,
+            "input count",
+        )?;
+
+        if !output_indices.is_empty() {
+            self.copy_to_device(b.changed_output_list, &output_indices)?;
+            self.copy_to_device(b.gather_output, &output_values)?;
+            let mut target = b.output_weight.pointer;
+            let mut indices = b.changed_output_list.pointer;
+            let mut count = as_u32("output neuron count", output_indices.len())?;
+            let mut packed = b.gather_output.pointer;
+            let mut params = [
+                param(&mut target),
+                param(&mut indices),
+                param(&mut count),
+                param(&mut packed),
+            ];
+            self.launch(
+                self.shared.kernels.scatter_output,
+                output_values.len(),
+                THREADS,
+                &mut params,
+            )?;
+        }
+
+        if !context_indices.is_empty() {
+            self.copy_to_device(b.changed_context_list, &context_indices)?;
+            self.copy_to_device(b.gather_context_keys, &context_keys)?;
+            self.copy_to_device(b.gather_context_observations, &context_observations)?;
+            self.copy_to_device(b.gather_context_embeddings, &context_embeddings)?;
+            let mut target_keys = b.context_keys.pointer;
+            let mut target_observations = b.context_observations.pointer;
+            let mut target_embeddings = b.context_embeddings.pointer;
+            let mut embedding_dim = as_u32("context embedding dim", dim)?;
+            let mut slots = b.changed_context_list.pointer;
+            let mut count = as_u32("context slot count", context_indices.len())?;
+            let mut source_keys = b.gather_context_keys.pointer;
+            let mut source_observations = b.gather_context_observations.pointer;
+            let mut source_embeddings = b.gather_context_embeddings.pointer;
+            let mut params = [
+                param(&mut target_keys),
+                param(&mut target_observations),
+                param(&mut target_embeddings),
+                param(&mut embedding_dim),
+                param(&mut slots),
+                param(&mut count),
+                param(&mut source_keys),
+                param(&mut source_observations),
+                param(&mut source_embeddings),
+            ];
+            self.launch(
+                self.shared.kernels.scatter_context,
+                context_embeddings.len().max(context_indices.len()),
+                THREADS,
+                &mut params,
+            )?;
+        }
+        if let Some(values) = output_bias {
+            self.copy_to_device(b.output_bias, &values)?;
+        }
+        if let Some(values) = context_output {
+            self.copy_to_device(b.context_output_weight, &values)?;
+        }
+        self.synchronize()?;
+        self.model_dirty = false;
+        self.output_bias_dirty_since_sync = false;
+        self.context_output_dirty_since_sync = false;
+        Ok(())
+    }
+
     fn read_change_list(&self, list: DeviceBuffer, count: DeviceBuffer) -> LeoResult<Vec<usize>> {
         let mut host_count = [0u32; 1];
         self.copy_from_device(count, &mut host_count)?;
@@ -4518,6 +5062,10 @@ impl CudaRuntime {
         )
     }
 
+    // Retained for the legacy per-wavefront delta/graph capability. The exact
+    // v1 logical story-batch path no longer calls it because canonical updates
+    // happen once, after complete private story trajectories.
+    #[allow(dead_code)]
     fn clear_batch_delta_accumulators_async(&self) -> LeoResult<()> {
         let b = self.buffers;
         for buffer in [
@@ -4629,15 +5177,6 @@ impl CudaRuntime {
         Ok(PinnedHostBuffer { pointer, bytes })
     }
 
-    fn copy_pinned_to_device_async<T>(
-        &self,
-        buffer: DeviceBuffer,
-        host: PinnedHostBuffer,
-        elements: usize,
-    ) -> LeoResult<()> {
-        self.copy_pinned_to_device_async_on::<T>(buffer, host, elements, self.compute_stream)
-    }
-
     fn copy_pinned_to_device_async_on<T>(
         &self,
         buffer: DeviceBuffer,
@@ -4690,6 +5229,34 @@ impl CudaRuntime {
                 (self.shared.driver.memcpy_dtoh_async)(host.pointer, buffer.pointer, bytes, stream)
             },
             "cuMemcpyDtoHAsync",
+        )
+    }
+
+    fn copy_device_to_device_async_on(
+        &self,
+        target: DeviceBuffer,
+        source: DeviceBuffer,
+        stream: CuStream,
+    ) -> LeoResult<()> {
+        if target.bytes != source.bytes {
+            return Err(LeoError::cuda(format!(
+                "CUDA device copy size mismatch target={} source={}",
+                target.bytes, source.bytes
+            )));
+        }
+        if target.bytes == 0 {
+            return Ok(());
+        }
+        self.shared.driver.check(
+            unsafe {
+                (self.shared.driver.memcpy_dtod_async)(
+                    target.pointer,
+                    source.pointer,
+                    target.bytes,
+                    stream,
+                )
+            },
+            "cuMemcpyDtoDAsync",
         )
     }
 
@@ -4825,16 +5392,42 @@ impl CudaRuntime {
         self.memset_zero_async(self.buffers.phase_profile_counters)
     }
 
-    fn emit_phase_profile(
-        &self,
-        logical_lanes: usize,
-        fused_launches_total: u64,
-        sample_stride: u64,
-        planned_fused_blocks: u32,
-    ) -> LeoResult<()> {
+    fn emit_phase_profile(&self, report: CudaPhaseProfileReport) -> LeoResult<()> {
+        let CudaPhaseProfileReport {
+            logical_lanes,
+            fused_launches_total,
+            sample_stride,
+            planned_fused_blocks,
+            geometry_skipped_samples,
+            sampled_grid_blocks_max,
+            skipped_grid_blocks_max,
+        } = report;
         let mut counters = [0u64; CUDA_PHASE_PROFILE_COUNTER_COUNT];
         self.copy_from_device(self.buffers.phase_profile_counters, &mut counters)?;
         let samples = counters[CUDA_PHASE_PROFILE_SAMPLES];
+        if samples == 0 {
+            let reason = if geometry_skipped_samples > 0 {
+                "profiled_kernel_cannot_match_production_grid"
+            } else if fused_launches_total == 0 {
+                "no_fused_wavefront_launches"
+            } else {
+                "no_sampled_fused_wavefront_launches"
+            };
+            eprintln!(
+                "{{\"event\":\"cuda_phase_profile_skipped\",\"reason\":\"{}\",\"logical_lanes\":{},\"sample_stride\":{},\"planned_fused_blocks\":{},\"normal_capacity_blocks\":{},\"profiled_capacity_blocks\":{},\"geometry_skipped_samples\":{},\"sampled_grid_blocks_max\":{},\"skipped_grid_blocks_max\":{},\"fused_launches_total\":{}}}",
+                reason,
+                logical_lanes,
+                sample_stride,
+                planned_fused_blocks,
+                self.shared.fused_blocks_256,
+                self.shared.fused_profile_blocks_256,
+                geometry_skipped_samples,
+                sampled_grid_blocks_max,
+                skipped_grid_blocks_max,
+                fused_launches_total,
+            );
+            return Ok(());
+        }
         let total_cycles = counters[1..]
             .iter()
             .copied()
@@ -4859,6 +5452,8 @@ impl CudaRuntime {
                 "\"logical_lanes\":{},\"sample_stride\":{},",
                 "\"planned_fused_blocks\":{},",
                 "\"normal_capacity_blocks\":{},\"profiled_capacity_blocks\":{},",
+                "\"geometry_skipped_samples\":{},",
+                "\"sampled_grid_blocks_max\":{},\"skipped_grid_blocks_max\":{},",
                 "\"sampled_fused_launches\":{},\"fused_launches_total\":{},",
                 "\"total_profiled_cycles\":{},\"cycles_per_sample\":{},",
                 "\"pre_cycles\":{},\"pre_pct\":{},",
@@ -4876,6 +5471,9 @@ impl CudaRuntime {
             planned_fused_blocks,
             self.shared.fused_blocks_256,
             self.shared.fused_profile_blocks_256,
+            geometry_skipped_samples,
+            sampled_grid_blocks_max,
+            skipped_grid_blocks_max,
             samples,
             fused_launches_total,
             total_cycles,
@@ -4902,6 +5500,10 @@ impl CudaRuntime {
         Ok(())
     }
 
+    // Retained as a legacy execution capability for compatibility and future
+    // experiments. Exact v1 story batching must not invoke a per-byte canonical
+    // apply/reset barrier.
+    #[allow(dead_code)]
     fn launch_sparse_apply_and_reset(&mut self, blocks: u32, threads: u32) -> LeoResult<bool> {
         let plan = (blocks.max(1), threads.max(32));
         if self.sparse_apply_graph_plan != Some(plan) {
@@ -5192,16 +5794,13 @@ impl Drop for CudaRuntime {
     }
 }
 
-/// Stage 3 shared-model GPU story batch.
+/// Exact v1 GPU logical story batch.
 ///
-/// Stories keep private recurrent/eligibility state but read one canonical
-/// model. At each byte-position wavefront all live stories compute against the
-/// same model snapshot, accumulate constrained deltas scaled by `1 / workers`,
-/// and one device-side reduction applies the mean before the next wavefront.
-/// This is a synchronous mini-batch variant of the previous worker mean-delta
-/// rule: the recurrent equations and byte representation are unchanged, while
-/// parameter synchronization moves from end-of-story CPU merging to per-byte
-/// GPU merging.
+/// Stories share immutable topology/configuration but own recurrent state and
+/// mutable learned parameters for their complete trajectories. Only after every
+/// story finishes are sparse worker deltas reduced with the same canonical
+/// batch-end mean rule as the CPU reference. Physical CUDA chunking therefore
+/// changes launch geometry only, never parameter visibility or update order.
 fn device_pointer_offset(pointer: CuDevicePtr, bytes: usize) -> LeoResult<CuDevicePtr> {
     pointer
         .checked_add(bytes as u64)
@@ -5210,8 +5809,14 @@ fn device_pointer_offset(pointer: CuDevicePtr, bytes: usize) -> LeoResult<CuDevi
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WavefrontLaunchKind {
-    Fused,
-    Direct { phase_launches: u64 },
+    Fused {
+        phase_profile_sampled: bool,
+        phase_profile_geometry_skipped: bool,
+        grid_blocks: u32,
+    },
+    Direct {
+        phase_launches: u64,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -5291,7 +5896,14 @@ fn launch_shared_wavefront_chunk(
         let mut scale = batch_scale;
         let mut delta_pointers = coordinator.buffers.batch_delta_pointer_table.pointer;
 
-        if phase_profile && coordinator.shared.fused_profile_blocks_256 > 0 {
+        // clock64 instrumentation increases register pressure and can reduce
+        // cooperative residency. A sampled launch is comparable only when the
+        // profiled kernel can run the exact same grid width as production; do
+        // not silently shrink the grid just to obtain a sample.
+        let phase_profile_sampled =
+            phase_profile && coordinator.shared.fused_profile_blocks_256 >= grid_blocks;
+        let phase_profile_geometry_skipped = phase_profile && !phase_profile_sampled;
+        if phase_profile_sampled {
             let mut phase_profile_counters = coordinator.buffers.phase_profile_counters.pointer;
             let mut parameters = [
                 param(&mut pointer_tables_ptr),
@@ -5309,7 +5921,7 @@ fn launch_shared_wavefront_chunk(
             ];
             coordinator.launch_cooperative_exact(
                 coordinator.shared.kernels.shared_wavefront_fused_profiled,
-                grid_blocks.min(coordinator.shared.fused_profile_blocks_256),
+                grid_blocks,
                 SHARED_BATCH_THREADS,
                 &mut parameters,
             )?;
@@ -5334,7 +5946,11 @@ fn launch_shared_wavefront_chunk(
                 &mut parameters,
             )?;
         }
-        return Ok(WavefrontLaunchKind::Fused);
+        return Ok(WavefrontLaunchKind::Fused {
+            phase_profile_sampled,
+            phase_profile_geometry_skipped,
+            grid_blocks,
+        });
     }
 
     let mut pointer_tables_ptr = pointer_tables_base;
@@ -5570,9 +6186,18 @@ pub(crate) fn train_story_batch_shared_device(
 
     coordinator.ensure_device_model_current()?;
     coordinator.make_current()?;
-    coordinator.clear_batch_delta_accumulators_async()?;
+    let canonical_revision = coordinator.model.parameter_revision;
     for lane in lanes.iter_mut() {
+        // Constant logical worker counts stay fully device-resident between
+        // batches. A lane used after sitting out a prior batch is repaired once
+        // from the current canonical image before story-local learning starts.
+        if lane.model_revision != canonical_revision {
+            coordinator.copy_canonical_parameters_to_batch_lane_async(lane)?;
+        }
         coordinator.reset_shared_batch_lane(lane)?;
+        // Keep the lane invalid until the successful batch-end mean has been
+        // copied back. Any early CUDA error therefore forces a repair next use.
+        lane.model_revision = u64::MAX;
     }
 
     let story_steps = stories
@@ -5610,9 +6235,13 @@ pub(crate) fn train_story_batch_shared_device(
         .collect::<Vec<_>>();
     let learning_trace = !matches!(permission, Permission::Frozen);
     let strength = permission.strength(&coordinator.model.config);
+    // Retained in kernel launch ABI for compatibility with cached/source-tested
+    // launch plumbing. Exact story-local learning no longer applies this scale
+    // per byte; `apply_mean_deltas` performs the only 1/workers reduction.
     let batch_scale = 1.0f32 / lanes.len() as f32;
-    let mut total_learned_steps = 0u64;
-    let mut any_context_learning = false;
+    let mut lane_learned_steps = vec![0u64; lanes.len()];
+    let mut lane_context_learning = vec![false; lanes.len()];
+    let mut lane_statistics = vec![StatisticsDelta::default(); lanes.len()];
 
     let profile_batch = coordinator.execution_tuner.should_profile_batch();
     let mut telemetry = CudaBatchTelemetry {
@@ -5621,6 +6250,9 @@ pub(crate) fn train_story_batch_shared_device(
     };
     let phase_profile_sample_stride = coordinator.phase_profile_sample_stride;
     let mut phase_profile_launch_sequence = 0u64;
+    let mut phase_profile_geometry_skips = 0u64;
+    let mut phase_profile_sampled_grid_max = 0u32;
+    let mut phase_profile_skipped_grid_max = 0u32;
     if phase_profile_sample_stride.is_some() {
         coordinator.clear_phase_profile_counters_async()?;
     }
@@ -5684,8 +6316,9 @@ pub(crate) fn train_story_batch_shared_device(
                     strength * target_weight
                 });
                 if learned {
-                    total_learned_steps = total_learned_steps.saturating_add(1);
-                    any_context_learning |= context_enabled;
+                    lane_learned_steps[lane_index] =
+                        lane_learned_steps[lane_index].saturating_add(1);
+                    lane_context_learning[lane_index] |= context_enabled;
                 }
                 device_steps.push(CudaPersistentStep {
                     symbol,
@@ -5759,8 +6392,9 @@ pub(crate) fn train_story_batch_shared_device(
         let mut compute_timing_started = false;
 
         // Pipeline the first wavefront with the lane uploads. This creates real
-        // copy/compute overlap while preserving the logical batch barrier: all
-        // physical groups still finish step 0 before the mean delta is applied.
+        // copy/compute overlap while preserving the logical batch barrier: every
+        // lane keeps its own learned parameter trajectory until the one
+        // canonical story-batch mean is applied after all wavefronts complete.
         for (group_index, lane_start) in (0..lanes.len()).step_by(physical_lane_chunk).enumerate() {
             let physical_lane_count = physical_lane_chunk.min(lanes.len() - lane_start);
             for lane_index in lane_start..lane_start + physical_lane_count {
@@ -5812,7 +6446,23 @@ pub(crate) fn train_story_batch_shared_device(
                         phase_profile,
                     },
                 )? {
-                    WavefrontLaunchKind::Fused => telemetry.fused_launches += 1,
+                    WavefrontLaunchKind::Fused {
+                        phase_profile_sampled,
+                        phase_profile_geometry_skipped,
+                        grid_blocks,
+                    } => {
+                        telemetry.fused_launches += 1;
+                        if phase_profile_sampled {
+                            phase_profile_sampled_grid_max =
+                                phase_profile_sampled_grid_max.max(grid_blocks);
+                        }
+                        if phase_profile_geometry_skipped {
+                            phase_profile_geometry_skips =
+                                phase_profile_geometry_skips.saturating_add(1);
+                            phase_profile_skipped_grid_max =
+                                phase_profile_skipped_grid_max.max(grid_blocks);
+                        }
+                    }
                     WavefrontLaunchKind::Direct { phase_launches } => {
                         telemetry.direct_phase_launches = telemetry
                             .direct_phase_launches
@@ -5828,16 +6478,6 @@ pub(crate) fn train_story_batch_shared_device(
                 coordinator.transfer_stream,
                 "cuEventRecord(h2d end)",
             )?;
-        }
-
-        if max_chunk_steps != 0
-            && learning_trace
-            && coordinator.launch_sparse_apply_and_reset(
-                execution_plan.sparse_apply_blocks,
-                execution_plan.sparse_apply_threads,
-            )?
-        {
-            telemetry.graph_launches = telemetry.graph_launches.saturating_add(1);
         }
 
         for step_index in 1..max_chunk_steps {
@@ -5860,25 +6500,29 @@ pub(crate) fn train_story_batch_shared_device(
                         phase_profile,
                     },
                 )? {
-                    WavefrontLaunchKind::Fused => telemetry.fused_launches += 1,
+                    WavefrontLaunchKind::Fused {
+                        phase_profile_sampled,
+                        phase_profile_geometry_skipped,
+                        grid_blocks,
+                    } => {
+                        telemetry.fused_launches += 1;
+                        if phase_profile_sampled {
+                            phase_profile_sampled_grid_max =
+                                phase_profile_sampled_grid_max.max(grid_blocks);
+                        }
+                        if phase_profile_geometry_skipped {
+                            phase_profile_geometry_skips =
+                                phase_profile_geometry_skips.saturating_add(1);
+                            phase_profile_skipped_grid_max =
+                                phase_profile_skipped_grid_max.max(grid_blocks);
+                        }
+                    }
                     WavefrontLaunchKind::Direct { phase_launches } => {
                         telemetry.direct_phase_launches = telemetry
                             .direct_phase_launches
                             .saturating_add(phase_launches);
                     }
                 }
-            }
-
-            // All physical chunks belong to one logical synchronized batch.
-            // Apply the accumulated mean exactly once at the existing
-            // wavefront barrier so launch geometry never changes learning.
-            if learning_trace
-                && coordinator.launch_sparse_apply_and_reset(
-                    execution_plan.sparse_apply_blocks,
-                    execution_plan.sparse_apply_threads,
-                )?
-            {
-                telemetry.graph_launches = telemetry.graph_launches.saturating_add(1);
             }
         }
 
@@ -5980,6 +6624,12 @@ pub(crate) fn train_story_batch_shared_device(
                     &mut lane.buffers.input_eligible_count,
                     &mut lane.buffers.input_next_eligible_count,
                 );
+                // Shared-batch kernels dereference the lane-resident pointer
+                // table on every wavefront. An odd chunk flips current/next
+                // eligibility buffers, so refresh that table before the next
+                // chunk just like the single-story persistent path does when it
+                // rebuilds its pointer table per chunk.
+                coordinator.refresh_shared_batch_pointer_table_async(lane)?;
             }
             lane.current_tick = lane.current_tick.saturating_add(count as u64);
 
@@ -6004,12 +6654,24 @@ pub(crate) fn train_story_batch_shared_device(
                     learned,
                 );
                 if learning_trace {
-                    coordinator.update_statistics(
-                        symbol,
-                        metrics.loss,
-                        metrics.active_neurons,
-                        metrics.emitted_events,
-                    );
+                    let statistics = &mut lane_statistics[lane_index];
+                    if symbol < 256 {
+                        statistics.processed_bytes = statistics.processed_bytes.saturating_add(1);
+                    }
+                    if let Some(value) = metrics.loss {
+                        statistics.training_loss_sum += value as f64;
+                        statistics.training_targets = statistics.training_targets.saturating_add(1);
+                    }
+                    statistics.active_neurons_sum = statistics
+                        .active_neurons_sum
+                        .saturating_add(metrics.active_neurons as u64);
+                    statistics.active_neurons_peak = statistics
+                        .active_neurons_peak
+                        .max(metrics.active_neurons as u64);
+                    statistics.synaptic_events = statistics
+                        .synaptic_events
+                        .saturating_add(metrics.emitted_events as u64);
+                    statistics.persistent_ticks = statistics.persistent_ticks.saturating_add(1);
                 }
                 story_metrics[lane_index].push(metrics);
             }
@@ -6017,24 +6679,81 @@ pub(crate) fn train_story_batch_shared_device(
     }
 
     if learning_trace {
-        let completed = story_steps.iter().filter(|steps| !steps.is_empty()).count() as u64;
-        coordinator.model.statistics.processed_stories = coordinator
-            .model
-            .statistics
-            .processed_stories
-            .saturating_add(completed);
-    }
-    coordinator.model.parameter_revision = coordinator
-        .model
-        .parameter_revision
-        .saturating_add(total_learned_steps);
-    if total_learned_steps > 0 {
-        coordinator.output_bias_dirty_since_sync = true;
-        if any_context_learning {
-            coordinator.context_output_dirty_since_sync = true;
+        for (statistics, steps) in lane_statistics.iter_mut().zip(&story_steps) {
+            if !steps.is_empty() {
+                statistics.processed_stories = statistics.processed_stories.saturating_add(1);
+            }
         }
     }
-    coordinator.model_dirty = false;
+
+    // Materialize only touched rows from each lane, then execute the exact same
+    // sparse worker reduction used by the CPU reference. The canonical model is
+    // never visible to another lane during a story.
+    let mut deltas = Vec::with_capacity(lanes.len());
+    let mut raw_changes = Vec::with_capacity(lanes.len());
+    for lane_index in 0..lanes.len() {
+        let (changes, values) = coordinator.snapshot_batch_lane_values(
+            &lanes[lane_index],
+            lane_learned_steps[lane_index] > 0,
+            lane_context_learning[lane_index],
+            lane_learned_steps[lane_index],
+            lane_statistics[lane_index].clone(),
+        )?;
+        let delta = SparseModelDelta::from_tracked_values(&coordinator.model, &changes, values)?;
+        raw_changes.push(changes);
+        deltas.push(delta);
+    }
+
+    let merge = apply_mean_deltas(&mut coordinator.model, &deltas)?;
+    let sync_changes = merged_parameter_changes(&mut coordinator.model, &deltas, &raw_changes)?;
+    coordinator.upload_current_sparse_model(&sync_changes)?;
+
+    if coordinator.track_parameter_changes {
+        accumulate_indices(
+            &sync_changes.threshold,
+            &mut coordinator.accumulated_threshold_mark,
+            &mut coordinator.accumulated_changes.threshold,
+        );
+        accumulate_indices(
+            &sync_changes.recurrent_weight,
+            &mut coordinator.accumulated_recurrent_mark,
+            &mut coordinator.accumulated_changes.recurrent_weight,
+        );
+        accumulate_indices(
+            &sync_changes.input_weight,
+            &mut coordinator.accumulated_input_mark,
+            &mut coordinator.accumulated_changes.input_weight,
+        );
+        accumulate_indices(
+            &sync_changes.output_neurons,
+            &mut coordinator.accumulated_output_mark,
+            &mut coordinator.accumulated_changes.output_neurons,
+        );
+        accumulate_indices(
+            &sync_changes.context_slots,
+            &mut coordinator.accumulated_context_mark,
+            &mut coordinator.accumulated_changes.context_slots,
+        );
+        coordinator.accumulated_changes.output_bias_dirty |= sync_changes.output_bias_dirty;
+        coordinator.accumulated_changes.context_output_dirty |= sync_changes.context_output_dirty;
+    }
+
+    // Restore active lanes from the new canonical device image using fast D2D
+    // copies. This is intentionally full learned-state copy: on P100-class
+    // bandwidth it is cheap relative to story compute, avoids a second sparse
+    // synchronization implementation, and keeps inactive-lane repair explicit.
+    for lane in lanes.iter() {
+        coordinator.copy_canonical_parameters_to_batch_lane_async(lane)?;
+    }
+    coordinator.shared.driver.check(
+        unsafe { (coordinator.shared.driver.stream_synchronize)(coordinator.transfer_stream) },
+        "cuStreamSynchronize(batch lane canonical restore)",
+    )?;
+    let merged_revision = coordinator.model.parameter_revision;
+    for lane in lanes.iter_mut() {
+        lane.model_revision = merged_revision;
+    }
+
     coordinator.execution_tuner.observe_batch(
         lanes.len(),
         tuning_work_units,
@@ -6042,33 +6761,26 @@ pub(crate) fn train_story_batch_shared_device(
         profile_batch.then_some(telemetry),
     );
     if let Some(sample_stride) = phase_profile_sample_stride {
-        coordinator.emit_phase_profile(
-            lanes.len(),
-            telemetry.fused_launches,
+        coordinator.emit_phase_profile(CudaPhaseProfileReport {
+            logical_lanes: lanes.len(),
+            fused_launches_total: telemetry.fused_launches,
             sample_stride,
-            execution_plan.fused_wavefront_blocks,
-        )?;
+            planned_fused_blocks: execution_plan.fused_wavefront_blocks,
+            geometry_skipped_samples: phase_profile_geometry_skips,
+            sampled_grid_blocks_max: phase_profile_sampled_grid_max,
+            skipped_grid_blocks_max: phase_profile_skipped_grid_max,
+        })?;
     }
     coordinator.reset_transient_state()?;
 
-    Ok((
-        story_metrics,
-        MergeMetrics {
-            workers: stories.len(),
-            // Stage 3 avoids a CPU sparse-delta materialization pass. These
-            // counters remain zero rather than forcing a device->host change
-            // list read solely for logging.
-            fixed_parameter_updates: 0,
-            context_keys: 0,
-        },
-    ))
+    Ok((story_metrics, merge))
 }
 
 fn cuda_execution_profile_key(model: &Model, shared: &SharedCuda) -> String {
     let source_digest = crate::digest_bytes(cuda_kernel_source().as_bytes());
     let material = format!(
         concat!(
-            "leo-cuda-plan-v3|device={}|name={}|uuid={}|pci={}|vram={}|driver={}|",
+            "leo-cuda-plan-v4|device={}|name={}|uuid={}|pci={}|vram={}|driver={}|",
             "cc={}.{}|sm={}|threads_sm={}|abi={}|semantics={}|source={}|",
             "n={}|blocks={}|npb={}|rec={}|input={}|ctx={}|ctxdim={}"
         ),

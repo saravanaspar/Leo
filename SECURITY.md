@@ -2,7 +2,7 @@
 
 ## Supported version
 
-Leo currently maintains the v1.0.0 code line. Security fixes should target the current `main` branch unless a maintainer documents another supported release line.
+Leo currently maintains the v1.0.1 code line. Security fixes should target the current `main` branch unless a maintainer documents another supported release line.
 
 ## Reporting a vulnerability
 

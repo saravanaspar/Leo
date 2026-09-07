@@ -88,12 +88,12 @@ perf/<short-description>
 
 ## Semantic compatibility rules
 
-The following are part of the v1.0.0 learning/execution contract and must not change accidentally:
+The following are part of the v1.0.1 learning/execution contract and must not change accidentally:
 
 - FP32 training semantics
 - standard bounded-surprise replay fraction of 30%
 - logical `--workers` batch semantics
-- canonical mean-update barrier
+- one canonical story-batch mean-update barrier (no per-byte cross-worker visibility)
 - dataset identity/provenance rules
 - checkpoint/resume identity rules
 - CPU reference behavior
@@ -122,6 +122,8 @@ For CUDA changes, include where applicable:
 - before/after throughput
 - correctness/conformance result
 - profiler evidence when claiming a hardware bottleneck improvement
+- replay fraction/segments/steps for replay-sensitive throughput claims
+- `cuda_story_batch_conformance` results for multi-story GPU changes
 
 Do not trade model/training quality for speed without an explicit semantic proposal.
 
@@ -141,7 +143,7 @@ Avoid adding dependencies for functionality already available in the workspace o
 
 ## Tests and documentation
 
-A PR is expected to include tests when it changes behavior. Source-string guards are useful for architectural invariants, but behavioral Rust tests are preferred for correctness when practical.
+A PR is expected to include tests when it changes behavior. Source-string guards are useful for architectural invariants, but they are not evidence of CPU/GPU numerical equivalence. CUDA story-batch changes must pass the real GPU conformance path at replay 0 and replay 0.30; behavioral Rust tests are preferred for hardware-independent correctness when practical.
 
 Documentation should describe the code that actually ships. Historical `STAGE*.md` files are implementation-history documents; current behavior belongs in the main v1 design/semantics/testing documents.
 

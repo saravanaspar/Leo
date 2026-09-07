@@ -15,7 +15,8 @@ mkdir -p "$RAW_DIR" "$PREPARED_DIR"
 if [[ ! -f "$RAW_DIR/TinyStories-train.txt" || ! -f "$RAW_DIR/TinyStories-valid.txt" ]]; then
   if ! command -v hf >/dev/null 2>&1; then
     echo "TinyStories files are missing and the hf CLI is unavailable." >&2
-    echo "Install requirements.txt or place TinyStories-train.txt and TinyStories-valid.txt in $RAW_DIR" >&2
+    echo "Install the Hugging Face CLI with: python3 -m pip install 'huggingface_hub>=0.34,<2'" >&2
+    echo "or place TinyStories-train.txt and TinyStories-valid.txt in $RAW_DIR" >&2
     exit 2
   fi
   hf download "$REPOSITORY" \

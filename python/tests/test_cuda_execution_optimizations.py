@@ -27,17 +27,52 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
             self.assertIn(kernel, rust)
         self.assertNotIn("leo_shared_cache_surrogate_tiled", rust)
 
-    def test_physical_batching_does_not_replace_logical_mean_batch(self):
+    def test_physical_batching_preserves_one_story_end_mean_barrier(self):
         cuda = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
         planner = (ROOT / "crates/leo-core/src/cuda_plan.rs").read_text()
+        main = (ROOT / "crates/leo-cli/src/main.rs").read_text()
 
-        self.assertIn("physical_lane_chunk", cuda)
-        self.assertIn("1.0f32 / lanes.len() as f32", cuda)
-        self.assertIn("launch_sparse_apply_and_reset", cuda)
+        batch = cuda.split("fn train_story_batch_shared_device", 1)[1].split(
+            "fn cuda_execution_profile_key", 1
+        )[0]
+        self.assertIn("physical_lane_chunk", batch)
+        self.assertIn("snapshot_batch_lane_values", batch)
+        self.assertIn("SparseModelDelta::from_tracked_values", batch)
+        self.assertEqual(batch.count("apply_mean_deltas("), 1)
+        self.assertNotIn("launch_sparse_apply_and_reset(", batch)
+        self.assertIn("copy_canonical_parameters_to_batch_lane_async", batch)
+        self.assertIn("model_revision", batch)
         self.assertIn("plan_never_changes_logical_lane_count", planner)
         self.assertNotIn("workers = execution_plan", cuda)
 
-    def test_tuning_cache_async_transfers_and_graphs_are_execution_only(self):
+        # Unlike the old source-string-only gate, the GPU backend probe now
+        # executes this production story-batch path against the CPU reference.
+        self.assertIn("cuda_story_batch_conformance", main)
+        self.assertIn("run_story_batch_conformance(&model, 0.0)", main)
+        self.assertIn("run_story_batch_conformance(&model, 0.30)", main)
+
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+        lane_update = kernels.split("leo_shared_phase_post_deltas_lane", 1)[1].split(
+            "leo_shared_phase_homeostasis_lane", 1
+        )[0]
+        for direct_update in (
+            "leo_p_update_output",
+            "leo_p_update_context",
+            "leo_p_update_recurrent_weights",
+            "leo_p_update_input_weights",
+            "leo_p_inhibitory_homeostasis",
+        ):
+            self.assertIn(direct_update, lane_update)
+        for cross_story_accumulator in (
+            "leo_p_accumulate_output_delta",
+            "leo_p_accumulate_context_delta",
+            "leo_p_accumulate_recurrent_delta",
+            "leo_p_accumulate_input_delta",
+            "leo_p_accumulate_inhibitory_delta",
+        ):
+            self.assertNotIn(cross_story_accumulator, lane_update)
+
+    def test_tuning_cache_and_async_transfers_are_execution_only(self):
         cuda = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
         planner = (ROOT / "crates/leo-core/src/cuda_plan.rs").read_text()
         semantics = (ROOT / "docs/SEMANTICS.md").read_text()
@@ -46,14 +81,14 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
             "leo-ptx-v1",
             "cuMemcpyHtoDAsync",
             "cuMemcpyDtoHAsync",
+            "cuMemcpyDtoDAsync",
             "cuMemAllocHost",
-            "cuStreamBeginCapture",
-            "cuGraphLaunch",
-            "capture_sparse_apply_graph",
         ):
             self.assertIn(marker, cuda)
         self.assertIn("OBSERVATIONS_PER_CANDIDATE", planner)
-        self.assertIn("persist_profile", planner)
+        self.assertIn("PersistedCandidateProgress", planner)
+        self.assertIn("persist_progress_best_effort", planner)
+        self.assertIn("cuda_autotune_resumed", planner)
         self.assertIn("logical story batch selected by `--workers`", semantics)
         self.assertIn("not autotuning knobs", semantics)
 
@@ -115,7 +150,7 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
             "cuDeviceTotalMem",
         ):
             self.assertIn(marker, cuda)
-        self.assertIn("leo-cuda-plan-v3", cuda)
+        self.assertIn("leo-cuda-plan-v4", cuda)
         self.assertIn("pci_bus_id", cuda)
         for field in ("sparse_apply_blocks", "sparse_apply_threads", "fused_wavefront_blocks"):
             self.assertIn(field, planner)
@@ -129,7 +164,8 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("LEO_GPU_RUNNER", gpu_ci)
         self.assertIn("cuda_autotune_complete", gpu_check)
         self.assertIn("cuda_profile", gpu_check)
-        self.assertIn("graph_launches", gpu_check)
+        self.assertIn("cuda_autotune_resumed", gpu_check)
+        self.assertIn("cuda_story_batch_conformance", gpu_check)
 
 
     def test_replay_prefix_uses_frozen_state_fast_path_without_changing_replay_budget(self):
@@ -162,13 +198,23 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("leo_p_select_model_block", cooperative)
         self.assertIn("leo_p_context_advance_history", cooperative)
         self.assertIn("leo_p_select_global", cooperative)
-        self.assertIn("leo_p_post_and_emit", cooperative)
+        self.assertIn("leo_p_post_and_emit_grid", cooperative)
         self.assertNotIn("leo_p_forward", cooperative)
         self.assertNotIn("leo_p_capture_training_step", cooperative)
         self.assertIn("runtime.model().config.replay.fraction", training)
         self.assertIn("runtime.model().config.replay.segment_bytes", training)
         self.assertIn("let cleanup_after = index + 1 == ranges.len();", training)
         self.assertIn("if cleanup_after {", training)
+
+        benchmark = (ROOT / "crates/leo-cli/src/main.rs").read_text()
+        for field in (
+            "base_training_targets",
+            "replay_fraction",
+            "replay_segments",
+            "replay_steps",
+            "replay_step_fraction",
+        ):
+            self.assertIn(field, benchmark)
 
     def test_sampled_cuda_phase_profiler_is_opt_in_and_math_neutral(self):
         cuda = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
@@ -209,6 +255,32 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("clock64()", profiled)
         self.assertIn("grid.sync();", profiled)
         self.assertNotIn("atomicAdd", profiled)
+        self.assertIn(
+            "fused_profile_blocks_256 >= grid_blocks",
+            cuda,
+        )
+        self.assertIn("cuda_phase_profile_skipped", cuda)
+        self.assertIn("profiled_kernel_cannot_match_production_grid", cuda)
+        self.assertIn("sampled_grid_blocks_max", cuda)
+        self.assertNotIn(
+            "grid_blocks.min(coordinator.shared.fused_profile_blocks_256)",
+            cuda,
+        )
+
+    def test_repository_gate_and_package_entrypoints_cover_all_reference_tests(self):
+        check = (ROOT / "scripts/check.sh").read_text()
+        makefile = (ROOT / "Makefile").read_text()
+        data = (ROOT / "scripts/data.sh").read_text()
+        ci = (ROOT / ".github/workflows/ci.yml").read_text()
+
+        self.assertIn("python3 -m unittest discover -s python/tests -v", check)
+        self.assertIn("python3 -m unittest discover -s tests -v", check)
+        self.assertIn("bash ./scripts/check.sh", makefile)
+        self.assertIn("huggingface_hub>=0.34,<2", data)
+        self.assertNotIn("Install requirements.txt", data)
+        self.assertIn("permissions:\n  contents: read", ci)
+        self.assertNotIn("actions/checkout@v", ci)
+        self.assertNotIn("actions/setup-python@v", ci)
 
     def test_training_lifecycle_is_owned_by_training_module(self):
         main = (ROOT / "crates/leo-cli/src/main.rs").read_text()

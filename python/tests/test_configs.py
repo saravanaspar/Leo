@@ -50,6 +50,33 @@ def load(path: Path) -> dict[str, Any]:
 
 
 class IntegratedConfigTests(unittest.TestCase):
+    def test_release_metadata_is_v1_0_1_without_semantic_schema_bump(self) -> None:
+        with (ROOT / "Cargo.toml").open("rb") as handle:
+            workspace = tomllib.load(handle)
+        self.assertEqual(workspace["workspace"]["package"]["version"], "1.0.1")
+
+        lock = (ROOT / "Cargo.lock").read_text(encoding="utf-8")
+        for package in ("leo-cli", "leo-core", "leo-data", "leo-format"):
+            self.assertIn(f'name = "{package}"\nversion = "1.0.1"', lock)
+
+        self.assertIn('version: "1.0.1"', (ROOT / "CITATION.cff").read_text(encoding="utf-8"))
+        self.assertIn("# Leo v1.0.1", (ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertIn(
+            "| Leo release | 1.0.1 |",
+            (ROOT / "docs/SEMANTICS.md").read_text(encoding="utf-8"),
+        )
+
+        semantics = (ROOT / "crates/leo-core/src/semantics.rs").read_text(encoding="utf-8")
+        for contract in (
+            "MODEL_SCHEMA_VERSION",
+            "TRAINING_POLICY_VERSION",
+            "EXECUTION_SEMANTICS_VERSION",
+            "DATASET_SCHEMA_VERSION",
+            "CUDA_ABI_VERSION",
+            "CHECKPOINT_SCHEMA_VERSION",
+        ):
+            self.assertIn(f"pub const {contract}: u32 = 1;", semantics)
+
     def test_only_supported_configs_exist(self) -> None:
         names = {path.name for path in CONFIG_ROOT.glob("*.toml")}
         self.assertEqual(names, REQUIRED_CONFIGS)
@@ -146,7 +173,10 @@ class IntegratedConfigTests(unittest.TestCase):
         self.assertIn("batched_documents: true", backend)
         self.assertIn("training_story_batch", backend)
         self.assertIn("GPU_STORY_BATCH_MAX_LANES", cuda)
-        self.assertNotIn("cuMemcpyDtoDAsync", cuda)
+        # Device-to-device copies are execution-only synchronization for the
+        # exact lane-private GPU batch; they do not introduce a learning formula fork.
+        self.assertIn("cuMemcpyDtoDAsync", cuda)
+        self.assertIn("copy_canonical_parameters_to_batch_lane_async", cuda)
         self.assertIn("nvrtcCompileProgram", cuda)
         self.assertIn("cuLaunchKernel", cuda)
         self.assertIn("include_str!(\"cuda_kernels.cu\")", cuda)

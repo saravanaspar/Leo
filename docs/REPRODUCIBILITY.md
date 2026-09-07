@@ -1,4 +1,4 @@
-# Leo v1.0.0 reproducibility guide
+# Leo v1.0.1 reproducibility guide
 
 ## Goal
 
@@ -12,11 +12,11 @@ Record the exact Git commit:
 git rev-parse HEAD
 ```
 
-Do not describe an experiment only as "v1.0.0" when multiple commits may exist under the same software version during active development.
+Do not describe an experiment only as "v1.0.1" when multiple commits may exist under the same software version during active development.
 
 ## Dependency identity
 
-`Cargo.lock` should be committed for the v1.0.0 application baseline and retained with reference training environments.
+`Cargo.lock` should be committed for the v1.0.1 application baseline and retained with reference training environments.
 
 Record:
 
@@ -70,7 +70,7 @@ At minimum retain:
 - compute capability if relevant;
 - Leo CUDA execution-profile identity/logs.
 
-Leo's CUDA autotuner cache is hardware/model/semantic specific but remains **execution cache**, not learned state. Deleting it is allowed; doing so may change the selected execution geometry and benchmark timing without changing the intended learning policy.
+Leo's CUDA autotuner cache is hardware/model/semantic/logical-batch specific but remains **execution cache**, not learned state. Both complete winners and incomplete candidate observations are persisted atomically; a fresh process may emit `cuda_autotune_resumed` and continue the same search. Deleting the cache is allowed; doing so may change warmup/tuning timing and selected execution geometry without changing the intended learning policy.
 
 ## TinyStories reference provenance
 
@@ -107,6 +107,9 @@ max_stories=
 max_bytes=
 validation_stories=
 replay_fraction=
+replay_segments=
+replay_steps=
+cuda_autotune_profile_key=
 ```
 
 The runtime already records many of these semantic/training fields; the surrounding experiment environment should retain the rest.

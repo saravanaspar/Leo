@@ -1,7 +1,7 @@
 .PHONY: check build test release
 
 check:
-	./scripts/check.sh
+	bash ./scripts/check.sh
 
 build:
 	cargo build --workspace

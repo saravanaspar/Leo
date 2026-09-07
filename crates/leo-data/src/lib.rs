@@ -61,7 +61,7 @@ impl PreparedDataset {
             return invalid_data("dataset index is smaller than the v1 header");
         }
         if &raw[0..8] != INDEX_MAGIC {
-            return invalid_data("invalid dataset index magic; regenerate data for Leo v1.0.0");
+            return invalid_data("invalid dataset index magic; regenerate data for Leo v1.0.1");
         }
         let schema_version = u32::from_le_bytes(raw[8..12].try_into().unwrap());
         if schema_version != DATASET_SCHEMA_VERSION {

@@ -1,4 +1,4 @@
-# Leo v1.0.0 semantics contract
+# Leo v1.0.1 semantics contract
 
 Leo separates **what learning means** from **where and how it executes**. A checkpoint records the semantic contract, while CPU and CUDA are implementations of that contract.
 
@@ -6,13 +6,15 @@ Leo separates **what learning means** from **where and how it executes**. A chec
 
 | Contract | Version |
 | --- | ---: |
-| Leo release | 1.0.0 |
+| Leo release | 1.0.1 |
 | Model schema | 1 |
 | Training policy | 1 |
 | Execution semantics | 1 |
 | Dataset schema | 1 |
 | CUDA ABI | 1 |
 | Checkpoint schema | 1 |
+
+v1.0.1 is a patch release of the v1 contract. The model schema, training policy, execution semantics, dataset schema, CUDA ABI, checkpoint schema, and `PSCLS100` checkpoint format remain unchanged from v1.0.0. Existing valid v1 artifacts do not require conversion solely because of the software release bump.
 
 The canonical constants live in `crates/leo-core/src/semantics.rs`. CUDA's device ABI is defined once in `crates/leo-core/cuda_abi.def`; the build script generates the Rust layout and CUDA header from that definition and checks its ABI version against the semantics contract.
 
@@ -48,6 +50,10 @@ fraction = 0.30
 - Model statistics describe the complete training trajectory; `parameter_revision` describes canonical parameter-state transitions.
 
 CPU is the numerical/reference executor. CUDA may change launch geometry, device memory layout, phase fusion, persistent execution, worklist traversal, transfer scheduling, graph replay, or **physical** lane chunking only when the learning semantics above remain intact. The logical story batch selected by `--workers`, its batch-scale denominator, and its canonical mean-update barrier are semantic inputs and are not autotuning knobs.
+
+For a logical batch with more than one story, every story starts from the same canonical parameter revision and owns a private learned-parameter trajectory for the **entire story**. No worker can observe another worker's updates inside that batch. After all supervised story passes finish, fixed-parameter deltas are mean-reduced once and context changes are merged once by `(order, fingerprint)`. CUDA implements this with one canonical device model plus lane-private mutable learned tensors; physical lane chunking/fusion never inserts an intermediate canonical update. The configured replay policy then runs from the merged canonical model.
+
+Execution-plan tuning is cacheable execution state only. Partial candidate observations are persisted atomically and may be resumed by a fresh process, but a cached or resumed plan may never change logical batch width, replay budget, arithmetic, parameter visibility, or the single batch-end mean barrier.
 
 ## Backend versus policy
 

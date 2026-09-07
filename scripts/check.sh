@@ -5,6 +5,7 @@ cd "$ROOT"
 export PYTHONDONTWRITEBYTECODE=1
 
 python3 -m unittest discover -s python/tests -v
+python3 -m unittest discover -s tests -v
 python3 python/check_rust_delimiters.py crates
 python3 python/check_cuda_abi.py
 python3 - <<'PY'

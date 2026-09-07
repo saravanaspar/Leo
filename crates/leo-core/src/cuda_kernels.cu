@@ -2080,7 +2080,12 @@ __device__ void leo_p_update_input_eligibility(
     }
 }
 
-__device__ void leo_p_post_and_emit(const unsigned long long* p, unsigned long long tick) {
+__device__ __forceinline__ void leo_p_post_and_emit_work(
+    const unsigned long long* p,
+    unsigned long long tick,
+    unsigned int thread,
+    unsigned int stride
+) {
     const LeoConfig* cfg = leo_p_cptr<LeoConfig>(p, LEO_P_CONFIG);
     const float* threshold = leo_p_cptr<float>(p, LEO_P_THRESHOLD);
     const float* recurrent_weight = leo_p_cptr<float>(p, LEO_P_RECURRENT_WEIGHT);
@@ -2099,8 +2104,6 @@ __device__ void leo_p_post_and_emit(const unsigned long long* p, unsigned long l
     float* ring_weight = leo_p_ptr<float>(p, LEO_P_RING_WEIGHT);
     const unsigned int count = *active_count;
     const unsigned int bucket = (unsigned int)(tick % 9ULL);
-    const unsigned int thread = leo_p_global_thread();
-    const unsigned int stride = leo_p_global_stride();
     if (thread == 0U) ring_count[bucket] = count;
     for (unsigned int index = thread; index < count; index += stride) {
         const unsigned int neuron = active[index];
@@ -2120,6 +2123,19 @@ __device__ void leo_p_post_and_emit(const unsigned long long* p, unsigned long l
             ring_weight[ring_base + local] = recurrent_weight[source_base + local];
         }
     }
+}
+
+__device__ void leo_p_post_and_emit(const unsigned long long* p, unsigned long long tick) {
+    leo_p_post_and_emit_work(p, tick, leo_p_global_thread(), leo_p_global_stride());
+}
+
+__device__ __forceinline__ void leo_p_post_and_emit_grid(
+    const unsigned long long* p,
+    unsigned long long tick
+) {
+    const unsigned int thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int stride = gridDim.x * blockDim.x;
+    leo_p_post_and_emit_work(p, tick, thread, stride);
 }
 
 __device__ void leo_p_forward(
@@ -3069,14 +3085,17 @@ extern "C" __global__ void leo_advance_frozen_cooperative(
         }
         grid.sync();
 
-        // Global selection and recurrent emission retain the exact one-block
-        // reduction/update order used by the v1 reference persistent path.
+        // Global winner selection keeps the exact one-block reduction order.
+        // The selected active rows are independent afterwards, so post/emit can
+        // use the full cooperative grid without changing any per-row FP32
+        // arithmetic. The grid barrier makes the selected list globally visible
+        // before that parallel work begins.
         if (blockIdx.x == 0U) {
             leo_p_select_global(pointers, tick, shared_values, shared_neurons);
             __syncthreads();
-            leo_p_post_and_emit(pointers, tick);
-            __syncthreads();
         }
+        grid.sync();
+        leo_p_post_and_emit_grid(pointers, tick);
         grid.sync();
     }
 }
@@ -3109,9 +3128,10 @@ extern "C" __global__ void leo_train_persistent(
 }
 
 
-// Stage 3 shared-model wavefront. The canonical model is referenced by every
-// lane pointer table while recurrent/eligibility state remains lane-private.
-// Kernel boundaries on one CUDA stream provide the global phase ordering.
+// Exact shared-wavefront story batch. Static topology/configuration is shared,
+// while recurrent state and every mutable learned parameter are lane-private.
+// Kernel boundaries on one CUDA stream provide phase ordering; lanes are only
+// averaged once after their complete stories finish.
 // Shared-model wavefront phase helpers. Both the cooperative fused kernel and
 // the capability fallback kernels use these exact bodies.
 __device__ __forceinline__ void leo_shared_phase_pre_lane(
@@ -3156,7 +3176,10 @@ __device__ __forceinline__ void leo_shared_phase_pre_lane(
     __syncthreads();
     leo_p_inject_symbol(p, tick, step.symbol, learning_trace, input_current_list, input_current_count);
     __syncthreads();
-    leo_p_context_resolve_shared(p, step.symbol, context_enabled, learning_trace && context_enabled);
+    // Context tables are lane-private in the exact logical-batch path, so use
+    // the ordinary single-story resolver including deterministic weakest-slot
+    // replacement semantics.
+    leo_p_context_resolve(p, step.symbol, context_enabled, learning_trace && context_enabled);
 }
 
 __device__ __forceinline__ void leo_shared_phase_select_block(
@@ -3342,25 +3365,31 @@ __device__ __forceinline__ void leo_shared_phase_post_deltas_lane(
     const unsigned int* input_next_list = even ? input_b_list : input_a_list;
     const unsigned int* input_next_count = even ? input_b_count : input_a_count;
 
-    leo_p_accumulate_output_delta(p, delta_pointers, step.supervised_strength, batch_scale);
+    // Exact v1 logical-batch semantics: each lane owns a private learned
+    // parameter image for the complete story. Apply the same direct learning
+    // helpers as the single-story persistent executor and defer cross-story
+    // averaging to the one canonical batch-end host/device barrier.
+    (void)batch_scale;
+    (void)delta_pointers;
+    leo_p_update_output(p, step.supervised_strength);
     __syncthreads();
     if (context_enabled) {
-        leo_p_accumulate_context_delta(p, delta_pointers, step.supervised_strength, batch_scale);
+        leo_p_update_context(p, step.supervised_strength);
         __syncthreads();
     }
     const unsigned int* learning_rec_list = learning_trace ? rec_next_list : rec_current_list;
     const unsigned int* learning_rec_count = learning_trace ? rec_next_count : rec_current_count;
     const unsigned int* learning_input_list = learning_trace ? input_next_list : input_current_list;
     const unsigned int* learning_input_count = learning_trace ? input_next_count : input_current_count;
-    leo_p_accumulate_recurrent_delta(
-        p, delta_pointers, learning_rec_list, learning_rec_count, step.supervised_strength, batch_scale
+    leo_p_update_recurrent_weights(
+        p, learning_rec_list, learning_rec_count, step.supervised_strength
     );
     __syncthreads();
-    leo_p_accumulate_input_delta(
-        p, delta_pointers, learning_input_list, learning_input_count, step.supervised_strength, batch_scale
+    leo_p_update_input_weights(
+        p, learning_input_list, learning_input_count, step.supervised_strength
     );
     __syncthreads();
-    leo_p_accumulate_inhibitory_delta(p, delta_pointers, strength, batch_scale);
+    leo_p_inhibitory_homeostasis(p, strength);
 }
 
 __device__ __forceinline__ void leo_shared_phase_homeostasis_lane(
@@ -3379,7 +3408,9 @@ __device__ __forceinline__ void leo_shared_phase_homeostasis_lane(
         pointer_table_addresses[lane]
     );
     const unsigned long long tick = base_ticks[lane] + (unsigned long long)step_index;
-    leo_p_accumulate_homeostasis_delta_worklist(p, delta_pointers, tick, batch_scale);
+    (void)batch_scale;
+    (void)delta_pointers;
+    leo_p_homeostasis(p, tick);
 }
 
 __device__ __forceinline__ void leo_shared_phase_capture_lane(
