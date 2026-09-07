@@ -15,13 +15,16 @@ pub(crate) use validation::{evaluate_model, print_learning_quality, print_predic
 
 use leo_core::symbols::{BEGIN_DOCUMENT, END_DOCUMENT};
 use leo_core::{
-    apply_mean_deltas, available_gpu_devices, merged_parameter_changes, BackendKind,
-    BackendRuntime, LeoError, LeoResult, MergeMetrics, Model, ParameterChanges, Permission,
-    SparseModelDelta, StepMetrics,
+    apply_mean_deltas, available_gpu_devices, merged_parameter_changes,
+    visible_gpu_device_compatibility, BackendKind, BackendRuntime, LeoError, LeoResult,
+    MergeMetrics, Model, PackedSparseModelUpdate, ParameterChanges, Permission, SparseModelDelta,
+    StepMetrics,
 };
-use std::sync::{Arc, OnceLock};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::thread;
 use std::time::Instant;
+
+pub(crate) const GPU_REFERENCE_WORKERS: usize = 16;
 
 #[derive(Debug, Clone, Copy)]
 struct ReplayDebugOptions {
@@ -295,12 +298,23 @@ pub(crate) struct BatchTrainingReport {
     pub(crate) replay_segments: usize,
     pub(crate) replay_steps: u64,
     pub(crate) replay_prefix_steps: u64,
+    pub(crate) replay_seconds: f64,
+    pub(crate) replay_sync_seconds: f64,
     pub(crate) merge: MergeMetrics,
 }
 
 /// Deep training boundary used by the CLI. It owns execution coordination;
 /// the canonical `BackendRuntime` remains explicit because checkpointing and
 /// evaluation synchronize against that same model owner.
+pub(crate) fn multi_gpu_requested() -> bool {
+    std::env::var("LEO_MULTI_GPU")
+        .map(|value| {
+            let value = value.trim();
+            value == "1" || value.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
 pub(crate) fn configured_multi_gpu_devices(
     backend: BackendKind,
     workers: usize,
@@ -308,11 +322,20 @@ pub(crate) fn configured_multi_gpu_devices(
     if backend != BackendKind::Gpu || workers == 0 {
         return Ok(1);
     }
-    let requested = std::env::var("LEO_MULTI_GPU")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let requested = multi_gpu_requested();
     if !requested || workers == 1 {
         return Ok(1);
+    }
+
+    if let Ok(value) = std::env::var("LEO_CUDA_DEVICE") {
+        let selected = value.trim().parse::<usize>().map_err(|_| {
+            LeoError::backend("LEO_CUDA_DEVICE must be an integer when LEO_MULTI_GPU is enabled")
+        })?;
+        if selected != 0 {
+            return Err(LeoError::backend(
+                "exact LEO_MULTI_GPU requires the canonical runtime on visible CUDA device 0; use CUDA_VISIBLE_DEVICES to choose/reorder the device group",
+            ));
+        }
     }
 
     let visible = available_gpu_devices()?;
@@ -321,7 +344,31 @@ pub(crate) fn configured_multi_gpu_devices(
             "LEO_MULTI_GPU requested, but fewer than two CUDA devices are visible",
         ));
     }
-    Ok(visible.min(workers))
+    let device_count = visible.min(workers);
+    let profiles = visible_gpu_device_compatibility()?;
+    let selected = profiles.get(..device_count).ok_or_else(|| {
+        LeoError::backend("CUDA compatibility probe returned fewer devices than cuDeviceGetCount")
+    })?;
+    if let Some(first) = selected.first() {
+        if let Some(other) = selected.iter().skip(1).find(|profile| {
+            profile.name != first.name
+                || profile.compute_major != first.compute_major
+                || profile.compute_minor != first.compute_minor
+        }) {
+            return Err(LeoError::backend(format!(
+                "exact multi-GPU requires homogeneous CUDA devices; device {} is {} cc {}.{}, device {} is {} cc {}.{}",
+                first.ordinal,
+                first.name,
+                first.compute_major,
+                first.compute_minor,
+                other.ordinal,
+                other.name,
+                other.compute_major,
+                other.compute_minor,
+            )));
+        }
+    }
+    Ok(device_count)
 }
 
 pub(crate) struct TrainingEngine {
@@ -357,27 +404,239 @@ impl TrainingEngine {
 // Leo's data-parallel axis: device placement changes execution only; workers,
 // denominator, and the canonical mean barrier do not change.
 struct MultiGpuBatchTrainer {
-    // Device 0 is the existing canonical CUDA runtime. Only devices 1..N-1
-    // need extra full-model replicas, so a model that fits on one GPU does not
-    // require two copies on GPU 0 merely to enable data parallelism.
-    replicas: Vec<BackendRuntime>,
+    // Device 0 remains the caller-owned canonical runtime. Secondary CUDA
+    // runtimes are created once inside persistent owner threads so CUDA
+    // context ownership and host-thread creation are not paid per batch.
+    replicas: Vec<MultiGpuReplicaWorker>,
     device_count: usize,
+}
+
+enum ReplicaCommand {
+    Train {
+        stories: Arc<Vec<Vec<u8>>>,
+        range: std::ops::Range<usize>,
+        permission: Permission,
+        expected_revision: u64,
+        repair_model: Option<Arc<Model>>,
+        response: mpsc::Sender<LeoResult<MultiGpuShardResult>>,
+    },
+    Synchronize {
+        update: Arc<PackedSparseModelUpdate>,
+        response: mpsc::Sender<LeoResult<u64>>,
+    },
+    Shutdown,
+}
+
+struct MultiGpuReplicaWorker {
+    device_index: usize,
+    sender: mpsc::SyncSender<ReplicaCommand>,
+    handle: Option<thread::JoinHandle<()>>,
+    parameter_revision: u64,
+}
+
+impl MultiGpuReplicaWorker {
+    fn spawn(model: Model, device_index: usize) -> LeoResult<Self> {
+        let initial_revision = model.parameter_revision;
+        let (sender, receiver) = mpsc::sync_channel::<ReplicaCommand>(2);
+        let (init_sender, init_receiver) = mpsc::sync_channel::<LeoResult<()>>(1);
+        let handle = thread::Builder::new()
+            .name(format!("leo-gpu-{device_index}"))
+            .spawn(move || {
+                let mut runtime = match BackendRuntime::new_gpu_on_device(model, device_index) {
+                    Ok(runtime) => {
+                        let _ = init_sender.send(Ok(()));
+                        runtime
+                    }
+                    Err(error) => {
+                        let _ = init_sender.send(Err(error));
+                        return;
+                    }
+                };
+
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        ReplicaCommand::Train {
+                            stories,
+                            range,
+                            permission,
+                            expected_revision,
+                            repair_model,
+                            response,
+                        } => {
+                            let result = (|| {
+                                if runtime.model().parameter_revision != expected_revision {
+                                    let repair = repair_model.ok_or_else(|| {
+                                        LeoError::internal(format!(
+                                            "multi-GPU replica {device_index} revision {} does not match canonical revision {expected_revision}",
+                                            runtime.model().parameter_revision
+                                        ))
+                                    })?;
+                                    *runtime.model_mut()? = (*repair).clone();
+                                }
+                                runtime.reset_transient_state()?;
+                                run_multi_gpu_shard(
+                                    &mut runtime,
+                                    &stories[range.clone()],
+                                    range.start,
+                                    permission,
+                                )
+                            })();
+                            let _ = response.send(result);
+                        }
+                        ReplicaCommand::Synchronize { update, response } => {
+                            let result = runtime
+                                .synchronize_packed_model(&update)
+                                .map(|_| runtime.model().parameter_revision);
+                            let _ = response.send(result);
+                        }
+                        ReplicaCommand::Shutdown => break,
+                    }
+                }
+            })
+            .map_err(|error| {
+                LeoError::internal(format!(
+                    "failed to spawn persistent multi-GPU worker for device {device_index}: {error}"
+                ))
+            })?;
+
+        match init_receiver.recv() {
+            Ok(Ok(())) => Ok(Self {
+                device_index,
+                sender,
+                handle: Some(handle),
+                parameter_revision: initial_revision,
+            }),
+            Ok(Err(error)) => {
+                let _ = handle.join();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = handle.join();
+                Err(LeoError::internal(format!(
+                    "multi-GPU worker for device {device_index} exited during initialization"
+                )))
+            }
+        }
+    }
+
+    fn dispatch_train(
+        &self,
+        stories: Arc<Vec<Vec<u8>>>,
+        range: std::ops::Range<usize>,
+        permission: Permission,
+        expected_revision: u64,
+        repair_model: Option<Arc<Model>>,
+    ) -> LeoResult<mpsc::Receiver<LeoResult<MultiGpuShardResult>>> {
+        let (response, receiver) = mpsc::channel();
+        self.sender
+            .send(ReplicaCommand::Train {
+                stories,
+                range,
+                permission,
+                expected_revision,
+                repair_model,
+                response,
+            })
+            .map_err(|_| {
+                LeoError::internal(format!(
+                    "persistent multi-GPU worker for device {} is unavailable",
+                    self.device_index
+                ))
+            })?;
+        Ok(receiver)
+    }
+
+    fn dispatch_sync(
+        &self,
+        update: Arc<PackedSparseModelUpdate>,
+    ) -> LeoResult<mpsc::Receiver<LeoResult<u64>>> {
+        let (response, receiver) = mpsc::channel();
+        self.sender
+            .send(ReplicaCommand::Synchronize { update, response })
+            .map_err(|_| {
+                LeoError::internal(format!(
+                    "persistent multi-GPU worker for device {} is unavailable",
+                    self.device_index
+                ))
+            })?;
+        Ok(receiver)
+    }
+}
+
+impl Drop for MultiGpuReplicaWorker {
+    fn drop(&mut self) {
+        let _ = self.sender.send(ReplicaCommand::Shutdown);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 struct MultiGpuShardResult {
     story_start: usize,
+    story_work: usize,
+    elapsed_seconds: f64,
     story_losses: Vec<Vec<f32>>,
     activity: ActivityDiagnostics,
     story_deltas: Vec<SparseModelDelta>,
     story_changes: Vec<ParameterChanges>,
 }
 
+#[cfg(test)]
 fn balanced_story_range(total: usize, shards: usize, shard_index: usize) -> std::ops::Range<usize> {
     let base = total / shards;
     let extra = total % shards;
     let start = shard_index * base + shard_index.min(extra);
     let len = base + usize::from(shard_index < extra);
     start..start + len
+}
+
+fn story_work(story: &[u8]) -> usize {
+    if story.is_empty() {
+        0
+    } else {
+        story.len().saturating_add(1)
+    }
+}
+
+fn work_balanced_story_ranges(stories: &[Vec<u8>], shards: usize) -> Vec<std::ops::Range<usize>> {
+    let shard_count = shards.min(stories.len());
+    if shard_count == 0 {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::with_capacity(shard_count);
+    let mut start = 0usize;
+    let mut remaining_work = stories.iter().map(|story| story_work(story)).sum::<usize>();
+
+    for shard_index in 0..shard_count {
+        let remaining_shards = shard_count - shard_index;
+        if remaining_shards == 1 {
+            ranges.push(start..stories.len());
+            break;
+        }
+
+        let max_end = stories.len() - (remaining_shards - 1);
+        let target = remaining_work.div_ceil(remaining_shards);
+        let mut end = start;
+        let mut assigned_work = 0usize;
+        while end < max_end {
+            let next_work = story_work(&stories[end]);
+            if end > start && assigned_work >= target {
+                break;
+            }
+            assigned_work = assigned_work.saturating_add(next_work);
+            end += 1;
+        }
+        if end == start {
+            end += 1;
+            assigned_work = story_work(&stories[start]);
+        }
+        ranges.push(start..end);
+        start = end;
+        remaining_work = remaining_work.saturating_sub(assigned_work);
+    }
+    ranges
 }
 
 fn aggregate_device_story_metrics(
@@ -406,6 +665,7 @@ fn run_multi_gpu_shard(
     story_start: usize,
     permission: Permission,
 ) -> LeoResult<MultiGpuShardResult> {
+    let started = Instant::now();
     let report = worker
         .training_story_batch_deltas(shard, permission)?
         .ok_or_else(|| {
@@ -425,6 +685,8 @@ fn run_multi_gpu_shard(
 
     Ok(MultiGpuShardResult {
         story_start,
+        story_work: shard.iter().map(|story| story_work(story)).sum(),
+        elapsed_seconds: started.elapsed().as_secs_f64(),
         story_losses,
         activity,
         story_deltas: report.story_deltas,
@@ -441,21 +703,38 @@ impl MultiGpuBatchTrainer {
         }
 
         // The caller's canonical runtime already owns visible CUDA device 0.
-        // Allocate replicas only on the remaining devices. This keeps the DDP
-        // memory rule intuitive: the model must fit once on every participating
-        // GPU; device 0 is not penalized with a second complete copy.
+        // Create secondary runtimes once on persistent owner threads. Keeping
+        // each CUDA runtime on its owner thread avoids per-batch thread/context
+        // setup and leaves device 0 free to execute the canonical shard.
         let mut replicas = Vec::with_capacity(device_count.saturating_sub(1));
         for device_index in 1..device_count {
-            replicas.push(BackendRuntime::new_gpu_on_device(
-                model.clone(),
-                device_index,
-            )?);
+            replicas.push(MultiGpuReplicaWorker::spawn(model.clone(), device_index)?);
         }
 
         Ok(Self {
             replicas,
             device_count,
         })
+    }
+
+    fn synchronize_replicas(&mut self, update: Arc<PackedSparseModelUpdate>) -> LeoResult<()> {
+        // Synchronize every resident replica, not only devices active in a
+        // short final batch. This prevents an inactive device from becoming
+        // stale and requiring a full-model repair when a later batch grows.
+        let mut receivers = Vec::with_capacity(self.replicas.len());
+        for worker in &self.replicas {
+            receivers.push(worker.dispatch_sync(Arc::clone(&update))?);
+        }
+        for (worker, receiver) in self.replicas.iter_mut().zip(receivers) {
+            let revision = receiver.recv().map_err(|_| {
+                LeoError::internal(format!(
+                    "persistent multi-GPU synchronization worker {} exited",
+                    worker.device_index
+                ))
+            })??;
+            worker.parameter_revision = revision;
+        }
+        Ok(())
     }
 
     fn train_story_batch(
@@ -466,64 +745,79 @@ impl MultiGpuBatchTrainer {
     ) -> LeoResult<BatchTrainingReport> {
         let device_count = self.device_count.min(stories.len());
         if device_count < 2 {
-            return train_story_batch(canonical, stories, permission);
+            // A short one-story batch still advances the canonical parameters.
+            // The single-device path tracks and sparse-commits its complete
+            // update into resident device-0 lanes. Reuse that tracked packet to
+            // keep every secondary replica current as well.
+            let report = train_story_batch(canonical, stories, permission)?;
+            let changes = canonical.parameter_changes()?;
+            let update = Arc::new(PackedSparseModelUpdate::from_model(
+                canonical.model(),
+                &changes,
+            )?);
+            self.synchronize_replicas(update)?;
+            return Ok(report);
         }
-        let replica_count = device_count - 1;
+        let active_replica_count = device_count - 1;
 
         canonical.synchronize_model()?;
         let base_revision = canonical.model().parameter_revision;
-        let base_model = canonical.model().clone();
-
-        // Device 0 is the canonical runtime and participates directly in the
-        // initial story pass. The retained-delta CUDA path leaves its canonical
-        // parameters unchanged until the flat cross-device mean below.
         canonical.reset_transient_state()?;
 
-        // Normally secondary replicas already equal canonical because sparse
-        // synchronization happens at the end of every logical batch. Repair a
-        // replica fully only after an out-of-band canonical revision change.
-        for worker in &mut self.replicas[..replica_count] {
-            if worker.model().parameter_revision != base_revision {
-                *worker.model_mut()? = base_model.clone();
-            }
-            worker.reset_transient_state()?;
+        let stories = Arc::new(stories);
+        let ranges = work_balanced_story_ranges(stories.as_slice(), device_count);
+
+        // Full repair is an exceptional path only. Build one host snapshot if
+        // any active replica missed a sparse synchronization, then share it;
+        // each device owns its independent model after cloning on its owner
+        // thread. Steady-state batches allocate no full canonical clone.
+        let needs_repair = self.replicas[..active_replica_count]
+            .iter()
+            .any(|worker| worker.parameter_revision != base_revision);
+        let repair_model = needs_repair.then(|| Arc::new(canonical.model().clone()));
+
+        // Dispatch secondary devices first so their GPU work overlaps device0.
+        let mut replica_receivers = Vec::with_capacity(active_replica_count);
+        for (replica_index, worker) in self.replicas[..active_replica_count].iter().enumerate() {
+            let device_index = replica_index + 1;
+            let range = ranges[device_index].clone();
+            let repair = if worker.parameter_revision != base_revision {
+                Some(Arc::clone(repair_model.as_ref().ok_or_else(|| {
+                    LeoError::internal("multi-GPU replica repair snapshot was not prepared")
+                })?))
+            } else {
+                None
+            };
+            replica_receivers.push(worker.dispatch_train(
+                Arc::clone(&stories),
+                range,
+                permission,
+                base_revision,
+                repair,
+            )?);
         }
 
-        let results = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(device_count);
+        let canonical_range = ranges[0].clone();
+        let canonical_result = run_multi_gpu_shard(
+            canonical,
+            &stories[canonical_range.clone()],
+            canonical_range.start,
+            permission,
+        )?;
 
-            let range = balanced_story_range(stories.len(), device_count, 0);
-            let shard = &stories[range.clone()];
-            let canonical_worker: &mut BackendRuntime = &mut *canonical;
-            handles.push(scope.spawn(move || {
-                run_multi_gpu_shard(canonical_worker, shard, range.start, permission)
-            }));
+        let mut results = Vec::with_capacity(device_count);
+        results.push(canonical_result);
+        for (replica_index, receiver) in replica_receivers.into_iter().enumerate() {
+            let device_index = replica_index + 1;
+            results.push(receiver.recv().map_err(|_| {
+                LeoError::internal(format!(
+                    "persistent multi-GPU training worker {device_index} exited"
+                ))
+            })??);
+        }
 
-            for (replica_index, worker) in self.replicas[..replica_count].iter_mut().enumerate() {
-                let device_index = replica_index + 1;
-                let range = balanced_story_range(stories.len(), device_count, device_index);
-                let shard = &stories[range.clone()];
-                handles
-                    .push(scope.spawn(move || {
-                        run_multi_gpu_shard(worker, shard, range.start, permission)
-                    }));
-            }
-
-            let mut results = Vec::with_capacity(device_count);
-            for handle in handles {
-                results.push(
-                    handle
-                        .join()
-                        .map_err(|_| LeoError::internal("multi-GPU training worker panicked"))??,
-                );
-            }
-            Ok::<_, LeoError>(results)
-        })?;
-
-        // Thread handles are joined in device order, but sort explicitly by
-        // canonical story position so future placement policies cannot change
-        // FP32 reduction order accidentally.
-        let mut results = results;
+        // Restore canonical story order explicitly. Work-aware placement is an
+        // execution detail and must never alter FP32/f64 reduction order.
         results.sort_by_key(|result| result.story_start);
 
         let mut deltas = Vec::with_capacity(stories.len());
@@ -532,11 +826,19 @@ impl MultiGpuBatchTrainer {
         let mut activity = ActivityDiagnostics::default();
         let mut min_stories_per_device = usize::MAX;
         let mut max_stories_per_device = 0usize;
+        let mut min_work_per_device = usize::MAX;
+        let mut max_work_per_device = 0usize;
+        let mut min_device_seconds = f64::INFINITY;
+        let mut max_device_seconds = 0.0f64;
 
         for result in results {
             let shard_story_count = result.story_deltas.len();
             min_stories_per_device = min_stories_per_device.min(shard_story_count);
             max_stories_per_device = max_stories_per_device.max(shard_story_count);
+            min_work_per_device = min_work_per_device.min(result.story_work);
+            max_work_per_device = max_work_per_device.max(result.story_work);
+            min_device_seconds = min_device_seconds.min(result.elapsed_seconds);
+            max_device_seconds = max_device_seconds.max(result.elapsed_seconds);
             deltas.extend(result.story_deltas);
             raw_changes.extend(result.story_changes);
             losses_by_story.extend(result.story_losses);
@@ -563,9 +865,7 @@ impl MultiGpuBatchTrainer {
             }
         }
 
-        // ----------------------------------------------------
         // One flat canonical mean across the original logical workers.
-        // ----------------------------------------------------
         let merge_started = Instant::now();
         let (merged, sync_changes) = {
             let model = canonical.model_mut()?;
@@ -574,43 +874,31 @@ impl MultiGpuBatchTrainer {
             (merged, sync_changes)
         };
 
-        // `model_mut` deliberately marks a CUDA host mirror dirty. Because GPU
-        // 0 already contains the old canonical image, upload only the sparse
-        // rows changed by the flat mean instead of paying a full-model H2D copy
-        // before replay. CPU/reference backends treat this as a no-op.
-        canonical.commit_sparse_host_model(&sync_changes)?;
+        // Pack changed canonical rows exactly once. GPU0 commits the packet to
+        // its canonical runtime and every resident story lane; all secondary
+        // devices consume the same immutable packet on their owner threads.
+        let sync_update = Arc::new(PackedSparseModelUpdate::from_model(
+            canonical.model(),
+            &sync_changes,
+        )?);
+        canonical.commit_packed_host_model(&sync_update)?;
         canonical.reset_transient_state()?;
         let merge_seconds = merge_started.elapsed().as_secs_f64();
 
-        // ----------------------------------------------------
-        // Sparse canonical -> secondary GPU replicas, concurrently. Device 0
-        // is already current from commit_sparse_host_model above.
-        // ----------------------------------------------------
         let sync_started = Instant::now();
-        let canonical_model = canonical.model();
-        thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(replica_count);
-            for worker in &mut self.replicas[..replica_count] {
-                let changes = &sync_changes;
-                handles.push(
-                    scope.spawn(move || worker.synchronize_sparse_model(canonical_model, changes)),
-                );
-            }
-            for handle in handles {
-                handle.join().map_err(|_| {
-                    LeoError::internal("multi-GPU sparse synchronization worker panicked")
-                })??;
-            }
-            Ok::<_, LeoError>(())
-        })?;
+        self.synchronize_replicas(Arc::clone(&sync_update))?;
         let sync_seconds = sync_started.elapsed().as_secs_f64();
 
         eprintln!(
-            "{{\"event\":\"multi_gpu_sparse_sync\",\"devices\":{},\"logical_stories\":{},\"stories_per_device_min\":{},\"stories_per_device_max\":{},\"exact_flat_story_mean\":true,\"canonical_device0_reused\":true,\"threshold\":{},\"recurrent\":{},\"input\":{},\"output_neurons\":{},\"context_slots\":{},\"output_bias\":{},\"context_output\":{},\"merge_ms\":{:.3},\"replica_sync_ms\":{:.3}}}",
+            "{{\"event\":\"multi_gpu_sparse_sync\",\"devices\":{},\"logical_stories\":{},\"stories_per_device_min\":{},\"stories_per_device_max\":{},\"work_per_device_min\":{},\"work_per_device_max\":{},\"device_seconds_min\":{:.6},\"device_seconds_max\":{:.6},\"exact_flat_story_mean\":true,\"canonical_device0_reused\":true,\"persistent_replica_threads\":true,\"threshold\":{},\"recurrent\":{},\"input\":{},\"output_neurons\":{},\"context_slots\":{},\"output_bias\":{},\"context_output\":{},\"merge_ms\":{:.3},\"replica_sync_ms\":{:.3}}}",
             device_count,
             stories.len(),
             min_stories_per_device,
             max_stories_per_device,
+            min_work_per_device,
+            max_work_per_device,
+            min_device_seconds,
+            max_device_seconds,
             sync_changes.threshold.len(),
             sync_changes.recurrent_weight.len(),
             sync_changes.input_weight.len(),
@@ -622,35 +910,37 @@ impl MultiGpuBatchTrainer {
             sync_seconds * 1000.0,
         );
 
-        // Replay stays in canonical story/range order. Until a true device-side
-        // model-parallel replay executor exists, moving it across devices would
-        // either alter parameter visibility or add a host/device barrier per
-        // replay step. Preserve learning semantics and synchronize the resulting
-        // sparse changes back to secondary data-parallel replicas afterward.
+        // Replay remains serial in canonical story/range/time order in v1.0.1.
+        // Time it explicitly so the scaling benchmark exposes the Amdahl wall;
+        // true neuron-sharded replay is the next architecture phase.
         canonical.enable_parameter_tracking();
-        let replay = apply_batch_replay_policy(canonical, &stories, &losses_by_story, permission)?;
+        let replay_started = Instant::now();
+        let replay =
+            apply_batch_replay_policy(canonical, stories.as_slice(), &losses_by_story, permission)?;
+        let replay_seconds = replay_started.elapsed().as_secs_f64();
         activity.add(replay.activity);
 
+        let replay_sync_started = Instant::now();
         if replay.replay_steps > 0 {
             let replay_changes = canonical.parameter_changes()?;
-            let canonical_model = canonical.model();
-            thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(replica_count);
-                for worker in &mut self.replicas[..replica_count] {
-                    let changes = &replay_changes;
-                    handles.push(
-                        scope.spawn(move || {
-                            worker.synchronize_sparse_model(canonical_model, changes)
-                        }),
-                    );
-                }
-                for handle in handles {
-                    handle.join().map_err(|_| {
-                        LeoError::internal("multi-GPU replay synchronization worker panicked")
-                    })??;
-                }
-                Ok::<_, LeoError>(())
-            })?;
+            let replay_update = Arc::new(PackedSparseModelUpdate::from_model(
+                canonical.model(),
+                &replay_changes,
+            )?);
+            canonical.synchronize_packed_model(&replay_update)?;
+            self.synchronize_replicas(replay_update)?;
+        }
+        let replay_sync_seconds = replay_sync_started.elapsed().as_secs_f64();
+
+        if replay.replay_steps > 0 {
+            eprintln!(
+                "{{\"event\":\"multi_gpu_serial_replay\",\"devices\":{},\"replay_steps\":{},\"prefix_steps\":{},\"replay_seconds\":{:.6},\"replay_sync_seconds\":{:.6},\"model_parallel_replay\":false}}",
+                device_count,
+                replay.replay_steps,
+                replay.prefix_steps,
+                replay_seconds,
+                replay_sync_seconds,
+            );
         }
 
         Ok(BatchTrainingReport {
@@ -661,6 +951,8 @@ impl MultiGpuBatchTrainer {
             replay_segments: replay.replay_segments,
             replay_steps: replay.replay_steps,
             replay_prefix_steps: replay.prefix_steps,
+            replay_seconds,
+            replay_sync_seconds,
             merge: MergeMetrics {
                 workers: stories.len(),
                 fixed_parameter_updates: merged.fixed_parameter_updates,
@@ -669,6 +961,7 @@ impl MultiGpuBatchTrainer {
         })
     }
 }
+
 fn apply_batch_replay_policy(
     runtime: &mut BackendRuntime,
     stories: &[Vec<u8>],
@@ -737,8 +1030,21 @@ pub(crate) fn train_story_batch(
     }
 
     if stories.len() == 1 {
+        let track_gpu_update = runtime.resolved_backend() == BackendKind::Gpu;
+        if track_gpu_update {
+            runtime.enable_parameter_tracking();
+        }
         let initial = train_document_pass(runtime, &stories[0], permission)?;
+        let replay_started = Instant::now();
         let replay = apply_replay_policy(runtime, &stories[0], &initial.losses, permission, 0)?;
+        let replay_seconds = replay_started.elapsed().as_secs_f64();
+        let replay_sync_started = Instant::now();
+        if track_gpu_update {
+            let changes = runtime.parameter_changes()?;
+            let update = PackedSparseModelUpdate::from_model(runtime.model(), &changes)?;
+            runtime.synchronize_packed_model(&update)?;
+        }
+        let replay_sync_seconds = replay_sync_started.elapsed().as_secs_f64();
         let mut activity = initial.activity;
         activity.add(replay.activity);
         return Ok(BatchTrainingReport {
@@ -749,6 +1055,8 @@ pub(crate) fn train_story_batch(
             replay_segments: replay.replay_segments,
             replay_steps: replay.replay_steps,
             replay_prefix_steps: replay.prefix_steps,
+            replay_seconds,
+            replay_sync_seconds,
             merge: MergeMetrics {
                 workers: 1,
                 fixed_parameter_updates: 0,
@@ -775,8 +1083,23 @@ pub(crate) fn train_story_batch(
                 }
                 losses_by_story.push(losses);
             }
+            // Replay advances the canonical device after the story-mean packet
+            // has already synchronized all resident lanes. Track replay alone
+            // and sparse-commit its changed rows back into those lanes so the
+            // next batch does not require a full canonical restore.
+            runtime.enable_parameter_tracking();
+            let replay_started = Instant::now();
             let replay =
                 apply_batch_replay_policy(runtime, &stories, &losses_by_story, permission)?;
+            let replay_seconds = replay_started.elapsed().as_secs_f64();
+            let replay_sync_started = Instant::now();
+            if replay.replay_steps > 0 {
+                let replay_changes = runtime.parameter_changes()?;
+                let replay_update =
+                    PackedSparseModelUpdate::from_model(runtime.model(), &replay_changes)?;
+                runtime.synchronize_packed_model(&replay_update)?;
+            }
+            let replay_sync_seconds = replay_sync_started.elapsed().as_secs_f64();
             activity.add(replay.activity);
             return Ok(BatchTrainingReport {
                 mean_loss: loss_sum / targets.max(1) as f64,
@@ -786,6 +1109,8 @@ pub(crate) fn train_story_batch(
                 replay_segments: replay.replay_segments,
                 replay_steps: replay.replay_steps,
                 replay_prefix_steps: replay.prefix_steps,
+                replay_seconds,
+                replay_sync_seconds,
                 merge: device_report.merge,
             });
         }
@@ -833,8 +1158,10 @@ pub(crate) fn train_story_batch(
         activity.add(report.activity);
         losses_by_story.push(report.losses);
     }
+    let replay_started = Instant::now();
     let replay =
         apply_batch_replay_policy(runtime, &trained_stories, &losses_by_story, permission)?;
+    let replay_seconds = replay_started.elapsed().as_secs_f64();
     activity.add(replay.activity);
 
     Ok(BatchTrainingReport {
@@ -845,6 +1172,8 @@ pub(crate) fn train_story_batch(
         replay_segments: replay.replay_segments,
         replay_steps: replay.replay_steps,
         replay_prefix_steps: replay.prefix_steps,
+        replay_seconds,
+        replay_sync_seconds: 0.0,
         merge,
     })
 }
@@ -1075,7 +1404,7 @@ fn replay_target_range_impl(
 
 #[cfg(test)]
 mod multi_gpu_partition_tests {
-    use super::balanced_story_range;
+    use super::{balanced_story_range, story_work, work_balanced_story_ranges};
 
     #[test]
     fn balanced_story_ranges_cover_logical_batch_in_order() {
@@ -1096,6 +1425,46 @@ mod multi_gpu_partition_tests {
                 assert_eq!(lengths.iter().sum::<usize>(), total);
             }
         }
+    }
+
+    #[test]
+    fn work_balanced_ranges_cover_stories_and_reduce_straggler_work() {
+        let stories = vec![
+            vec![b'a'; 100],
+            vec![b'b'; 1],
+            vec![b'c'; 1],
+            vec![b'd'; 1],
+            vec![b'e'; 1],
+            vec![b'f'; 1],
+        ];
+        let ranges = work_balanced_story_ranges(&stories, 2);
+        assert_eq!(ranges.first().expect("range").start, 0);
+        assert_eq!(ranges.last().expect("range").end, stories.len());
+        assert_eq!(ranges[0].end, ranges[1].start);
+
+        let work = ranges
+            .iter()
+            .map(|range| {
+                stories[range.clone()]
+                    .iter()
+                    .map(|story| story_work(story))
+                    .sum::<usize>()
+            })
+            .collect::<Vec<_>>();
+        let count_ranges = [
+            balanced_story_range(stories.len(), 2, 0),
+            balanced_story_range(stories.len(), 2, 1),
+        ];
+        let count_work = count_ranges
+            .iter()
+            .map(|range| {
+                stories[range.clone()]
+                    .iter()
+                    .map(|story| story_work(story))
+                    .sum::<usize>()
+            })
+            .collect::<Vec<_>>();
+        assert!(work.iter().max() <= count_work.iter().max());
     }
 
     #[test]

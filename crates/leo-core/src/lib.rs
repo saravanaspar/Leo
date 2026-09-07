@@ -22,14 +22,17 @@ use std::fmt::{Display, Formatter};
 
 pub use artifact::{digest_bytes, digest_file, ArtifactDigest, Sha256, DIGEST_ALGORITHM};
 pub use backend::{
-    available_gpu_devices, BackendCapabilities, BackendKind, BackendRuntime, DeviceAccess,
-    DeviceBufferSpec, DeviceModelLayout, DeviceScalarType, DeviceStoryBatchDeltaReport,
-    DeviceStoryBatchReport, RuntimeBackend,
+    available_gpu_devices, visible_gpu_device_compatibility, BackendCapabilities, BackendKind,
+    BackendRuntime, DeviceAccess, DeviceBufferSpec, DeviceModelLayout, DeviceScalarType,
+    DeviceStoryBatchDeltaReport, DeviceStoryBatchReport, GpuDeviceCompatibility, RuntimeBackend,
 };
 pub use config::Config;
 pub use metrics::{StepMetrics, TrainingStatistics};
 pub use model::Model;
-pub use parallel::{apply_mean_deltas, merged_parameter_changes, MergeMetrics, SparseModelDelta};
+pub use parallel::{
+    apply_mean_deltas, merged_parameter_changes, MergeMetrics, PackedSparseModelUpdate,
+    SparseModelDelta,
+};
 pub use permission::Permission;
 pub use runtime::{ParameterChanges, Runtime};
 pub use semantics::SemanticsContract;

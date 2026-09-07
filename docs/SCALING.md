@@ -1,10 +1,10 @@
 # Leo scaling architecture
 
-Leo v1.0.1 keeps one learning contract while allowing the execution layer to
-use more CUDA devices. The code path is implemented, but should be treated as
-requiring real 2+ GPU hardware validation before production deployment. The model, replay policy, FP32 arithmetic, logical worker
-count, and canonical mean barrier are semantic inputs; physical GPU placement is
-not.
+Leo's unreleased scaling work on top of v1.0.1 keeps one learning contract while
+allowing the execution layer to use more CUDA devices. The model, replay policy,
+FP32 arithmetic, logical worker count, and canonical mean barrier are semantic
+inputs; physical GPU placement is not. Multi-GPU production acceptance still
+requires the 2+ GPU hardware gates described below.
 
 ## Data parallelism = logical story workers
 
@@ -20,14 +20,21 @@ start from the same parameter revision.
 | 8 | 2 stories per GPU |
 | 16 | 1 story per GPU |
 
-Uneven counts use a deterministic contiguous balanced partition, for example 16
-stories on 3 GPUs become 6 + 5 + 5.
+Placement is deterministic and contiguous but balances estimated story work
+(target/byte count), not merely story count. Equal-width 16-story batches on 3
+GPUs still become 6 + 5 + 5; variable-length batches may use different contiguous
+ranges to reduce barrier stragglers without changing canonical story order.
 
 Each device returns **one sparse delta per original story**. The coordinator
 sorts device results by the original story position, flattens all 16 deltas, and
 calls the same canonical `apply_mean_deltas` once. There is no nested
 mean-of-device-means, so the denominator remains 16 independent of device count.
-The globally merged sparse rows are then synchronized to the resident replicas.
+The globally merged sparse rows are packed once, committed to GPU 0, and
+synchronized to every secondary canonical replica **and every resident story
+lane**. This keeps lane revisions current between batches and avoids full-model
+canonical-to-lane restoration on the next logical batch. Single-GPU native
+story batching uses the same packed lane update after its canonical mean instead
+of restoring every lane with a complete model copy.
 
 Enable the path with:
 
@@ -51,15 +58,27 @@ GPU also owns the private mutable story-lane state for the workers assigned to
 that device, so practical VRAM is one canonical/replica image plus that device's
 lane states; adding GPUs distributes those lane states instead of pooling VRAM.
 An explicit multi-GPU request fails if fewer than two CUDA devices are visible
-rather than silently running on one GPU.
+rather than silently running on one GPU. Exact mode also requires a homogeneous
+device group (same reported GPU model and compute capability); use
+`CUDA_VISIBLE_DEVICES` to select/reorder the group, with visible device 0 as the
+canonical runtime.
 
 ## What scales today
 
 The initial logical-story pass is distributed across devices concurrently.
-Sparse canonical synchronization occurs only at the batch barrier. GPU 0
-receives the exact merged rows through a sparse host-mirror commit and secondary
-replicas receive those same changed rows concurrently. This is the
-low-communication scaling axis and is appropriate even on PCIe-only systems.
+Secondary CUDA runtimes live on persistent owner threads instead of being
+re-created or re-threaded at every batch. Sparse canonical synchronization occurs
+only at the batch barrier. GPU 0 receives the exact merged rows through a packed
+sparse host-mirror commit and secondary replicas consume the same immutable
+packet. The packet is also scattered into resident story lanes. Batch-end sparse
+GPU-to-host snapshots compact all lane change counters into one small D2H read,
+then compact the variable payload into at most three typed D2H reads (f32/u32/u64)
+instead of blocking or transferring lane by lane.
+
+The host reducer still preserves the exact logical-story accumulation order, but
+uses deterministic k-way sparse merging rather than allocation-heavy tree maps.
+Constraint projection and validation inspect only changed parameters at the hot
+barrier; full model validation remains at artifact/checkpoint boundaries.
 
 The CUDA executor also uses sparse worklists and exact packed-key selection.
 Current sparse execution optimizations include:
@@ -110,18 +129,26 @@ GPUs approach >= 1.6x and ideally ~1.8x. Full 30% replay-on efficiency will be
 lower until replay becomes model-parallel.
 
 Use `scripts/benchmark_multi_gpu.py` to measure 1/N GPU throughput with identical
-model, data, story count, workers, and replay policy. The utility checks the
-semantic workload counters and loss before reporting speedup.
+model, data, story count, workers, and replay policy. The utility now requires an
+exact SHA-256 digest of the complete trained persistent state in addition to the
+workload counters/loss. It also prints a 10-second `nvidia-smi` heartbeat while
+Leo is otherwise silent. On 2+ GPU hosts, `scripts/check_gpu.sh` runs a 1-GPU vs
+2-GPU final-state parity gate automatically.
+
+`training_benchmark` also reports `replay_seconds`, `replay_sync_seconds`,
+`replay_wall_fraction`, and `serial_replay_speedup_ceiling` so the remaining
+Amdahl limit is measured rather than guessed.
 
 ## Resume identity
 
 The exact data-parallel synchronization identity is:
 
 ```text
-gpu_multi_device_story_mean_exact
+gpu_story_mean_exact_v1
 ```
 
-Older experimental multi-GPU resumes used a different device-mean identity.
-Leo rejects those resumes instead of silently continuing with different
-reduction semantics. Start a fresh multi-GPU run when moving from the old
-experimental synchronization mode.
+Physical GPU count is not part of the exact synchronization identity. For
+backward compatibility Leo accepts the earlier exact aliases
+`gpu_shared_wavefront_mean` and `gpu_multi_device_story_mean_exact` as equivalent
+to `gpu_story_mean_exact_v1` when the backend is GPU and logical workers > 1.
+Experimental device-mean identities remain incompatible and require a fresh run.

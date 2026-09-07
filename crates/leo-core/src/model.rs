@@ -292,6 +292,41 @@ impl Model {
             return Err(LeoError::internal("model contains NaN or infinite values"));
         }
         if self
+            .neurons
+            .threshold
+            .iter()
+            .any(|value| *value < 0.05 || *value > 2.0)
+        {
+            return Err(LeoError::internal(
+                "neuron thresholds violate canonical parameter bounds",
+            ));
+        }
+        if self
+            .neurons
+            .excitability
+            .iter()
+            .any(|value| *value < 0.1 || *value > 4.0)
+        {
+            return Err(LeoError::internal(
+                "neuron excitability violates canonical parameter bounds",
+            ));
+        }
+        let weight_min = self.config.learning.weight_min;
+        let weight_max = self.config.learning.weight_max;
+        if self
+            .output
+            .weights
+            .iter()
+            .chain(&self.context.embeddings)
+            .chain(&self.context.output_weights)
+            .any(|value| *value < weight_min || *value > weight_max)
+        {
+            return Err(LeoError::internal(
+                "learned projection weights violate canonical parameter bounds",
+            ));
+        }
+
+        if self
             .context
             .keys
             .iter()
@@ -466,5 +501,36 @@ fn sample_delay(rng: &mut SplitMix64) -> u8 {
         50..=74 => 2,
         75..=89 => 4,
         _ => 8,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_model() -> Model {
+        let config = Config::from_toml(include_str!("../../../configs/test.toml"))
+            .expect("test config should parse");
+        Model::initialize(config).expect("test model should initialize")
+    }
+
+    #[test]
+    fn validation_rejects_out_of_bounds_canonical_threshold() {
+        let mut model = test_model();
+        model.neurons.threshold[0] = 2.01;
+        assert!(model.validate().is_err());
+    }
+
+    #[test]
+    fn validation_rejects_out_of_bounds_learned_projection_weight() {
+        let mut model = test_model();
+        model.output.weights[0] = model.config.learning.weight_max + 0.01;
+        assert!(model.validate().is_err());
+    }
+
+    #[test]
+    fn initialized_model_satisfies_canonical_parameter_bounds() {
+        let model = test_model();
+        model.validate().expect("initialized model should validate");
     }
 }

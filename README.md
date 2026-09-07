@@ -424,7 +424,7 @@ CUDA_VISIBLE_DEVICES=0,1 LEO_MULTI_GPU=1 \
 The synchronization identity is:
 
 ```text
-gpu_multi_device_story_mean_exact
+gpu_story_mean_exact_v1
 ```
 
 Each GPU starts its assigned stories from the same canonical revision. Leo
@@ -436,16 +436,20 @@ so multi-GPU mode does not allocate a second full model copy on the first GPU;
 only secondary devices receive canonical replicas. VRAM is not pooled: every
 GPU needs one canonical/replica image plus the private mutable story-lane state
 for the workers assigned to that device. Adding GPUs distributes those lane
-states rather than combining device memory. An explicit `LEO_MULTI_GPU=1`
-request fails if fewer than two CUDA devices are visible.
+states rather than combining device memory. An explicit `LEO_MULTI_GPU=1` request fails if fewer than two CUDA devices are
+visible, and exact mode rejects heterogeneous GPU groups. The canonical visible
+device is device 0; use `CUDA_VISIBLE_DEVICES` to choose or reorder the group.
+Merged sparse rows are packed once and synchronized into canonical replicas and
+resident story lanes so lanes remain hot across logical batches. Secondary CUDA
+runtimes are owned by persistent worker threads.
 
 Replay remains on the canonical backend in story/range order. Consequently,
 base-pass data parallelism can scale well while full replay-on throughput is
 still limited by the serial replay fraction. See [docs/SCALING.md](docs/SCALING.md)
-for the scaling model and benchmark procedure. GPU scheduling may still produce
-the tiny numerical differences covered by the normal CPU/CUDA conformance
-thresholds; the logical denominator, update barrier, replay policy, and FP32
-learning equations are unchanged.
+for the scaling model and benchmark procedure. The GPU gate now requires an exact complete-training-state digest match for
+1-GPU vs 2-GPU runs on homogeneous devices, in addition to the existing CPU/CUDA
+conformance checks. The logical denominator, update barrier, replay policy, and
+FP32 learning equations are unchanged.
 
 </details>
 

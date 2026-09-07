@@ -376,3 +376,30 @@ LEO_MULTI_GPU=0 "$LEO" benchmark \
   --stories 32 \
   --workers 16 \
   --backend gpu
+
+# On hosts with at least two homogeneous GPUs, prove that physical placement is
+# execution-only: 1-GPU and 2-GPU runs must finish with the same complete
+# persistent training-state digest, not merely similar loss/counters.
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  if [[ "${CUDA_VISIBLE_DEVICES}" == "-1" ]]; then
+    GPU_COUNT=0
+  else
+    GPU_COUNT=$(printf '%s\n' "${CUDA_VISIBLE_DEVICES}" | awk -F',' '{print NF}')
+  fi
+else
+  GPU_COUNT=$(nvidia-smi --query-gpu=index --format=csv,noheader,nounits | sed '/^[[:space:]]*$/d' | wc -l)
+fi
+if [[ "$GPU_COUNT" -ge 2 ]]; then
+  echo "Running exact 1-GPU vs 2-GPU final-state conformance gate"
+  python3 scripts/benchmark_multi_gpu.py \
+    --leo "$LEO" \
+    --model "$TMP/model.pscls" \
+    --bytes "$TMP/data/tinystories.train.bytes" \
+    --index "$TMP/data/tinystories.train.idx" \
+    --stories 32 \
+    --workers 16 \
+    --counts 1,2 \
+    --max-attempts 8
+else
+  echo "Skipping multi-GPU final-state parity gate: only $GPU_COUNT GPU visible"
+fi

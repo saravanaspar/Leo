@@ -4,6 +4,20 @@ All notable project changes should be recorded here.
 
 ## Unreleased
 
+- Keep the reference GPU logical batch at 16 workers by default so backend selection cannot silently change the training denominator.
+- Normalize exact GPU story-mean resume identity across physical GPU counts while accepting the two prior exact aliases and continuing to reject experimental device-mean resumes.
+- Require homogeneous CUDA devices for exact multi-GPU runs and reserve visible device 0 for the canonical runtime; use `CUDA_VISIBLE_DEVICES` for selection/reordering.
+- Replace per-batch secondary thread creation with persistent CUDA owner threads and deterministic work-balanced contiguous story placement.
+- Keep GPU story lanes hot across batches by sparse-syncing merged and replay-updated canonical packets into each resident lane instead of forcing full-model lane restoration; the same packed path now replaces the prior full canonical-to-lane restore on single-GPU story batches too.
+- Pack each canonical sparse update once and reuse it for GPU0 commit and all secondary replicas, avoiding repeated host-model gathers per device.
+- Compact per-story sparse GPU snapshots across lanes so change counts use one small D2H read and the variable f32/u32/u64 payload uses at most three aggregate D2H reads instead of lane-by-lane transfers.
+- Replace allocation-heavy tree-map sparse reduction with deterministic k-way reduction in canonical story order while preserving the public `SparseModelDelta` interface.
+- Restrict merge-time constraint projection and validation to changed parameters; full validation remains at model/checkpoint boundaries.
+- Enforce canonical threshold, excitability, output, context-embedding, and context-output bounds during full model/checkpoint validation so changed-only merge validation never relies on silently repairing untouched invalid parameters.
+- Add exact full training-state SHA-256 to training benchmarks and a 1-GPU vs 2-GPU parity gate on multi-GPU CI hosts.
+- Add live 10-second GPU-utilization heartbeats to the multi-GPU scaling benchmark, plus replay wall/sync timing and the measured serial-replay speedup ceiling.
+- Make validation use multiple GPUs only when multi-GPU execution was explicitly requested rather than opportunistically consuming every visible device.
+
 - Replace experimental mean-of-device-means training with exact logical-story data parallelism: retain one sparse delta per story, restore canonical story order, and apply one flat `1 / workers` canonical mean across 2..N visible GPUs, including uneven partitions and one-story-per-device layouts.
 - Make `benchmark --train` use the same multi-GPU `TrainingEngine` as real training and report `gpu_devices`, so scaling measurements cannot silently fall back to GPU 0.
 - Defer redundant device-local canonical merging/copies in multi-GPU shards; only the globally merged sparse canonical state is synchronized back to resident replicas.

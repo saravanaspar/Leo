@@ -9,7 +9,7 @@ use crate::metrics::TrainingStatistics;
 use crate::model::Model;
 use crate::runtime::ParameterChanges;
 use crate::{digest_bytes, ArtifactDigest, LeoError, LeoResult};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SparseF32Delta {
@@ -69,6 +69,237 @@ pub struct TrackedModelValues {
     pub context_output_weight: Option<Vec<f32>>,
     pub revision_increment: u64,
     pub statistics: StatisticsDelta,
+}
+
+/// Canonical sparse parameter image prepared once per logical batch and reused
+/// for every CUDA replica/lane synchronization. The packet contains host-side
+/// values in the same packed layouts consumed by the existing CUDA scatter
+/// kernels, avoiding repeated canonical-model gathers for each device.
+#[derive(Debug, Clone)]
+pub struct PackedSparseModelUpdate {
+    pub threshold_indices: Vec<u32>,
+    pub threshold_values: Vec<f32>,
+    pub recurrent_indices: Vec<u32>,
+    pub recurrent_values: Vec<f32>,
+    pub input_indices: Vec<u32>,
+    pub input_values: Vec<f32>,
+    pub output_neurons: Vec<u32>,
+    /// CUDA-native layout: one contiguous OUTPUT_CLASSES row per neuron.
+    pub output_values_by_neuron: Vec<f32>,
+    pub context_slots: Vec<u32>,
+    pub context_keys: Vec<u64>,
+    pub context_observations: Vec<u32>,
+    pub context_embeddings: Vec<f32>,
+    pub output_bias: Option<Vec<f32>>,
+    pub context_output_weights: Option<Vec<f32>>,
+    pub generation: u64,
+    pub parameter_revision: u64,
+    pub statistics: TrainingStatistics,
+}
+
+impl PackedSparseModelUpdate {
+    pub fn from_model(model: &Model, changes: &ParameterChanges) -> LeoResult<Self> {
+        fn indices_u32(label: &str, values: &[usize]) -> LeoResult<Vec<u32>> {
+            values
+                .iter()
+                .map(|&value| {
+                    u32::try_from(value).map_err(|_| {
+                        LeoError::internal(format!("{label} sparse index exceeds u32"))
+                    })
+                })
+                .collect()
+        }
+
+        fn selected_values(label: &str, source: &[f32], indices: &[usize]) -> LeoResult<Vec<f32>> {
+            indices
+                .iter()
+                .map(|&index| {
+                    source.get(index).copied().ok_or_else(|| {
+                        LeoError::internal(format!("{label} sparse index is outside the model"))
+                    })
+                })
+                .collect()
+        }
+
+        let threshold_indices = indices_u32("threshold", &changes.threshold)?;
+        let threshold_values =
+            selected_values("threshold", &model.neurons.threshold, &changes.threshold)?;
+        let recurrent_indices = indices_u32("recurrent", &changes.recurrent_weight)?;
+        let recurrent_values = selected_values(
+            "recurrent",
+            &model.recurrent.weight,
+            &changes.recurrent_weight,
+        )?;
+        let input_indices = indices_u32("input", &changes.input_weight)?;
+        let input_values = selected_values("input", &model.input.weights, &changes.input_weight)?;
+
+        let output_neurons = indices_u32("output neuron", &changes.output_neurons)?;
+        let neuron_count = model.neuron_count();
+        let mut output_values_by_neuron = Vec::with_capacity(
+            changes
+                .output_neurons
+                .len()
+                .saturating_mul(crate::symbols::OUTPUT_CLASSES),
+        );
+        for &neuron in &changes.output_neurons {
+            if neuron >= neuron_count {
+                return Err(LeoError::internal(
+                    "output neuron sparse index is outside the model",
+                ));
+            }
+            for output in 0..crate::symbols::OUTPUT_CLASSES {
+                output_values_by_neuron.push(model.output.weights[output * neuron_count + neuron]);
+            }
+        }
+
+        let context_slots = indices_u32("context slot", &changes.context_slots)?;
+        let dim = model.config.context.embedding_dim;
+        let mut context_keys = Vec::with_capacity(changes.context_slots.len());
+        let mut context_observations = Vec::with_capacity(changes.context_slots.len());
+        let mut context_embeddings =
+            Vec::with_capacity(changes.context_slots.len().saturating_mul(dim));
+        for &slot in &changes.context_slots {
+            if slot >= model.context.keys.len() {
+                return Err(LeoError::internal(
+                    "context sparse slot is outside the model",
+                ));
+            }
+            context_keys.push(model.context.keys[slot]);
+            context_observations.push(model.context.observations[slot]);
+            let start = slot * dim;
+            context_embeddings.extend_from_slice(&model.context.embeddings[start..start + dim]);
+        }
+
+        Ok(Self {
+            threshold_indices,
+            threshold_values,
+            recurrent_indices,
+            recurrent_values,
+            input_indices,
+            input_values,
+            output_neurons,
+            output_values_by_neuron,
+            context_slots,
+            context_keys,
+            context_observations,
+            context_embeddings,
+            output_bias: changes.output_bias_dirty.then(|| model.output.bias.clone()),
+            context_output_weights: changes
+                .context_output_dirty
+                .then(|| model.context.output_weights.clone()),
+            generation: model.generation,
+            parameter_revision: model.parameter_revision,
+            statistics: model.statistics.clone(),
+        })
+    }
+
+    pub fn apply_to_model(&self, model: &mut Model) -> LeoResult<()> {
+        fn overwrite_selected(
+            label: &str,
+            target: &mut [f32],
+            indices: &[u32],
+            values: &[f32],
+        ) -> LeoResult<()> {
+            if indices.len() != values.len() {
+                return Err(LeoError::internal(format!(
+                    "{label} packed sparse index/value counts differ"
+                )));
+            }
+            for (&index, &value) in indices.iter().zip(values) {
+                let slot = target.get_mut(index as usize).ok_or_else(|| {
+                    LeoError::internal(format!("{label} packed sparse index is outside model"))
+                })?;
+                *slot = value;
+            }
+            Ok(())
+        }
+
+        overwrite_selected(
+            "threshold",
+            &mut model.neurons.threshold,
+            &self.threshold_indices,
+            &self.threshold_values,
+        )?;
+        overwrite_selected(
+            "recurrent",
+            &mut model.recurrent.weight,
+            &self.recurrent_indices,
+            &self.recurrent_values,
+        )?;
+        overwrite_selected(
+            "input",
+            &mut model.input.weights,
+            &self.input_indices,
+            &self.input_values,
+        )?;
+
+        let neuron_count = model.neuron_count();
+        let expected_output_values = self
+            .output_neurons
+            .len()
+            .saturating_mul(crate::symbols::OUTPUT_CLASSES);
+        if self.output_values_by_neuron.len() != expected_output_values {
+            return Err(LeoError::internal(
+                "packed output rows do not match output neuron count",
+            ));
+        }
+        for (row, &neuron) in self.output_neurons.iter().enumerate() {
+            let neuron = neuron as usize;
+            if neuron >= neuron_count {
+                return Err(LeoError::internal(
+                    "packed output neuron is outside the model",
+                ));
+            }
+            for output in 0..crate::symbols::OUTPUT_CLASSES {
+                model.output.weights[output * neuron_count + neuron] =
+                    self.output_values_by_neuron[row * crate::symbols::OUTPUT_CLASSES + output];
+            }
+        }
+
+        let dim = model.config.context.embedding_dim;
+        if self.context_slots.len() != self.context_keys.len()
+            || self.context_slots.len() != self.context_observations.len()
+            || self.context_embeddings.len() != self.context_slots.len().saturating_mul(dim)
+        {
+            return Err(LeoError::internal(
+                "packed context rows have invalid dimensions",
+            ));
+        }
+        for (row, &slot) in self.context_slots.iter().enumerate() {
+            let slot = slot as usize;
+            if slot >= model.context.keys.len() {
+                return Err(LeoError::internal(
+                    "packed context slot is outside the model",
+                ));
+            }
+            model.context.keys[slot] = self.context_keys[row];
+            model.context.observations[slot] = self.context_observations[row];
+            let start = slot * dim;
+            let source = row * dim;
+            model.context.embeddings[start..start + dim]
+                .copy_from_slice(&self.context_embeddings[source..source + dim]);
+        }
+        if let Some(values) = &self.output_bias {
+            if values.len() != model.output.bias.len() {
+                return Err(LeoError::internal(
+                    "packed output bias has invalid dimensions",
+                ));
+            }
+            model.output.bias.copy_from_slice(values);
+        }
+        if let Some(values) = &self.context_output_weights {
+            if values.len() != model.context.output_weights.len() {
+                return Err(LeoError::internal(
+                    "packed context output weights have invalid dimensions",
+                ));
+            }
+            model.context.output_weights.copy_from_slice(values);
+        }
+        model.generation = self.generation;
+        model.parameter_revision = self.parameter_revision;
+        model.statistics = self.statistics.clone();
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -531,8 +762,8 @@ pub fn apply_mean_deltas(
         total.saturating_add(delta.revision_increment)
     });
     master.parameter_revision = master.parameter_revision.saturating_add(revision_increment);
-    project_parameter_constraints(master);
-    master.validate()?;
+    project_parameter_constraints_sparse(master, deltas)?;
+    validate_sparse_merge(master, deltas)?;
 
     Ok(MergeMetrics {
         workers: worker_count,
@@ -550,9 +781,8 @@ pub fn merged_parameter_changes(
     deltas: &[SparseModelDelta],
     raw_changes: &[ParameterChanges],
 ) -> LeoResult<ParameterChanges> {
-    let mut changes = ParameterChanges::default();
     let neuron_count = canonical.neuron_count();
-
+    let mut changes = ParameterChanges::default();
     for delta in deltas {
         changes
             .threshold
@@ -722,22 +952,48 @@ fn apply_sparse_mean<'a>(
     groups: impl Iterator<Item = &'a [SparseF32Delta]>,
     worker_count: usize,
 ) -> LeoResult<usize> {
-    let mut sums = BTreeMap::<usize, f64>::new();
-    for group in groups {
-        for update in group {
-            if update.index >= target.len() || !update.delta.is_finite() {
-                return Err(LeoError::internal("invalid sparse worker parameter delta"));
-            }
-            *sums.entry(update.index).or_default() += update.delta as f64;
+    let groups = groups.collect::<Vec<_>>();
+    let mut positions = vec![0usize; groups.len()];
+    let mut updates = 0usize;
+
+    loop {
+        let next_index = groups
+            .iter()
+            .zip(&positions)
+            .filter_map(|(group, &position)| group.get(position).map(|update| update.index))
+            .min();
+        let Some(index) = next_index else {
+            break;
+        };
+        if index >= target.len() {
+            return Err(LeoError::internal("invalid sparse worker parameter delta"));
         }
-    }
-    for (&index, &sum) in &sums {
+
+        // Preserve the canonical logical-story reduction order exactly. Each
+        // worker contributes at most once to a given aligned parameter because
+        // SparseModelDelta is canonicalized before it reaches this reducer.
+        let mut sum = 0.0f64;
+        for (worker_index, group) in groups.iter().enumerate() {
+            let position = positions[worker_index];
+            if let Some(update) = group.get(position) {
+                if update.index == index {
+                    if !update.delta.is_finite() {
+                        return Err(LeoError::internal("invalid sparse worker parameter delta"));
+                    }
+                    sum += update.delta as f64;
+                    positions[worker_index] += 1;
+                }
+            }
+        }
+
         target[index] += (sum / worker_count as f64) as f32;
         if !target[index].is_finite() {
             return Err(LeoError::internal("merged parameter became non-finite"));
         }
+        updates = updates.saturating_add(1);
     }
-    Ok(sums.len())
+
+    Ok(updates)
 }
 
 fn apply_context_deltas(
@@ -745,55 +1001,90 @@ fn apply_context_deltas(
     deltas: &[SparseModelDelta],
     worker_count: usize,
 ) -> LeoResult<usize> {
-    let embedding_dim = master.config.context.embedding_dim;
-    let mut merged = BTreeMap::<(usize, u64), (Vec<f64>, u64)>::new();
-    for delta in deltas {
-        for update in &delta.context {
-            if update.embedding_delta.len() != embedding_dim
-                || update.order == 0
-                || update.order > master.config.context.max_order
-                || update.key == 0
-                || update
-                    .embedding_delta
-                    .iter()
-                    .any(|value| !value.is_finite())
-            {
-                return Err(LeoError::internal("invalid keyed context worker delta"));
-            }
-            let entry = merged
-                .entry((update.order, update.key))
-                .or_insert_with(|| (vec![0.0; embedding_dim], 0));
-            for (sum, value) in entry.0.iter_mut().zip(&update.embedding_delta) {
-                *sum += *value as f64;
-            }
-            entry.1 = entry
-                .1
-                .saturating_add(u64::from(update.observation_increment));
-        }
+    #[derive(Debug)]
+    struct MergedContextDelta {
+        order: usize,
+        key: u64,
+        embedding_sum: Vec<f64>,
+        observations: u64,
     }
 
-    let mut ordered = merged.into_iter().collect::<Vec<_>>();
-    ordered.sort_unstable_by(|left, right| {
+    let embedding_dim = master.config.context.embedding_dim;
+    let groups = deltas
+        .iter()
+        .map(|delta| delta.context.as_slice())
+        .collect::<Vec<_>>();
+    let mut positions = vec![0usize; groups.len()];
+    let mut merged = Vec::<MergedContextDelta>::new();
+
+    loop {
+        let next_key = groups
+            .iter()
+            .zip(&positions)
+            .filter_map(|(group, &position)| {
+                group.get(position).map(|update| (update.order, update.key))
+            })
+            .min();
+        let Some((order, key)) = next_key else {
+            break;
+        };
+
+        let mut embedding_sum = vec![0.0f64; embedding_dim];
+        let mut observations = 0u64;
+        for (worker_index, group) in groups.iter().enumerate() {
+            let position = positions[worker_index];
+            if let Some(update) = group.get(position) {
+                if (update.order, update.key) == (order, key) {
+                    if update.embedding_delta.len() != embedding_dim
+                        || update.order == 0
+                        || update.order > master.config.context.max_order
+                        || update.key == 0
+                        || update
+                            .embedding_delta
+                            .iter()
+                            .any(|value| !value.is_finite())
+                    {
+                        return Err(LeoError::internal("invalid keyed context worker delta"));
+                    }
+                    for (sum, &value) in embedding_sum.iter_mut().zip(&update.embedding_delta) {
+                        *sum += value as f64;
+                    }
+                    observations =
+                        observations.saturating_add(u64::from(update.observation_increment));
+                    positions[worker_index] += 1;
+                }
+            }
+        }
+        merged.push(MergedContextDelta {
+            order,
+            key,
+            embedding_sum,
+            observations,
+        });
+    }
+
+    // Slot replacement priority remains identical to the previous reducer:
+    // observation-heavy contexts first, then stable (order,key) tie-breaking.
+    merged.sort_unstable_by(|left, right| {
         right
-            .1
-             .1
-            .cmp(&left.1 .1)
-            .then_with(|| left.0.cmp(&right.0))
+            .observations
+            .cmp(&left.observations)
+            .then_with(|| (left.order, left.key).cmp(&(right.order, right.key)))
     });
-    for ((order, key), (embedding_sum, observations)) in &ordered {
-        let (slot, _) = master.resolve_context_slot(*order, *key, true)?;
+    for update in &merged {
+        let (slot, _) = master.resolve_context_slot(update.order, update.key, true)?;
         let slot = slot.expect("allocating a valid context always returns a slot");
         let range = master.context.embedding_range(slot, embedding_dim);
         for (value, sum) in master.context.embeddings[range]
             .iter_mut()
-            .zip(embedding_sum)
+            .zip(&update.embedding_sum)
         {
             *value += (*sum / worker_count as f64) as f32;
         }
         master.context.observations[slot] = master.context.observations[slot]
-            .saturating_add((*observations).min(u64::from(u32::MAX)) as u32);
+            .saturating_add(update.observations.min(u64::from(u32::MAX)) as u32);
     }
-    Ok(ordered.len())
+    Ok(merged.len())
 }
 
 fn statistics_delta(before: &TrainingStatistics, after: &TrainingStatistics) -> StatisticsDelta {
@@ -850,37 +1141,182 @@ fn apply_statistics_deltas(statistics: &mut TrainingStatistics, deltas: &[Sparse
     }
 }
 
-fn project_parameter_constraints(model: &mut Model) {
+fn project_parameter_constraints_sparse(
+    model: &mut Model,
+    deltas: &[SparseModelDelta],
+) -> LeoResult<()> {
     let minimum = model.config.learning.weight_min;
     let maximum = model.config.learning.weight_max;
-    for threshold in &mut model.neurons.threshold {
-        *threshold = threshold.clamp(0.05, 2.0);
-    }
-    for excitability in &mut model.neurons.excitability {
-        *excitability = excitability.clamp(0.1, 4.0);
-    }
     let capacity = model.recurrent.capacity_per_neuron;
-    for (slot, weight) in model.recurrent.weight.iter_mut().enumerate() {
-        let source = slot / capacity;
-        *weight = (*weight).clamp(minimum, maximum);
-        *weight = if model.neurons.neuron_type[source] == 0 {
-            (*weight).max(0.0)
-        } else {
-            (*weight).min(0.0)
-        };
+    let context_dim = model.config.context.embedding_dim;
+
+    for delta in deltas {
+        for update in &delta.threshold {
+            let value = model
+                .neurons
+                .threshold
+                .get_mut(update.index)
+                .ok_or_else(|| LeoError::internal("merged threshold index is outside the model"))?;
+            *value = (*value).clamp(0.05, 2.0);
+        }
+        for update in &delta.excitability {
+            let value = model
+                .neurons
+                .excitability
+                .get_mut(update.index)
+                .ok_or_else(|| {
+                    LeoError::internal("merged excitability index is outside the model")
+                })?;
+            *value = (*value).clamp(0.1, 4.0);
+        }
+        for update in &delta.recurrent_weight {
+            let weight = model
+                .recurrent
+                .weight
+                .get_mut(update.index)
+                .ok_or_else(|| LeoError::internal("merged recurrent index is outside the model"))?;
+            let source = update.index / capacity;
+            *weight = (*weight).clamp(minimum, maximum);
+            *weight = if model.neurons.neuron_type[source] == 0 {
+                (*weight).max(0.0)
+            } else {
+                (*weight).min(0.0)
+            };
+        }
+        for update in &delta.input_weight {
+            let weight = model
+                .input
+                .weights
+                .get_mut(update.index)
+                .ok_or_else(|| LeoError::internal("merged input index is outside the model"))?;
+            *weight = (*weight).clamp(0.0, maximum);
+        }
+        for update in &delta.output_weight {
+            let weight =
+                model.output.weights.get_mut(update.index).ok_or_else(|| {
+                    LeoError::internal("merged output index is outside the model")
+                })?;
+            *weight = (*weight).clamp(minimum, maximum);
+        }
+        for update in &delta.context {
+            if let (Some(slot), _) = model.resolve_context_slot(update.order, update.key, false)? {
+                let start = slot * context_dim;
+                for weight in &mut model.context.embeddings[start..start + context_dim] {
+                    *weight = (*weight).clamp(minimum, maximum);
+                }
+            }
+        }
+        for update in &delta.context_output_weight {
+            let weight = model
+                .context
+                .output_weights
+                .get_mut(update.index)
+                .ok_or_else(|| {
+                    LeoError::internal("merged context output index is outside the model")
+                })?;
+            *weight = (*weight).clamp(minimum, maximum);
+        }
     }
-    for weight in &mut model.input.weights {
-        *weight = (*weight).clamp(0.0, maximum);
+    Ok(())
+}
+
+fn validate_sparse_merge(model: &mut Model, deltas: &[SparseModelDelta]) -> LeoResult<()> {
+    if !model.statistics.training_loss_sum.is_finite() {
+        return Err(LeoError::internal(
+            "merged model statistics contain a non-finite loss",
+        ));
     }
-    for weight in &mut model.output.weights {
-        *weight = (*weight).clamp(minimum, maximum);
+
+    let minimum = model.config.learning.weight_min;
+    let maximum = model.config.learning.weight_max;
+    let capacity = model.recurrent.capacity_per_neuron;
+    let context_dim = model.config.context.embedding_dim;
+
+    for delta in deltas {
+        for update in &delta.threshold {
+            let value = model.neurons.threshold[update.index];
+            if !value.is_finite() || !(0.05..=2.0).contains(&value) {
+                return Err(LeoError::internal(
+                    "merged threshold violates canonical parameter bounds",
+                ));
+            }
+        }
+        for update in &delta.excitability {
+            let value = model.neurons.excitability[update.index];
+            if !value.is_finite() || !(0.1..=4.0).contains(&value) {
+                return Err(LeoError::internal(
+                    "merged excitability violates canonical parameter bounds",
+                ));
+            }
+        }
+        for update in &delta.recurrent_weight {
+            let weight = model.recurrent.weight[update.index];
+            let source = update.index / capacity;
+            let sign_valid = if model.neurons.neuron_type[source] == 0 {
+                weight >= 0.0
+            } else {
+                weight <= 0.0
+            };
+            if !weight.is_finite() || weight < minimum || weight > maximum || !sign_valid {
+                return Err(LeoError::internal(
+                    "merged recurrent parameter violates model constraints",
+                ));
+            }
+        }
+        for update in &delta.input_weight {
+            let weight = model.input.weights[update.index];
+            if !weight.is_finite() || weight < 0.0 || weight > maximum {
+                return Err(LeoError::internal(
+                    "merged input parameter violates model constraints",
+                ));
+            }
+        }
+        for update in &delta.output_weight {
+            let weight = model
+                .output
+                .weights
+                .get(update.index)
+                .copied()
+                .ok_or_else(|| LeoError::internal("merged output index is outside the model"))?;
+            if !weight.is_finite() || weight < minimum || weight > maximum {
+                return Err(LeoError::internal(
+                    "merged output weight violates canonical parameter bounds",
+                ));
+            }
+        }
+        for update in &delta.output_bias {
+            if !model.output.bias[update.index].is_finite() {
+                return Err(LeoError::internal("merged output bias is non-finite"));
+            }
+        }
+        for update in &delta.context {
+            if let (Some(slot), _) = model.resolve_context_slot(update.order, update.key, false)? {
+                if model.context.keys[slot] == 0 && model.context.observations[slot] != 0 {
+                    return Err(LeoError::internal(
+                        "merged context slot has observations without a key",
+                    ));
+                }
+                let start = slot * context_dim;
+                if model.context.embeddings[start..start + context_dim]
+                    .iter()
+                    .any(|value| !value.is_finite() || *value < minimum || *value > maximum)
+                {
+                    return Err(LeoError::internal(
+                        "merged context embedding violates canonical parameter bounds",
+                    ));
+                }
+            }
+        }
+        for update in &delta.context_output_weight {
+            let weight = model.context.output_weights[update.index];
+            if !weight.is_finite() || weight < minimum || weight > maximum {
+                return Err(LeoError::internal(
+                    "merged context output weight violates canonical parameter bounds",
+                ));
+            }
+        }
     }
-    for weight in &mut model.context.embeddings {
-        *weight = (*weight).clamp(minimum, maximum);
-    }
-    for weight in &mut model.context.output_weights {
-        *weight = (*weight).clamp(minimum, maximum);
-    }
+    Ok(())
 }
 
 fn config_fingerprint(model: &Model) -> ArtifactDigest {
@@ -889,9 +1325,12 @@ fn config_fingerprint(model: &Model) -> ArtifactDigest {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_mean_deltas, statistics_delta, SparseModelDelta, TrackedModelValues};
-    use crate::symbols::{BEGIN_DOCUMENT, END_DOCUMENT};
-    use crate::{Config, Model, Permission, Runtime};
+    use super::{
+        apply_mean_deltas, statistics_delta, PackedSparseModelUpdate, SparseModelDelta,
+        TrackedModelValues,
+    };
+    use crate::symbols::{BEGIN_DOCUMENT, END_DOCUMENT, OUTPUT_CLASSES};
+    use crate::{Config, Model, ParameterChanges, Permission, Runtime};
 
     fn model() -> Model {
         let config = Config::from_toml(include_str!("../../../configs/test.toml")).unwrap();
@@ -1013,6 +1452,89 @@ mod tests {
         let expected = SparseModelDelta::between_tracked(&base, trained, &changes).unwrap();
         let observed = SparseModelDelta::from_tracked_values(&base, &changes, values).unwrap();
         assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn output_weights_merge_in_logical_worker_order_without_tree_maps() {
+        let base = model();
+        let neuron = 3usize;
+        let output = 7usize;
+        let index = output * base.neuron_count() + neuron;
+        let mut first = base.clone();
+        let mut second = base.clone();
+        first.output.weights[index] += 0.2;
+        second.output.weights[index] -= 0.1;
+        let deltas = [
+            SparseModelDelta::between(&base, &first).unwrap(),
+            SparseModelDelta::between(&base, &second).unwrap(),
+        ];
+        assert_eq!(deltas[0].output_weight.len(), 1);
+        assert_eq!(deltas[1].output_weight.len(), 1);
+        assert_eq!(deltas[0].output_weight[0].index, index);
+
+        let mut master = base.clone();
+        apply_mean_deltas(&mut master, &deltas).unwrap();
+        let expected = base.output.weights[index] + 0.05;
+        assert!((master.output.weights[index] - expected).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn packed_sparse_update_reproduces_selected_canonical_rows() {
+        let base = model();
+        let mut canonical = base.clone();
+        canonical.neurons.threshold[0] += 0.125;
+        canonical.recurrent.weight[0] *= 0.5;
+        canonical.input.weights[0] += 0.03125;
+        let neuron_count = canonical.neuron_count();
+        for output in 0..OUTPUT_CLASSES {
+            canonical.output.weights[output * neuron_count] += output as f32 * 1.0e-6;
+        }
+        canonical.output.bias[0] += 0.25;
+        canonical.context.keys[0] = 42;
+        canonical.context.observations[0] = 7;
+        canonical.context.embeddings[0] = -0.125;
+        canonical.context.output_weights[0] += 0.0625;
+        canonical.parameter_revision = canonical.parameter_revision.saturating_add(3);
+        canonical.statistics.processed_stories = 9;
+
+        let changes = ParameterChanges {
+            threshold: vec![0],
+            recurrent_weight: vec![0],
+            input_weight: vec![0],
+            output_neurons: vec![0],
+            context_slots: vec![0],
+            output_bias_dirty: true,
+            context_output_dirty: true,
+        };
+        let packet = PackedSparseModelUpdate::from_model(&canonical, &changes).unwrap();
+        let mut replica = base.clone();
+        packet.apply_to_model(&mut replica).unwrap();
+
+        assert_eq!(replica.neurons.threshold[0], canonical.neurons.threshold[0]);
+        assert_eq!(replica.recurrent.weight[0], canonical.recurrent.weight[0]);
+        assert_eq!(replica.input.weights[0], canonical.input.weights[0]);
+        for output in 0..OUTPUT_CLASSES {
+            assert_eq!(
+                replica.output.weights[output * replica.neuron_count()],
+                canonical.output.weights[output * canonical.neuron_count()]
+            );
+        }
+        assert_eq!(replica.output.bias, canonical.output.bias);
+        assert_eq!(replica.context.keys[0], canonical.context.keys[0]);
+        assert_eq!(
+            replica.context.observations[0],
+            canonical.context.observations[0]
+        );
+        assert_eq!(
+            replica.context.embeddings[0],
+            canonical.context.embeddings[0]
+        );
+        assert_eq!(
+            replica.context.output_weights,
+            canonical.context.output_weights
+        );
+        assert_eq!(replica.parameter_revision, canonical.parameter_revision);
+        assert_eq!(replica.statistics.processed_stories, 9);
     }
 
     #[test]
