@@ -4,6 +4,9 @@ All notable project changes should be recorded here.
 
 ## Unreleased
 
+- Replace serial persistent per-block top-k selection with an exact packed-key parallel network on supported power-of-two CUDA shapes, preserving the historical block-cutoff quirk and retaining the legacy fallback for unsupported/non-finite cases.
+- Accelerate persistent global winner selection with the same exact packed key and reuse already-sorted per-block winner runs to skip completed bitonic stages without changing active-neuron order.
+- Add reference tests proving packed-key ordering, historical cutoff reconstruction, and pre-sorted-run merge equivalence to Leo's v1 comparator.
 - Accelerate the single-story supervised replay path with a cooperative whole-grid CUDA executor while preserving the legacy one-block kernel as an execution-only A/B fallback.
 - Expose hidden frozen-prefix replay work in benchmark/training progress accounting and add opt-in replay/CUDA timing, launch, memory, hardware-identity, segment, and sampled phase diagnostics.
 - Keep replay selection/order, logical worker semantics, FP32 equations, artifact formats, and v1 semantic/schema identifiers unchanged.

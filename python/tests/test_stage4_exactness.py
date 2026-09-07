@@ -1,4 +1,5 @@
 import random
+import struct
 import unittest
 from pathlib import Path
 
@@ -41,6 +42,78 @@ def stage3_block_select(values, keep, rotation, neuron_count):
     return winners, cutoff
 
 
+
+
+def f32(value: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def selection_record(value: float, neuron: int, rotation: int, neuron_count: int) -> int:
+    value = f32(value)
+    if value <= 0.0:
+        return 0
+    bits = struct.unpack("<I", struct.pack("<f", value))[0]
+    tie = 0xFFFFFFFF - rotated_key(neuron, rotation, neuron_count)
+    return (bits << 32) | tie
+
+
+def selection_record_value(record: int) -> float:
+    if record == 0:
+        return -1.0
+    return struct.unpack("<f", struct.pack("<I", record >> 32))[0]
+
+
+def selection_record_neuron(record: int, rotation: int, neuron_count: int) -> int:
+    if record == 0:
+        return 0
+    rotated = 0xFFFFFFFF - (record & 0xFFFFFFFF)
+    return (rotated + rotation) % neuron_count
+
+
+def packed_block_select(values, keep, rotation, neuron_count):
+    records = sorted(
+        (selection_record(value, neuron, rotation, neuron_count) for value, neuron in values),
+        reverse=True,
+    )
+    positive = sum(record != 0 for record in records)
+    winner_count = min(positive, keep)
+    winners = [
+        (
+            selection_record_value(record),
+            selection_record_neuron(record, rotation, neuron_count),
+        )
+        for record in records[:winner_count]
+    ]
+    if positive <= keep:
+        return winners, 0.0
+
+    last_positive = next((item for item in reversed(values) if item[0] > 0.0), None)
+    assert last_positive is not None
+    last_is_winner = any(neuron == last_positive[1] for _, neuron in winners)
+    cutoff = selection_record_value(records[keep]) if last_is_winner else last_positive[0]
+    return winners, cutoff
+
+
+def bitonic_sort_keys(records, first_width=2):
+    records = list(records)
+    width = first_width
+    while width <= len(records):
+        stride = width >> 1
+        while stride:
+            for index in range(len(records)):
+                other = index ^ stride
+                if other <= index:
+                    continue
+                better_first = (index & width) == 0
+                left = records[index]
+                right = records[other]
+                should_swap = left < right if better_first else left > right
+                if should_swap:
+                    records[index], records[other] = right, left
+            stride >>= 1
+        width <<= 1
+    return records
+
 def stage4_exact_select(values, keep, rotation, neuron_count):
     positive = [(value, neuron) for value, neuron in values if value > 0.0]
     # Total ordering corresponding to leo_better.
@@ -74,6 +147,52 @@ class Stage4ExactnessTests(unittest.TestCase):
                 stage3_block_select(values, keep, rotation, neuron_count),
                 stage4_exact_select(values, keep, rotation, neuron_count),
             )
+
+    def test_packed_selection_matches_serial_winners_and_cutoff(self):
+        rng = random.Random(424242)
+        neuron_count = 32768
+        keep = 8
+        for _ in range(1000):
+            block_start = rng.randrange(0, neuron_count - 256)
+            rotation = rng.randrange(neuron_count)
+            values = []
+            for local in range(256):
+                value = f32(rng.choice((0.0, 0.0, 0.1, 0.2, rng.random())))
+                values.append((value, block_start + local))
+            self.assertEqual(
+                stage3_block_select(values, keep, rotation, neuron_count),
+                packed_block_select(values, keep, rotation, neuron_count),
+            )
+
+    def test_presorted_block_runs_can_skip_completed_bitonic_widths(self):
+        rng = random.Random(9001)
+        neuron_count = 32768
+        rotation = 1337
+        run = 8
+        runs = []
+        for block in range(128):
+            records = []
+            for local in range(run):
+                neuron = block * 256 + local
+                value = f32(rng.choice((0.0, 0.1, 0.2, rng.random())))
+                records.append(selection_record(value, neuron, rotation, neuron_count))
+            records.sort(reverse=True)
+            if block & 1:
+                records.reverse()
+            runs.extend(records)
+
+        merged = bitonic_sort_keys(runs, first_width=run * 2)
+        self.assertEqual(merged, sorted(runs, reverse=True))
+
+    def test_cuda_source_reuses_exact_packed_selection_helpers(self):
+        cuda = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+        self.assertIn("leo_selection_record(", cuda)
+        self.assertIn("leo_bitonic_sort_selection_keys(", cuda)
+        self.assertIn("presorted_runs", cuda)
+        self.assertIn("last_positive_neuron", cuda)
+        self.assertIn("Exact legacy fallback for unsupported shapes", cuda)
+        self.assertIn("leo_p_select_model_block(p, tick, model_block, shared_selection_keys)", cuda)
+        self.assertNotIn("float* shared_values,\n    unsigned int* shared_neurons", cuda)
 
     def test_historical_gpu_docs_point_to_current_v1_contract(self):
         main = (ROOT / "crates/leo-cli/src/main.rs").read_text()
