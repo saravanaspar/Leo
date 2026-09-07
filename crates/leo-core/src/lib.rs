@@ -28,7 +28,7 @@ pub use backend::{
 pub use config::Config;
 pub use metrics::{StepMetrics, TrainingStatistics};
 pub use model::Model;
-pub use parallel::{apply_mean_deltas, MergeMetrics, SparseModelDelta};
+pub use parallel::{apply_mean_deltas, merged_parameter_changes, MergeMetrics, SparseModelDelta};
 pub use permission::Permission;
 pub use runtime::{ParameterChanges, Runtime};
 pub use semantics::SemanticsContract;

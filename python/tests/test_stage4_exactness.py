@@ -85,7 +85,7 @@ class Stage4ExactnessTests(unittest.TestCase):
             self.assertEqual(len(matches), 1)
             text = matches[0].read_text()
             self.assertIn("Historical design record", text)
-            self.assertIn("not** the Leo v1.0.0 runtime contract", text)
+            self.assertIn("not** the Leo v1.0.1 runtime contract", text)
             self.assertIn("PSCLS100", text)
 
         self.assertIn("cuda_shared_model_tiled_post_wavefront_learning", main)

@@ -61,17 +61,87 @@ python3 python/prepare_tinystories.py \
   --text-format paragraph \
   --output "$TMP/data" \
   --source-repository leo-gpu-ci \
-  --source-revision v1.0.0
+  --source-revision v1.0.1
 
 "$LEO" init --config configs/test.toml --output "$TMP/model.pscls"
 
-# Numerical-reference gate. This also forces real NVRTC compilation, module
-# load, device allocation, frozen execution, and training execution.
-"$LEO" backend --backend gpu --model "$TMP/model.pscls" --json
+# Isolate CUDA/PTX and execution-plan cache state so the gate proves both
+# cold-start persistence and fresh-process resume deterministically.
+export LEO_CACHE_DIR="$TMP/cache"
 
-# Workers > 1 deliberately exercises the shared-model story-batch path,
-# cooperative fused wavefront when supported, dual-stream H2D/compute overlap,
-# sparse apply graph, and the multidimensional online execution tuner.
+# Numerical-reference gate. Besides the single-step probe this now executes the
+# actual multi-story production fast path against the CPU reference with replay
+# disabled and with the locked v1 30% replay policy.
+BACKEND_LOG="$TMP/gpu-backend.log"
+"$LEO" backend --backend gpu --model "$TMP/model.pscls" --json 2>&1 | tee "$BACKEND_LOG"
+
+python3 - "$BACKEND_LOG" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+conformance = []
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    raw = raw.strip()
+    if not raw.startswith("{"):
+        continue
+    try:
+        event = json.loads(raw)
+    except json.JSONDecodeError:
+        continue
+    if event.get("event") == "cuda_story_batch_conformance":
+        conformance.append(event)
+
+by_fraction = {round(float(event["replay_fraction"]), 2): event for event in conformance}
+if set(by_fraction) != {0.0, 0.3}:
+    raise SystemExit(
+        f"expected CPU/GPU story-batch conformance at replay 0 and 0.30, got {sorted(by_fraction)}"
+    )
+for fraction, event in sorted(by_fraction.items()):
+    if event.get("ready") is not True:
+        raise SystemExit(f"story-batch conformance was not ready for replay={fraction}")
+    if int(event.get("workers", 0)) != 4:
+        raise SystemExit(f"story-batch conformance used unexpected worker count: {event}")
+    if float(event.get("max_parameter_delta", 1.0)) > 3.0e-3:
+        raise SystemExit(f"parameter parity exceeded tolerance for replay={fraction}: {event}")
+    if float(event.get("mean_loss_delta", 1.0)) > 3.0e-3:
+        raise SystemExit(f"loss parity exceeded tolerance for replay={fraction}: {event}")
+if int(by_fraction[0.0].get("replay_steps", -1)) != 0:
+    raise SystemExit("replay-disabled conformance unexpectedly executed replay steps")
+if int(by_fraction[0.3].get("replay_steps", 0)) <= 0:
+    raise SystemExit("30% replay conformance did not execute any replay steps")
+print("CPU/GPU logical-batch conformance OK at replay=0 and replay=0.30")
+PY
+
+# A deliberately short first process leaves the 16-lane tuner incomplete. A
+# second fresh process must restore that observation instead of repeating it.
+PARTIAL_ONE="$TMP/gpu-autotune-partial-1.log"
+PARTIAL_TWO="$TMP/gpu-autotune-partial-2.log"
+LEO_MULTI_GPU=0 "$LEO" benchmark \
+  --train \
+  --model "$TMP/model.pscls" \
+  --bytes "$TMP/data/tinystories.train.bytes" \
+  --index "$TMP/data/tinystories.train.idx" \
+  --stories 16 \
+  --workers 16 \
+  --backend gpu 2>&1 | tee "$PARTIAL_ONE"
+LEO_MULTI_GPU=0 "$LEO" benchmark \
+  --train \
+  --model "$TMP/model.pscls" \
+  --bytes "$TMP/data/tinystories.train.bytes" \
+  --index "$TMP/data/tinystories.train.idx" \
+  --stories 16 \
+  --workers 16 \
+  --backend gpu 2>&1 | tee "$PARTIAL_TWO"
+grep -q '"event":"cuda_autotune_resumed"' "$PARTIAL_TWO" || {
+  echo "fresh GPU process did not resume incomplete autotuning work" >&2
+  exit 1
+}
+
+# Enough equal-width batches remain to finish the bounded multidimensional
+# search after the two short resume probes. Workers > 1 exercises the exact
+# lane-private story trajectories, fused/direct wavefronts, transfer overlap,
+# and batch-end sparse canonical merge.
 BENCH_LOG="$TMP/gpu-benchmark.log"
 LEO_MULTI_GPU=0 "$LEO" benchmark \
   --train \
@@ -132,9 +202,10 @@ if not any(
     for profile in profiles
 ):
     raise SystemExit("GPU CI observed neither fused nor direct wavefront launches")
-if not any(int(profile["graph_launches"]) > 0 for profile in profiles):
-    raise SystemExit("GPU CI did not exercise CUDA Graph replay for sparse apply/reset")
 
+# Exact v1 batches no longer apply a canonical mean after every byte, so the
+# old sparse-apply/reset graph is not expected to launch in this path. Keep the
+# telemetry field for compatibility/diagnostics, but do not require activity.
 final = autotune[-1]
 for field in (
     "lane_chunk",
@@ -156,16 +227,7 @@ print(
 )
 PY
 
-if [[ -n "${LEO_CACHE_DIR:-}" ]]; then
-  CACHE_ROOT="$LEO_CACHE_DIR/cuda"
-elif [[ -n "${XDG_CACHE_HOME:-}" ]]; then
-  CACHE_ROOT="$XDG_CACHE_HOME/leo/cuda"
-elif [[ -n "${HOME:-}" ]]; then
-  CACHE_ROOT="$HOME/.cache/leo/cuda"
-else
-  echo "no CUDA cache root is available" >&2
-  exit 1
-fi
+CACHE_ROOT="$LEO_CACHE_DIR/cuda"
 [[ -d "$CACHE_ROOT" ]] || {
   echo "CUDA cache root was not created: $CACHE_ROOT" >&2
   exit 1
@@ -180,8 +242,49 @@ find "$CACHE_ROOT" -type f ! -path '*/profiles/*' -print -quit | grep -q . || {
   exit 1
 }
 
-# A short second process validates that the cached artifacts are readable by a
-# fresh Leo process rather than only by the process that created them.
+# Sample the internal phase profiler on the production launch geometry. The
+# profiled kernel may have lower cooperative occupancy than the normal kernel;
+# in that case Leo must run the normal kernel and report an explicit skip rather
+# than silently profiling a narrower grid.
+PHASE_LOG="$TMP/gpu-phase-profile.log"
+LEO_CUDA_PHASE_PROFILE=1 LEO_CUDA_PHASE_PROFILE_STRIDE=1 LEO_MULTI_GPU=0 "$LEO" benchmark \
+  --train \
+  --model "$TMP/model.pscls" \
+  --bytes "$TMP/data/tinystories.train.bytes" \
+  --index "$TMP/data/tinystories.train.idx" \
+  --stories 16 \
+  --workers 16 \
+  --backend gpu 2>&1 | tee "$PHASE_LOG"
+python3 - "$PHASE_LOG" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+phase_events = []
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    raw = raw.strip()
+    if not raw.startswith("{"):
+        continue
+    try:
+        event = json.loads(raw)
+    except json.JSONDecodeError:
+        continue
+    if event.get("event") in {"cuda_phase_profile", "cuda_phase_profile_skipped"}:
+        phase_events.append(event)
+if not phase_events:
+    raise SystemExit("phase-profiler GPU run emitted neither a profile nor an explicit skip")
+for event in phase_events:
+    if event.get("event") == "cuda_phase_profile":
+        normal = int(event.get("normal_capacity_blocks", 0))
+        profiled = int(event.get("profiled_capacity_blocks", 0))
+        sampled_grid = int(event.get("sampled_grid_blocks_max", 0))
+        if sampled_grid <= 0 or normal < sampled_grid or profiled < sampled_grid:
+            raise SystemExit(f"phase profile used non-comparable launch geometry: {event}")
+print("CUDA phase-profiler geometry gate OK")
+PY
+
+# A final short fresh process validates complete cache reuse rather than only
+# the in-memory state of the process that completed tuning.
 LEO_MULTI_GPU=0 "$LEO" benchmark \
   --train \
   --model "$TMP/model.pscls" \

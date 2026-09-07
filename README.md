@@ -1,4 +1,4 @@
-# Leo v1.0.0
+# Leo v1.0.1
 
 <p align="center">
   <strong>Open-source AI source code for a sparse recurrent byte-learning system with a CPU reference backend and a custom NVIDIA CUDA backend.</strong>
@@ -9,7 +9,7 @@
   <a href="https://github.com/saravanaspar/Leo/actions/workflows/gpu-ci.yml"><img alt="GPU CI" src="https://github.com/saravanaspar/Leo/actions/workflows/gpu-ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
   <img alt="Rust 1.85" src="https://img.shields.io/badge/Rust-1.85%2B-orange.svg">
-  <img alt="Version 1.0.0" src="https://img.shields.io/badge/version-1.0.0-informational.svg">
+  <img alt="Version 1.0.1" src="https://img.shields.io/badge/version-1.0.1-informational.svg">
 </p>
 
 <p align="center">
@@ -25,7 +25,7 @@
 > [!IMPORTANT]
 > **Current public development and quality testing is specifically centered on the [TinyStories dataset](https://huggingface.co/datasets/roneneldan/TinyStories).** Leo is research-oriented AI source code. Passing repository tests proves implementation invariants; it does not by itself prove model quality, generalization, or production readiness.
 
-Leo v1.0.0 is a clean durability baseline for fresh training and long-lived experiments. It keeps **FP32 learning semantics**, **30% bounded-surprise replay** in the standard configurations, strict artifact identity, checkpoint/resume safety, a CPU reference path, and execution-only CUDA optimization.
+Leo v1.0.1 is the current patch release of the clean v1 durability baseline for fresh training and long-lived experiments. It keeps **FP32 learning semantics**, **30% bounded-surprise replay** in the standard configurations, strict artifact identity, checkpoint/resume safety, a CPU reference path, and execution-only CUDA optimization.
 
 ## Project status
 
@@ -34,12 +34,12 @@ Leo v1.0.0 is a clean durability baseline for fresh training and long-lived expe
 | CPU reference backend | Supported |
 | Single-GPU CUDA training | Supported |
 | CUDA execution autotuning | Supported, execution-only |
-| CUDA Graph sparse apply/reset | Supported when driver APIs allow it |
+| CUDA Graph sparse apply/reset | Legacy capability retained; exact v1 story batching uses one batch-end sparse sync |
 | Async pinned H2D/D2H pipeline | Supported |
 | Cooperative fused wavefront | Preferred when hardware supports it |
 | Multi-GPU training | **Experimental** batch-end device mean |
-| FP16/BF16 training | Not part of v1.0.0 |
-| Dynamic topology growth | Not part of v1.0.0 |
+| FP16/BF16 training | Not part of v1.0.1 |
+| Dynamic topology growth | Not part of v1.0.1 |
 | Pre-v1 artifact compatibility | Intentionally not supported |
 
 ### Core v1 guarantees
@@ -49,7 +49,7 @@ Leo v1.0.0 is a clean durability baseline for fresh training and long-lived expe
 - **30% replay:** standard configurations keep bounded-surprise replay enabled at `0.30`.
 - **Strict artifacts:** datasets, checkpoints, and resume state are identity-bound and validated.
 - **One CUDA ABI source:** Rust/CUDA pointer/config layouts come from `crates/leo-core/cuda_abi.def`.
-- **Execution-only tuning:** CUDA tuning cannot change logical `--workers`, replay fraction, precision, update barriers, or learning equations.
+- **Execution-only tuning:** CUDA tuning cannot change logical `--workers`, replay fraction, precision, update barriers, or learning equations. Incomplete tuning observations are persisted and resumed by fresh Leo processes.
 
 <details>
 <summary><strong>What Leo provides</strong></summary>
@@ -109,7 +109,7 @@ bash ./scripts/check.sh
 ```
 
 > [!NOTE]
-> `Cargo.lock` should be committed for the v1.0.0 application baseline. Dependency changes should be explicit, reviewed, and validated rather than silently drifting between training environments.
+> `Cargo.lock` should be committed for the v1.0.1 application baseline. Dependency changes should be explicit, reviewed, and validated rather than silently drifting between training environments.
 
 ---
 
@@ -256,12 +256,14 @@ CUDA_VISIBLE_DEVICES=0 \
   --valid-index data/prepared/tinystories.valid.idx \
   --validation-stories 100 \
   --passes 1 \
-  --workers 64 \
+  --workers 16 \
   --backend gpu \
   --fresh-run
 ```
 
 Use `--fresh-run` only when intentionally starting a new training operation and discarding compatible prior resume state for that model.
+
+For the current P100/TinyStories reference runs, use **`--workers 16`**. Worker count is a semantic experiment parameter because it defines the logical batch and mean-reduction denominator; it is not an autotuning knob. Re-benchmark another logical worker count deliberately and record it with the experiment rather than treating it as a transparent speed setting.
 
 ### Scripted training
 
@@ -288,7 +290,7 @@ bash ./scripts/train.sh \
   configs/tinystories.toml \
   1 \
   100000 \
-  64 \
+  16 \
   "" \
   gpu \
   100
@@ -320,7 +322,7 @@ Limit by story count:
   --train-index data/prepared/tinystories.train.idx \
   --passes 1 \
   --max-stories 10000 \
-  --workers 64 \
+  --workers 16 \
   --backend gpu
 ```
 
@@ -333,7 +335,7 @@ Limit by raw input bytes:
   --train-index data/prepared/tinystories.train.idx \
   --passes 1 \
   --max-bytes 100000000 \
-  --workers 64 \
+  --workers 16 \
   --backend gpu
 ```
 
@@ -345,21 +347,21 @@ Limit by raw input bytes:
 
 The CUDA backend may optimize **execution only**. It keeps the v1 learning contract unchanged while using:
 
-- persistent device model buffers
-- exact touched/learning worklists
-- sparse delta application
-- adaptive physical lane chunks
-- cooperative-grid wavefront fusion with a compatibility fallback
-- hardware/model/driver-specific execution-plan tuning
-- SHA-256-keyed NVRTC PTX caching
-- pinned host staging
-- separate transfer and compute streams
-- event-ordered H2D/compute/D2H overlap
-- one-batch-ahead verified dataset prefetch
-- CUDA Graph replay for the stable sparse apply/reset sequence
-- sampled runtime telemetry
+- one canonical device model plus lane-private mutable learned tensors for each logical story trajectory;
+- exact touched/learning worklists and sparse batch-end worker snapshots;
+- one canonical CPU-equivalent mean merge after every complete logical story batch;
+- fast device-to-device refresh of the merged canonical learned image into active lanes;
+- adaptive **physical** lane chunks that never change logical `--workers`;
+- cooperative-grid wavefront fusion with a compatibility fallback;
+- hardware/model/driver-specific execution-plan tuning;
+- SHA-256-keyed NVRTC PTX caching;
+- pinned host staging with separate transfer and compute streams;
+- event-ordered H2D/compute/D2H overlap;
+- one-batch-ahead verified dataset prefetch;
+- replay-prefix frozen execution that uploads invariant pointer state once per prefix and distributes independent post/emit work across the cooperative grid;
+- sampled runtime telemetry and an opt-in fused-wavefront phase profiler.
 
-The logical `--workers` batch is never autotuned because it defines the canonical batch whose sparse deltas are mean-reduced.
+The logical `--workers` batch is never autotuned because it defines the canonical batch whose sparse deltas are mean-reduced. Execution-plan observations are persisted even before tuning completes, so a fresh process resumes the same hardware/model/logical-width search rather than discarding partial work. The exact story-batch tuner searches only active dimensions (physical lane chunk and fused cooperative grid width); legacy sparse-apply fields remain cache/telemetry metadata but are not burned as no-op candidates. The older sparse-apply/reset CUDA Graph machinery remains in the runtime for compatibility/diagnostics, but the exact v1 story-batch path does **not** perform a per-byte canonical sparse apply.
 
 Execution/PTX profiles are cache data, not model state. They live under one of:
 
@@ -370,6 +372,16 @@ ${XDG_CACHE_HOME}/leo/cuda
 ```
 
 Deleting that cache forces recompilation/retuning without deleting learned parameters.
+
+### Replay performance diagnostics
+
+The standard v1 policy remains `replay.fraction = 0.30`. Replay is not disabled or weakened for CUDA speed. The training benchmark now reports `base_training_targets`, `replay_fraction`, `replay_segments`, `replay_steps`, and `replay_step_fraction` so replay overhead can be measured directly alongside `steps_per_second`.
+
+The current CUDA replay-prefix fast path removes avoidable host/device setup work while preserving replay selection and arithmetic. Performance claims still require a real target-GPU benchmark; repository tests prove semantics, not P100 throughput.
+
+### Internal CUDA phase profiler
+
+Set `LEO_CUDA_PHASE_PROFILE=1` to sample fused-wavefront phase timing. `LEO_CUDA_PHASE_PROFILE_STRIDE=N` controls the sampling cadence (default: 64). Instrumentation can lower cooperative occupancy, so Leo records a phase sample only when the profiled kernel can launch the **same grid width** as the normal production kernel. Otherwise the production kernel runs unchanged and Leo emits `cuda_phase_profile_skipped` with reason `profiled_kernel_cannot_match_production_grid`. Successful `cuda_phase_profile` events include the normal/profiled capacities and `sampled_grid_blocks_max`; percentages are comparable only for those successfully sampled fused launches.
 
 ### GPU verification
 
@@ -463,7 +475,7 @@ Training benchmark:
   --bytes data/prepared/tinystories.train.bytes \
   --index data/prepared/tinystories.train.idx \
   --stories 1024 \
-  --workers 64 \
+  --workers 16 \
   --backend gpu
 ```
 

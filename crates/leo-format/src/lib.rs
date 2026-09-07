@@ -3,7 +3,7 @@
 //! The v1 wire format is intentionally strict: one schema, strong SHA-256
 //! integrity metadata, no duplicate/overlapping sections, and an explicit Leo
 //! semantics contract.  Pre-v1 checkpoint formats are not accepted by the main
-//! runtime; v1.0.0 is a clean training baseline.
+//! runtime; v1.0.1 preserves the clean v1 artifact baseline established by v1.0.0.
 
 use leo_core::artifact::{digest_bytes, digest_file, ArtifactDigest, DIGEST_BYTES};
 use leo_core::metrics::TrainingStatistics;
@@ -557,7 +557,7 @@ fn decode_model(bytes: &[u8]) -> LeoResult<Model> {
         decode_semantics_contract(required(&sections, SectionKind::SemanticsContract)?.payload)?;
     if contract != SemanticsContract::CURRENT {
         return Err(LeoError::checkpoint_incompatible(format!(
-            "checkpoint semantics {:?} do not match Leo v1.0.0 semantics {:?}",
+            "checkpoint semantics {:?} do not match Leo v1.0.1 semantics {:?}",
             contract,
             SemanticsContract::CURRENT
         )));
@@ -618,7 +618,7 @@ fn validate_header(header: &[u8]) -> LeoResult<()> {
     }
     if &header[0..8] != MAGIC {
         return Err(LeoError::checkpoint_incompatible(
-            "unsupported checkpoint magic; Leo v1.0.0 accepts only PSCLS100 artifacts",
+            "unsupported checkpoint magic; Leo v1.0.1 accepts only PSCLS100 artifacts",
         ));
     }
     let format_version = u32::from_le_bytes(header[8..12].try_into().unwrap());

@@ -15,8 +15,9 @@ pub(crate) use validation::{evaluate_model, print_learning_quality, print_predic
 
 use leo_core::symbols::{BEGIN_DOCUMENT, END_DOCUMENT};
 use leo_core::{
-    apply_mean_deltas, BackendKind, BackendRuntime, DeviceStoryBatchReport, LeoError, LeoResult,
-    MergeMetrics, Model, ParameterChanges, Permission, SparseModelDelta, StepMetrics,
+    apply_mean_deltas, merged_parameter_changes, BackendKind, BackendRuntime,
+    DeviceStoryBatchReport, LeoError, LeoResult, MergeMetrics, Model, ParameterChanges, Permission,
+    SparseModelDelta, StepMetrics,
 };
 use std::sync::Arc;
 use std::thread;
@@ -357,93 +358,6 @@ impl MultiGpuBatchTrainer {
             },
         })
     }
-}
-
-// Determine exactly which canonical rows/slots must be copied back to
-// every persistent GPU replica.
-fn merged_parameter_changes(
-    canonical: &mut Model,
-    deltas: &[SparseModelDelta],
-    raw_changes: &[ParameterChanges],
-) -> LeoResult<ParameterChanges> {
-    let mut changes = ParameterChanges::default();
-    let neuron_count = canonical.neuron_count();
-
-    for delta in deltas {
-        changes
-            .threshold
-            .extend(delta.threshold.iter().map(|update| update.index));
-
-        changes
-            .recurrent_weight
-            .extend(delta.recurrent_weight.iter().map(|update| update.index));
-
-        changes
-            .input_weight
-            .extend(delta.input_weight.iter().map(|update| update.index));
-
-        // Model output layout is [output][neuron].
-        changes.output_neurons.extend(
-            delta
-                .output_weight
-                .iter()
-                .map(|update| update.index % neuron_count),
-        );
-
-        changes.output_bias_dirty |= !delta.output_bias.is_empty();
-
-        changes.context_output_dirty |= !delta.context_output_weight.is_empty();
-
-        // Context keys can land in a different slot after the canonical merge.
-        // Include their final canonical locations.
-        for update in &delta.context {
-            if let (Some(slot), _) =
-                canonical.resolve_context_slot(update.order, update.key, false)?
-            {
-                changes.context_slots.push(slot);
-            }
-        }
-    }
-
-    // Also include the original device-local slots.
-    //
-    // This matters when collision resolution causes a context key to move to
-    // another slot in the merged canonical table.
-    for raw in raw_changes {
-        changes.threshold.extend(raw.threshold.iter().copied());
-
-        changes
-            .recurrent_weight
-            .extend(raw.recurrent_weight.iter().copied());
-
-        changes
-            .input_weight
-            .extend(raw.input_weight.iter().copied());
-
-        changes
-            .output_neurons
-            .extend(raw.output_neurons.iter().copied());
-
-        changes
-            .context_slots
-            .extend(raw.context_slots.iter().copied());
-
-        changes.output_bias_dirty |= raw.output_bias_dirty;
-        changes.context_output_dirty |= raw.context_output_dirty;
-    }
-
-    fn dedup(values: &mut Vec<usize>) {
-        values.sort_unstable();
-        values.dedup();
-    }
-
-    dedup(&mut changes.threshold);
-    dedup(&mut changes.recurrent_weight);
-    dedup(&mut changes.input_weight);
-    dedup(&mut changes.output_neurons);
-    dedup(&mut changes.context_slots);
-
-    Ok(changes)
 }
 
 fn apply_batch_replay_policy(

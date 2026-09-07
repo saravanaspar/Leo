@@ -1,5 +1,6 @@
 from functools import cmp_to_key
 import random
+import unittest
 
 
 def better(left, right, rotation, neuron_count):
@@ -63,35 +64,40 @@ def heap_merge(runs, rotation, neuron_count):
     return result
 
 
-def test_heap_merge_matches_total_leo_order():
-    rng = random.Random(20260807)
-    neuron_count = 32768
-    keep = 8
-    for _ in range(500):
-        rotation = rng.randrange(neuron_count)
-        block_count = rng.randint(1, 128)
-        ids = iter(rng.sample(range(neuron_count), block_count * keep))
+class Stage5MergeReferenceTests(unittest.TestCase):
+    def test_heap_merge_matches_total_leo_order(self):
+        rng = random.Random(20260807)
+        neuron_count = 32768
+        keep = 8
+        for _ in range(500):
+            rotation = rng.randrange(neuron_count)
+            block_count = rng.randint(1, 128)
+            ids = iter(rng.sample(range(neuron_count), block_count * keep))
 
-        def cmp(left, right):
-            if better(left, right, rotation, neuron_count):
-                return -1
-            if better(right, left, rotation, neuron_count):
-                return 1
-            return 0
+            def cmp(left, right):
+                if better(left, right, rotation, neuron_count):
+                    return -1
+                if better(right, left, rotation, neuron_count):
+                    return 1
+                return 0
 
-        runs = []
-        for _block in range(block_count):
-            positive = rng.randrange(keep + 1)
-            row = [
-                (rng.choice((0.1, 0.2, 0.3, rng.random())), next(ids))
-                for _ in range(positive)
-            ]
-            for _ in range(keep - positive):
-                next(ids)
-            row.sort(key=cmp_to_key(cmp))
-            row.extend([(-1.0, 0)] * (keep - positive))
-            runs.append(row)
+            runs = []
+            for _block in range(block_count):
+                positive = rng.randrange(keep + 1)
+                row = [
+                    (rng.choice((0.1, 0.2, 0.3, rng.random())), next(ids))
+                    for _ in range(positive)
+                ]
+                for _ in range(keep - positive):
+                    next(ids)
+                row.sort(key=cmp_to_key(cmp))
+                row.extend([(-1.0, 0)] * (keep - positive))
+                runs.append(row)
 
-        expected = [item for row in runs for item in row if item[0] > 0]
-        expected.sort(key=cmp_to_key(cmp))
-        assert heap_merge(runs, rotation, neuron_count) == expected
+            expected = [item for row in runs for item in row if item[0] > 0]
+            expected.sort(key=cmp_to_key(cmp))
+            self.assertEqual(heap_merge(runs, rotation, neuron_count), expected)
+
+
+if __name__ == "__main__":
+    unittest.main()

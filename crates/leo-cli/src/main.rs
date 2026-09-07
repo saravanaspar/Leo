@@ -315,6 +315,137 @@ fn command_inspect(arguments: &Arguments) -> LeoResult<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct BatchConformanceResult {
+    replay_fraction: f32,
+    max_parameter_delta: f32,
+    mean_loss_delta: f64,
+    replay_segments: usize,
+    replay_steps: u64,
+}
+
+fn max_f32_slice_delta(left: &[f32], right: &[f32]) -> LeoResult<f32> {
+    if left.len() != right.len() {
+        return Err(LeoError::internal(
+            "CPU/GPU conformance compared differently sized parameter arrays",
+        ));
+    }
+    Ok(left
+        .iter()
+        .zip(right)
+        .fold(0.0f32, |maximum, (left, right)| {
+            maximum.max((left - right).abs())
+        }))
+}
+
+fn run_story_batch_conformance(
+    base: &Model,
+    replay_fraction: f32,
+) -> LeoResult<BatchConformanceResult> {
+    let mut conformance_model = base.clone();
+    conformance_model.config.replay.fraction = replay_fraction;
+    let stories = vec![
+        b"red kite over a blue pond".to_vec(),
+        b"small cat by a warm window".to_vec(),
+        b"green boat on quiet water".to_vec(),
+        b"little bird under the moon".to_vec(),
+    ];
+
+    let mut cpu = BackendRuntime::new(conformance_model.clone(), BackendKind::Cpu)?;
+    let mut gpu = BackendRuntime::new(conformance_model, BackendKind::Gpu)?;
+    let cpu_report = train_story_batch(&mut cpu, stories.clone(), Permission::Training)?;
+    let gpu_report = train_story_batch(&mut gpu, stories, Permission::Training)?;
+    cpu.synchronize_model()?;
+    gpu.synchronize_model()?;
+
+    if cpu_report.replay_segments != gpu_report.replay_segments
+        || cpu_report.replay_steps != gpu_report.replay_steps
+    {
+        return Err(LeoError::internal(format!(
+            "CUDA logical-batch replay parity failed at fraction {replay_fraction}: CPU segments/steps={}/{}, GPU={}/{}",
+            cpu_report.replay_segments,
+            cpu_report.replay_steps,
+            gpu_report.replay_segments,
+            gpu_report.replay_steps,
+        )));
+    }
+
+    let cpu_model = cpu.model();
+    let gpu_model = gpu.model();
+    if cpu_model.parameter_revision != gpu_model.parameter_revision {
+        return Err(LeoError::internal(format!(
+            "CUDA logical-batch revision parity failed at replay fraction {replay_fraction}: CPU={}, GPU={}",
+            cpu_model.parameter_revision, gpu_model.parameter_revision,
+        )));
+    }
+    if cpu_model.context.keys != gpu_model.context.keys
+        || cpu_model.context.observations != gpu_model.context.observations
+    {
+        return Err(LeoError::internal(format!(
+            "CUDA logical-batch context identity parity failed at replay fraction {replay_fraction}"
+        )));
+    }
+
+    let cpu_stats = &cpu_model.statistics;
+    let gpu_stats = &gpu_model.statistics;
+    if cpu_stats.processed_bytes != gpu_stats.processed_bytes
+        || cpu_stats.processed_stories != gpu_stats.processed_stories
+        || cpu_stats.training_targets != gpu_stats.training_targets
+        || cpu_stats.active_neurons_sum != gpu_stats.active_neurons_sum
+        || cpu_stats.active_neurons_peak != gpu_stats.active_neurons_peak
+        || cpu_stats.synaptic_events != gpu_stats.synaptic_events
+        || cpu_stats.numerical_rejections != gpu_stats.numerical_rejections
+        || cpu_stats.persistent_ticks != gpu_stats.persistent_ticks
+    {
+        return Err(LeoError::internal(format!(
+            "CUDA logical-batch statistics parity failed at replay fraction {replay_fraction}"
+        )));
+    }
+
+    let mut max_parameter_delta = 0.0f32;
+    for delta in [
+        max_f32_slice_delta(&cpu_model.neurons.threshold, &gpu_model.neurons.threshold)?,
+        max_f32_slice_delta(
+            &cpu_model.neurons.excitability,
+            &gpu_model.neurons.excitability,
+        )?,
+        max_f32_slice_delta(&cpu_model.recurrent.weight, &gpu_model.recurrent.weight)?,
+        max_f32_slice_delta(&cpu_model.input.weights, &gpu_model.input.weights)?,
+        max_f32_slice_delta(&cpu_model.output.weights, &gpu_model.output.weights)?,
+        max_f32_slice_delta(&cpu_model.output.bias, &gpu_model.output.bias)?,
+        max_f32_slice_delta(&cpu_model.context.embeddings, &gpu_model.context.embeddings)?,
+        max_f32_slice_delta(
+            &cpu_model.context.output_weights,
+            &gpu_model.context.output_weights,
+        )?,
+    ] {
+        max_parameter_delta = max_parameter_delta.max(delta);
+    }
+    let mean_loss_delta = (cpu_report.mean_loss - gpu_report.mean_loss).abs();
+    let training_loss_sum_delta = (cpu_stats.training_loss_sum - gpu_stats.training_loss_sum).abs();
+    const PARAMETER_TOLERANCE: f32 = 3.0e-3;
+    const LOSS_TOLERANCE: f64 = 3.0e-3;
+    if !max_parameter_delta.is_finite()
+        || max_parameter_delta > PARAMETER_TOLERANCE
+        || !mean_loss_delta.is_finite()
+        || mean_loss_delta > LOSS_TOLERANCE
+        || !training_loss_sum_delta.is_finite()
+        || training_loss_sum_delta > LOSS_TOLERANCE * cpu_stats.training_targets.max(1) as f64
+    {
+        return Err(LeoError::internal(format!(
+            "CUDA logical-batch numerical parity failed at replay fraction {replay_fraction}: max parameter delta={max_parameter_delta}, mean loss delta={mean_loss_delta}, training loss sum delta={training_loss_sum_delta}"
+        )));
+    }
+
+    Ok(BatchConformanceResult {
+        replay_fraction,
+        max_parameter_delta,
+        mean_loss_delta,
+        replay_segments: gpu_report.replay_segments,
+        replay_steps: gpu_report.replay_steps,
+    })
+}
+
 fn command_backend(arguments: &Arguments) -> LeoResult<()> {
     let requested = backend_from_arguments(arguments)?;
     let gpu_devices = available_gpu_devices().unwrap_or(0);
@@ -433,7 +564,26 @@ fn command_backend(arguments: &Arguments) -> LeoResult<()> {
                 )));
             }
 
+            // The old probe stopped at one-step CPU/GPU parity and therefore
+            // never exercised the production multi-story fast path. Run the
+            // same logical batch through CPU reference and CUDA twice: once
+            // without replay to isolate the batch-end mean barrier, then with
+            // the locked v1 30% replay policy to cover replay selection/prefix
+            // reconstruction and the resulting canonical model.
+            let batch_without_replay = run_story_batch_conformance(&model, 0.0)?;
+            let batch_with_replay = run_story_batch_conformance(&model, 0.30)?;
+
             if arguments.flag("json") {
+                for result in [&batch_without_replay, &batch_with_replay] {
+                    println!(
+                        "{{\"event\":\"cuda_story_batch_conformance\",\"replay_fraction\":{},\"workers\":4,\"max_parameter_delta\":{},\"mean_loss_delta\":{},\"replay_segments\":{},\"replay_steps\":{},\"ready\":true}}",
+                        result.replay_fraction,
+                        result.max_parameter_delta,
+                        result.mean_loss_delta,
+                        result.replay_segments,
+                        result.replay_steps,
+                    );
+                }
                 println!(
                     "{{\"event\":\"cuda_kernel_probe\",\"resolved\":\"{}\",\"ready\":true,\"frozen_probe_steps\":{},\"frozen_max_probability_delta\":{},\"training_probe_steps\":{},\"training_max_probability_delta\":{}}}",
                     gpu_runtime.resolved_backend(),
@@ -530,6 +680,8 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
         let mut activity = ActivityDiagnostics::default();
         let mut weighted_loss = 0.0f64;
         let mut targets = 0u64;
+        let mut replay_segments = 0usize;
+        let mut replay_steps = 0u64;
         let story_order: Vec<usize> = (0..story_limit).collect();
         let prefetcher = StoryBatchPrefetcher::spawn(&dataset, story_order, "training benchmark")?;
         if position < story_limit {
@@ -551,6 +703,8 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
             let report = train_story_batch(&mut runtime, stories, Permission::Training)?;
             weighted_loss += report.mean_loss * report.targets as f64;
             targets = targets.saturating_add(report.targets as u64);
+            replay_segments = replay_segments.saturating_add(report.replay_segments);
+            replay_steps = replay_steps.saturating_add(report.replay_steps);
             activity.add(report.activity);
             position = next_position;
             if max_input_bytes.is_some_and(|limit| input_bytes >= limit) {
@@ -566,7 +720,7 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
         let projected_input_bytes = 2_000_000_000f64;
         let projected_seconds = elapsed / input_bytes.max(1) as f64 * projected_input_bytes;
         println!(
-            "{{\"event\":\"training_benchmark\",\"model\":\"{}\",\"neurons\":{},\"fixed_synapses\":{},\"context_slots\":{},\"context_embedding_dim\":{},\"workers\":{},\"stories\":{},\"input_bytes\":{},\"training_steps\":{},\"seconds\":{},\"input_bytes_per_second\":{},\"steps_per_second\":{},\"mean_loss\":{},\"bits_per_byte\":{},\"active_fraction\":{},\"recurrent_events_per_step\":{},\"context_cells_per_step\":{},\"context_probes_per_step\":{},\"output_madds_per_step\":{},\"projected_seconds_1gb_2_epochs\":{},\"projected_days_1gb_2_epochs\":{}}}",
+            "{{\"event\":\"training_benchmark\",\"model\":\"{}\",\"neurons\":{},\"fixed_synapses\":{},\"context_slots\":{},\"context_embedding_dim\":{},\"workers\":{},\"stories\":{},\"input_bytes\":{},\"training_steps\":{},\"base_training_targets\":{},\"replay_fraction\":{},\"replay_segments\":{},\"replay_steps\":{},\"replay_step_fraction\":{},\"seconds\":{},\"input_bytes_per_second\":{},\"steps_per_second\":{},\"mean_loss\":{},\"bits_per_byte\":{},\"active_fraction\":{},\"recurrent_events_per_step\":{},\"context_cells_per_step\":{},\"context_probes_per_step\":{},\"output_madds_per_step\":{},\"projected_seconds_1gb_2_epochs\":{},\"projected_days_1gb_2_epochs\":{}}}",
             json_escape(&runtime.model().config.model.name),
             runtime.model().neuron_count(),
             runtime.model().recurrent.weight.len(),
@@ -576,6 +730,11 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
             position,
             input_bytes,
             activity.steps,
+            targets,
+            runtime.model().config.replay.fraction,
+            replay_segments,
+            replay_steps,
+            replay_steps as f64 / activity.steps.max(1) as f64,
             elapsed,
             input_bytes as f64 / elapsed.max(1.0e-9),
             activity.steps as f64 / elapsed.max(1.0e-9),

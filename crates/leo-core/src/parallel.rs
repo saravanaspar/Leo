@@ -54,6 +54,23 @@ pub struct SparseModelDelta {
     pub statistics: StatisticsDelta,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TrackedModelValues {
+    pub threshold: Vec<f32>,
+    pub recurrent_weight: Vec<f32>,
+    pub input_weight: Vec<f32>,
+    /// CUDA-native row layout: one contiguous OUTPUT_CLASSES row per changed neuron.
+    pub output_weight_by_neuron: Vec<f32>,
+    pub output_bias: Option<Vec<f32>>,
+    pub context_keys: Vec<u64>,
+    pub context_observations: Vec<u32>,
+    /// One contiguous embedding row per changed context slot.
+    pub context_embeddings: Vec<f32>,
+    pub context_output_weight: Option<Vec<f32>>,
+    pub revision_increment: u64,
+    pub statistics: StatisticsDelta,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MergeMetrics {
     pub workers: usize,
@@ -205,6 +222,226 @@ impl SparseModelDelta {
         Ok(delta)
     }
 
+    /// Build the same sparse worker delta as `between_tracked`, but from a
+    /// device-side sparse snapshot instead of materializing a complete worker
+    /// `Model` on the host. This is used by the exact CUDA logical-batch path:
+    /// each story owns its learned parameter image on-device and only touched
+    /// rows cross PCIe at the batch-end canonical mean barrier.
+    pub fn from_tracked_values(
+        base: &Model,
+        changes: &ParameterChanges,
+        values: TrackedModelValues,
+    ) -> LeoResult<Self> {
+        let TrackedModelValues {
+            threshold,
+            recurrent_weight,
+            input_weight,
+            output_weight_by_neuron,
+            output_bias,
+            context_keys,
+            context_observations,
+            context_embeddings,
+            context_output_weight,
+            revision_increment,
+            statistics,
+        } = values;
+
+        fn selected_deltas(
+            base: &[f32],
+            indices: &[usize],
+            values: &[f32],
+            label: &str,
+        ) -> LeoResult<Vec<SparseF32Delta>> {
+            if indices.len() != values.len() {
+                return Err(LeoError::internal(format!(
+                    "tracked {label} value count does not match index count"
+                )));
+            }
+            let mut result = Vec::with_capacity(indices.len());
+            for (&index, &after) in indices.iter().zip(values) {
+                let before = *base.get(index).ok_or_else(|| {
+                    LeoError::internal(format!("tracked {label} index is outside the model"))
+                })?;
+                if !after.is_finite() {
+                    return Err(LeoError::internal(format!(
+                        "tracked {label} value is non-finite"
+                    )));
+                }
+                let delta = after - before;
+                if delta != 0.0 {
+                    result.push(SparseF32Delta { index, delta });
+                }
+            }
+            Ok(result)
+        }
+
+        let neuron_count = base.neuron_count();
+        let expected_output_values = changes
+            .output_neurons
+            .len()
+            .saturating_mul(crate::symbols::OUTPUT_CLASSES);
+        if output_weight_by_neuron.len() != expected_output_values {
+            return Err(LeoError::internal(
+                "tracked output value count does not match changed neuron count",
+            ));
+        }
+        let mut output_weight = Vec::with_capacity(expected_output_values);
+        for (row, &neuron) in changes.output_neurons.iter().enumerate() {
+            if neuron >= neuron_count {
+                return Err(LeoError::internal(
+                    "tracked output neuron is outside the model",
+                ));
+            }
+            for output in 0..crate::symbols::OUTPUT_CLASSES {
+                let host_index = output * neuron_count + neuron;
+                let after = output_weight_by_neuron[row * crate::symbols::OUTPUT_CLASSES + output];
+                if !after.is_finite() {
+                    return Err(LeoError::internal(
+                        "tracked output weight value is non-finite",
+                    ));
+                }
+                let delta = after - base.output.weights[host_index];
+                if delta != 0.0 {
+                    output_weight.push(SparseF32Delta {
+                        index: host_index,
+                        delta,
+                    });
+                }
+            }
+        }
+
+        let output_bias = match output_bias {
+            Some(after) if changes.output_bias_dirty => {
+                if after.len() != base.output.bias.len()
+                    || after.iter().any(|value| !value.is_finite())
+                {
+                    return Err(LeoError::internal(
+                        "tracked output bias snapshot is invalid",
+                    ));
+                }
+                diff_f32(&base.output.bias, &after)
+            }
+            Some(_) => {
+                return Err(LeoError::internal(
+                    "tracked output bias supplied without dirty flag",
+                ));
+            }
+            None if changes.output_bias_dirty => {
+                return Err(LeoError::internal(
+                    "tracked output bias dirty flag is missing its snapshot",
+                ));
+            }
+            None => Vec::new(),
+        };
+
+        let context_output_weight = match context_output_weight {
+            Some(after) if changes.context_output_dirty => {
+                if after.len() != base.context.output_weights.len()
+                    || after.iter().any(|value| !value.is_finite())
+                {
+                    return Err(LeoError::internal(
+                        "tracked context output snapshot is invalid",
+                    ));
+                }
+                diff_f32(&base.context.output_weights, &after)
+            }
+            Some(_) => {
+                return Err(LeoError::internal(
+                    "tracked context output supplied without dirty flag",
+                ));
+            }
+            None if changes.context_output_dirty => {
+                return Err(LeoError::internal(
+                    "tracked context output dirty flag is missing its snapshot",
+                ));
+            }
+            None => Vec::new(),
+        };
+
+        let dim = base.config.context.embedding_dim;
+        if context_keys.len() != changes.context_slots.len()
+            || context_observations.len() != changes.context_slots.len()
+            || context_embeddings.len() != changes.context_slots.len().saturating_mul(dim)
+        {
+            return Err(LeoError::internal(
+                "tracked context snapshot dimensions do not match changed slots",
+            ));
+        }
+        let slots_per_order = base.config.context.slots_per_order;
+        let mut context = Vec::with_capacity(changes.context_slots.len());
+        for (row, &slot) in changes.context_slots.iter().enumerate() {
+            if slot >= base.context.keys.len() {
+                return Err(LeoError::internal(
+                    "tracked context slot is outside the model",
+                ));
+            }
+            let key = context_keys[row];
+            if key == 0 {
+                continue;
+            }
+            let order = slot / slots_per_order + 1;
+            let base_slot = find_context_slot(base, order, key);
+            let base_observations = base_slot.map_or(0, |value| base.context.observations[value]);
+            let mut embedding_delta = Vec::with_capacity(dim);
+            let mut changed = false;
+            for dimension in 0..dim {
+                let before = base_slot.map_or(0.0, |value| {
+                    base.context.embeddings[value * dim + dimension]
+                });
+                let after = context_embeddings[row * dim + dimension];
+                if !after.is_finite() {
+                    return Err(LeoError::internal(
+                        "tracked context embedding value is non-finite",
+                    ));
+                }
+                let delta = after - before;
+                changed |= delta != 0.0;
+                embedding_delta.push(delta);
+            }
+            let observation_increment = context_observations[row].saturating_sub(base_observations);
+            if changed || observation_increment > 0 {
+                context.push(ContextKeyDelta {
+                    order,
+                    key,
+                    embedding_delta,
+                    observation_increment,
+                });
+            }
+        }
+
+        let mut delta = Self {
+            config_fingerprint: config_fingerprint(base),
+            base_revision: base.parameter_revision,
+            revision_increment,
+            threshold: selected_deltas(
+                &base.neurons.threshold,
+                &changes.threshold,
+                &threshold,
+                "threshold",
+            )?,
+            excitability: Vec::new(),
+            recurrent_weight: selected_deltas(
+                &base.recurrent.weight,
+                &changes.recurrent_weight,
+                &recurrent_weight,
+                "recurrent weight",
+            )?,
+            input_weight: selected_deltas(
+                &base.input.weights,
+                &changes.input_weight,
+                &input_weight,
+                "input weight",
+            )?,
+            output_weight,
+            output_bias,
+            context_output_weight,
+            context,
+            statistics,
+        };
+        delta.canonicalize_order();
+        Ok(delta)
+    }
+
     fn canonicalize_order(&mut self) {
         self.threshold.sort_unstable_by_key(|update| update.index);
         self.excitability
@@ -302,6 +539,75 @@ pub fn apply_mean_deltas(
         fixed_parameter_updates,
         context_keys,
     })
+}
+
+/// Return the exact canonical rows/slots that must be synchronized after a
+/// sparse worker mean merge. Context keys can move to a different collision
+/// slot during keyed merging, so both the worker-local source slots and the
+/// final canonical destinations are included.
+pub fn merged_parameter_changes(
+    canonical: &mut Model,
+    deltas: &[SparseModelDelta],
+    raw_changes: &[ParameterChanges],
+) -> LeoResult<ParameterChanges> {
+    let mut changes = ParameterChanges::default();
+    let neuron_count = canonical.neuron_count();
+
+    for delta in deltas {
+        changes
+            .threshold
+            .extend(delta.threshold.iter().map(|update| update.index));
+        changes
+            .recurrent_weight
+            .extend(delta.recurrent_weight.iter().map(|update| update.index));
+        changes
+            .input_weight
+            .extend(delta.input_weight.iter().map(|update| update.index));
+        changes.output_neurons.extend(
+            delta
+                .output_weight
+                .iter()
+                .map(|update| update.index % neuron_count),
+        );
+        changes.output_bias_dirty |= !delta.output_bias.is_empty();
+        changes.context_output_dirty |= !delta.context_output_weight.is_empty();
+        for update in &delta.context {
+            if let (Some(slot), _) =
+                canonical.resolve_context_slot(update.order, update.key, false)?
+            {
+                changes.context_slots.push(slot);
+            }
+        }
+    }
+
+    for raw in raw_changes {
+        changes.threshold.extend(raw.threshold.iter().copied());
+        changes
+            .recurrent_weight
+            .extend(raw.recurrent_weight.iter().copied());
+        changes
+            .input_weight
+            .extend(raw.input_weight.iter().copied());
+        changes
+            .output_neurons
+            .extend(raw.output_neurons.iter().copied());
+        changes
+            .context_slots
+            .extend(raw.context_slots.iter().copied());
+        changes.output_bias_dirty |= raw.output_bias_dirty;
+        changes.context_output_dirty |= raw.context_output_dirty;
+    }
+
+    fn dedup(values: &mut Vec<usize>) {
+        values.sort_unstable();
+        values.dedup();
+    }
+    dedup(&mut changes.threshold);
+    dedup(&mut changes.recurrent_weight);
+    dedup(&mut changes.input_weight);
+    dedup(&mut changes.output_neurons);
+    dedup(&mut changes.context_slots);
+    Ok(changes)
 }
 
 fn ensure_aligned_models(base: &Model, trained: &Model) -> LeoResult<()> {
@@ -583,7 +889,7 @@ fn config_fingerprint(model: &Model) -> ArtifactDigest {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_mean_deltas, SparseModelDelta};
+    use super::{apply_mean_deltas, statistics_delta, SparseModelDelta, TrackedModelValues};
     use crate::symbols::{BEGIN_DOCUMENT, END_DOCUMENT};
     use crate::{Config, Model, Permission, Runtime};
 
@@ -631,6 +937,82 @@ mod tests {
             SparseModelDelta::between_tracked(&base, runtime.model(), &runtime.parameter_changes())
                 .unwrap();
         assert_eq!(tracked, full);
+    }
+
+    #[test]
+    fn device_sparse_snapshot_matches_tracked_worker_delta() {
+        let base = model();
+        let mut runtime = Runtime::new(base.clone()).unwrap();
+        runtime.enable_parameter_tracking();
+        runtime.begin_document();
+        for (symbol, target) in [
+            (BEGIN_DOCUMENT, Some(b'A' as u32)),
+            (b'A' as u32, Some(b'B' as u32)),
+            (b'B' as u32, Some(END_DOCUMENT)),
+        ] {
+            runtime.step(symbol, target, Permission::Training).unwrap();
+        }
+        runtime.finish_document();
+
+        let trained = runtime.model();
+        let changes = runtime.parameter_changes();
+        let neuron_count = base.neuron_count();
+        let output_classes = crate::symbols::OUTPUT_CLASSES;
+        let mut output_weight_by_neuron =
+            Vec::with_capacity(changes.output_neurons.len().saturating_mul(output_classes));
+        for &neuron in &changes.output_neurons {
+            for output in 0..output_classes {
+                output_weight_by_neuron
+                    .push(trained.output.weights[output * neuron_count + neuron]);
+            }
+        }
+        let dim = base.config.context.embedding_dim;
+        let mut context_keys = Vec::with_capacity(changes.context_slots.len());
+        let mut context_observations = Vec::with_capacity(changes.context_slots.len());
+        let mut context_embeddings =
+            Vec::with_capacity(changes.context_slots.len().saturating_mul(dim));
+        for &slot in &changes.context_slots {
+            context_keys.push(trained.context.keys[slot]);
+            context_observations.push(trained.context.observations[slot]);
+            let start = slot * dim;
+            context_embeddings.extend_from_slice(&trained.context.embeddings[start..start + dim]);
+        }
+
+        let values = TrackedModelValues {
+            threshold: changes
+                .threshold
+                .iter()
+                .map(|&index| trained.neurons.threshold[index])
+                .collect(),
+            recurrent_weight: changes
+                .recurrent_weight
+                .iter()
+                .map(|&index| trained.recurrent.weight[index])
+                .collect(),
+            input_weight: changes
+                .input_weight
+                .iter()
+                .map(|&index| trained.input.weights[index])
+                .collect(),
+            output_weight_by_neuron,
+            output_bias: changes
+                .output_bias_dirty
+                .then(|| trained.output.bias.clone()),
+            context_keys,
+            context_observations,
+            context_embeddings,
+            context_output_weight: changes
+                .context_output_dirty
+                .then(|| trained.context.output_weights.clone()),
+            revision_increment: trained
+                .parameter_revision
+                .saturating_sub(base.parameter_revision),
+            statistics: statistics_delta(&base.statistics, &trained.statistics),
+        };
+
+        let expected = SparseModelDelta::between_tracked(&base, trained, &changes).unwrap();
+        let observed = SparseModelDelta::from_tracked_values(&base, &changes, values).unwrap();
+        assert_eq!(observed, expected);
     }
 
     #[test]

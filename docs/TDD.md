@@ -1,4 +1,4 @@
-# Leo v1.0.0 technical design
+# Leo v1.0.1 technical design
 
 ## 1. Architectural boundary
 
@@ -45,13 +45,15 @@ canonical model theta_t
 canonical model theta_t+1
 ```
 
-GPU-native story batching produces equivalent policy inputs (per-story supervised losses) and canonical replay is applied afterward, so GPU execution does not omit replay.
+GPU-native story batching follows the same worker semantics. Every logical CUDA lane starts from `theta_t`, owns its recurrent state **and mutable learned tensors** for the complete story, and exposes only a sparse touched-value snapshot at the end. Those snapshots are converted into the same `SparseModelDelta` representation as CPU workers, mean-reduced once, and then the canonical replay policy is applied. There is no per-byte canonical parameter apply inside the logical batch.
 
 ## 4. CUDA execution
 
 CUDA keeps persistent model buffers on device and transfers/synchronizes at explicit model boundaries. v1 makes cooperative persistent execution the preferred path when the device supports it. The required non-cooperative path remains a hardware compatibility fallback.
 
-The shared-wavefront story batch is the normal GPU batch path. It keeps lanes in the same high-level execution phase, reducing avoidable control divergence and host launch traffic. Persistent state is represented as contiguous typed device buffers (structure-of-arrays style) separate from the checkpoint representation.
+The shared-wavefront story batch is the normal GPU batch path. It keeps lanes in the same high-level execution phase, reducing avoidable control divergence and host launch traffic. Static topology/configuration and the canonical device model are shared. Each logical lane owns transient recurrent state plus the mutable learned tensors and change lists needed to preserve its private full-story trajectory. Persistent state is represented as contiguous typed device buffers (structure-of-arrays style) separate from the checkpoint representation.
+
+At the end of the supervised logical batch, CUDA gathers only touched lane values, constructs CPU-compatible sparse worker deltas, performs one canonical host mean/context merge, sparsely uploads the merged canonical rows, and refreshes active lane learned tensors by device-to-device copies. An odd 4096-step chunk refreshes the lane pointer table after eligibility-buffer swaps so long stories keep the same buffer identity as single-story execution.
 
 The v1 executor may optimize execution aggressively while preserving FP32 learning semantics:
 
@@ -61,14 +63,15 @@ The v1 executor may optimize execution aggressively while preserving FP32 learni
 - device-oriented contiguous model/scratch layouts;
 - shared phase/wavefront execution to reduce avoidable branch divergence;
 - exact per-tick touched-neuron and learning-destination worklists, with epoch arrays retained as the authoritative membership state;
-- sparse changed-parameter application using the existing delta lists rather than dense parameter scans;
-- physical CUDA lane chunking that leaves the logical story batch and single mean-update barrier unchanged;
-- online execution tuning across physical lane width, sparse-apply block/thread geometry, and cooperative fused-grid width; profiles are keyed by GPU UUID/PCI-bus/name/ordinal/VRAM, driver version, compute capability, SM/thread capacity, model/source/semantic identity, and **logical batch width**, so profiles cannot be casually reused across different hardware or partial/full logical batches;
+- sparse touched-value gathering and batch-end canonical synchronization rather than full worker-model DtoH/HtoD copies;
+- physical CUDA lane chunking that leaves the logical story batch and **one story-end mean-update barrier** unchanged;
+- online execution tuning across physical lane width and cooperative fused-grid width; legacy sparse-apply geometry remains recorded but is not searched by the exact story-batch path; profiles are keyed by GPU UUID/PCI-bus/name/ordinal/VRAM, driver version, compute capability, SM/thread capacity, model/source/semantic identity, and **logical batch width**, so profiles cannot be casually reused across different hardware or partial/full logical batches; incomplete candidate scores are persisted atomically and resumed by fresh processes;
 - SHA-256-keyed NVRTC PTX caching whose key binds kernel source, cooperative-groups header, CUDA ABI, execution semantics, NVRTC version, compile options, and compute capability;
 - page-locked host staging with separate compute/transfer streams, event dependencies, and pipelined HtoD staging so the next physical lane group can transfer while the current group computes; DtoH records are similarly ordered by events instead of a whole-stream host synchronization;
 - one-batch-ahead dataset prefetch using an already-verified cloned dataset handle;
-- CUDA Graph capture only for the stable sparse apply/reset launch sequence, with transparent direct-launch fallback when graph APIs/capture are unavailable;
-- sampled runtime telemetry for HtoD/compute/DtoH/host-wait timing, effective transfer bandwidth, launch mix, and occupancy estimates without synchronizing every production batch; `scripts/profile_cuda.sh` uses Nsight Compute for architecture-specific hardware counters such as DRAM behavior, achieved occupancy, warp/branch behavior, instructions, and atomics.
+- legacy CUDA Graph sparse apply/reset capability remains available in the runtime, but the exact v1 multi-story path no longer performs a per-byte canonical sparse apply;
+- a frozen replay-prefix fast path that uploads invariant pointer state once per prefix and distributes independent post/emit rows across the cooperative grid without changing replay selection or FP32 arithmetic;
+- sampled runtime telemetry for HtoD/compute/DtoH/host-wait timing, effective transfer bandwidth, launch mix, and occupancy estimates without synchronizing every production batch; an opt-in `LEO_CUDA_PHASE_PROFILE` mode measures fused-wavefront phases only when the instrumented kernel can launch the **same production grid width**, otherwise normal execution continues and emits `cuda_phase_profile_skipped`; `scripts/profile_cuda.sh` uses Nsight Compute for architecture-specific hardware counters where supported.
 
 The execution planner is intentionally forbidden from changing logical `--workers`, replay fraction, update ordering, precision, or the number of canonical mean updates. It may only choose physical launch geometry for work already required by ExecutionSemantics v1.
 
@@ -115,7 +118,8 @@ The long-term boundary tests are:
 - canonical synchronous-delta tests;
 - replay-policy selection tests;
 - CUDA ABI generation/source-of-truth checks;
-- CPU/CUDA forward/training conformance plus shared-batch CUDA smoke tests on configured GPU CI runners (`.github/workflows/gpu-ci.yml`).
+- CPU/CUDA forward/training conformance plus **production multi-story batch conformance at replay 0 and replay 0.30**, including learned parameters, context identity/observations, revisions, statistics, replay counts, and loss thresholds, on configured GPU CI runners (`.github/workflows/gpu-ci.yml`);
+- fresh-process incomplete-autotune resume and phase-profiler geometry gates on the GPU runner.
 
 Python source guards are secondary architecture lint; behavioral Rust tests remain the primary correctness evidence where a Rust toolchain is available.
 

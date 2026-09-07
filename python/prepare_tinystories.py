@@ -18,7 +18,7 @@ INDEX = struct.Struct("<QII")
 TEXT_KEYS = ("text", "story", "content")
 END_OF_TEXT = b"<|endoftext|>"
 STREAM_CHUNK_BYTES = 1 << 20
-PREPARER_VERSION = "1.0.0"
+PREPARER_VERSION = "1.0.1"
 
 
 def sha256_bytes(payload: bytes) -> bytes:
