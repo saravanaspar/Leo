@@ -170,6 +170,46 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("let cleanup_after = index + 1 == ranges.len();", training)
         self.assertIn("if cleanup_after {", training)
 
+    def test_sampled_cuda_phase_profiler_is_opt_in_and_math_neutral(self):
+        cuda = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+
+        self.assertIn("LEO_CUDA_PHASE_PROFILE", cuda)
+        self.assertIn("LEO_CUDA_PHASE_PROFILE_STRIDE", cuda)
+        self.assertIn("cuda_phase_profile", cuda)
+        self.assertIn("fused_wavefront_only", cuda)
+        self.assertIn("profiled_capacity_blocks", cuda)
+        self.assertIn("phase_profile_counters", cuda)
+        self.assertIn("phase_profile_sample_stride", cuda)
+        self.assertIn("shared_wavefront_fused_profiled", cuda)
+
+        normal_fused = kernels.split(
+            'extern "C" __global__ void leo_shared_wavefront_fused', 1
+        )[1].split("enum LeoCudaPhaseProfileCounter", 1)[0]
+        self.assertNotIn("clock64()", normal_fused)
+        self.assertNotIn("phase_profile_counters", normal_fused)
+
+        profiled = kernels.split(
+            'extern "C" __global__ void leo_shared_wavefront_fused_profiled', 1
+        )[1].split(
+            'extern "C" __global__ void leo_apply_shared_wavefront_deltas', 1
+        )[0]
+        for phase in (
+            "LEO_CUDA_PHASE_PROFILE_PRE",
+            "LEO_CUDA_PHASE_PROFILE_SELECT",
+            "LEO_CUDA_PHASE_PROFILE_POST_SELECT",
+            "LEO_CUDA_PHASE_PROFILE_CACHE_SURROGATE",
+            "LEO_CUDA_PHASE_PROFILE_POST_CORE",
+            "LEO_CUDA_PHASE_PROFILE_LEARNING_SIGNALS",
+            "LEO_CUDA_PHASE_PROFILE_POST_DELTAS",
+            "LEO_CUDA_PHASE_PROFILE_HOMEOSTASIS",
+            "LEO_CUDA_PHASE_PROFILE_CAPTURE",
+        ):
+            self.assertIn(phase, profiled)
+        self.assertIn("clock64()", profiled)
+        self.assertIn("grid.sync();", profiled)
+        self.assertNotIn("atomicAdd", profiled)
+
     def test_training_lifecycle_is_owned_by_training_module(self):
         main = (ROOT / "crates/leo-cli/src/main.rs").read_text()
         lifecycle = (ROOT / "crates/leo-cli/src/training/lifecycle.rs").read_text()

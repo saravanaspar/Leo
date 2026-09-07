@@ -3606,6 +3606,156 @@ extern "C" __global__ void leo_shared_wavefront_fused(
     }
 }
 
+enum LeoCudaPhaseProfileCounter {
+    LEO_CUDA_PHASE_PROFILE_SAMPLES = 0,
+    LEO_CUDA_PHASE_PROFILE_PRE = 1,
+    LEO_CUDA_PHASE_PROFILE_SELECT = 2,
+    LEO_CUDA_PHASE_PROFILE_POST_SELECT = 3,
+    LEO_CUDA_PHASE_PROFILE_CACHE_SURROGATE = 4,
+    LEO_CUDA_PHASE_PROFILE_POST_CORE = 5,
+    LEO_CUDA_PHASE_PROFILE_LEARNING_SIGNALS = 6,
+    LEO_CUDA_PHASE_PROFILE_POST_DELTAS = 7,
+    LEO_CUDA_PHASE_PROFILE_HOMEOSTASIS = 8,
+    LEO_CUDA_PHASE_PROFILE_CAPTURE = 9
+};
+
+extern "C" __global__ void leo_shared_wavefront_fused_profiled(
+    const unsigned long long* pointer_table_addresses,
+    const unsigned long long* step_buffer_addresses,
+    const unsigned int* step_counts,
+    const unsigned long long* base_ticks,
+    unsigned int lane_count,
+    unsigned int step_index,
+    unsigned int model_block_count,
+    unsigned int learning_trace_raw,
+    float strength,
+    float batch_scale,
+    const unsigned long long* delta_pointers,
+    unsigned long long* phase_profile_counters
+) {
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+    __shared__ float shared_values[LEO_GLOBAL_SORT];
+    __shared__ unsigned int shared_neurons[LEO_GLOBAL_SORT];
+    __shared__ float shared_latent[LEO_MAX_CONTEXT_DIM];
+    __shared__ float shared_reduction[512];
+
+    // Profiling is opt-in and sampled by the host. Only one thread reads the
+    // SM cycle counter and accumulates phase time, so normal launches pay no
+    // clock/atomic cost. Existing grid barriers define the phase boundaries.
+    const bool profile_thread = phase_profile_counters != nullptr
+        && blockIdx.x == 0U
+        && threadIdx.x == 0U;
+    unsigned long long phase_start = profile_thread ? clock64() : 0ULL;
+
+    for (unsigned int lane = blockIdx.x; lane < lane_count; lane += gridDim.x) {
+        leo_shared_phase_pre_lane(pointer_table_addresses, step_buffer_addresses, step_counts,
+            base_ticks, lane_count, step_index, learning_trace_raw, lane);
+    }
+    grid.sync();
+    if (profile_thread) {
+        const unsigned long long now = clock64();
+        phase_profile_counters[LEO_CUDA_PHASE_PROFILE_PRE] += now - phase_start;
+        phase_start = now;
+    }
+
+    const unsigned int select_work = lane_count * model_block_count;
+    for (unsigned int work = blockIdx.x; work < select_work; work += gridDim.x) {
+        leo_shared_phase_select_block(pointer_table_addresses, step_counts, base_ticks,
+            lane_count, step_index, model_block_count, work);
+    }
+    grid.sync();
+    if (profile_thread) {
+        const unsigned long long now = clock64();
+        phase_profile_counters[LEO_CUDA_PHASE_PROFILE_SELECT] += now - phase_start;
+        phase_start = now;
+    }
+
+    for (unsigned int lane = blockIdx.x; lane < lane_count; lane += gridDim.x) {
+        leo_shared_phase_post_select_lane(pointer_table_addresses, step_counts, base_ticks,
+            lane_count, step_index, lane, shared_values, shared_neurons);
+    }
+    grid.sync();
+    if (profile_thread) {
+        const unsigned long long now = clock64();
+        phase_profile_counters[LEO_CUDA_PHASE_PROFILE_POST_SELECT] += now - phase_start;
+        phase_start = now;
+    }
+
+    for (unsigned int lane = blockIdx.x; lane < lane_count; lane += gridDim.x) {
+        leo_shared_phase_cache_surrogate_lane(pointer_table_addresses, step_counts, base_ticks,
+            lane_count, step_index, lane);
+    }
+    grid.sync();
+    if (profile_thread) {
+        const unsigned long long now = clock64();
+        phase_profile_counters[LEO_CUDA_PHASE_PROFILE_CACHE_SURROGATE] += now - phase_start;
+        phase_start = now;
+    }
+
+    for (unsigned int lane = blockIdx.x; lane < lane_count; lane += gridDim.x) {
+        leo_shared_phase_post_core_lane(pointer_table_addresses, step_buffer_addresses, step_counts,
+            base_ticks, lane_count, step_index, learning_trace_raw, lane,
+            shared_latent, shared_reduction);
+    }
+    grid.sync();
+    if (profile_thread) {
+        const unsigned long long now = clock64();
+        phase_profile_counters[LEO_CUDA_PHASE_PROFILE_POST_CORE] += now - phase_start;
+        phase_start = now;
+    }
+
+    for (unsigned int lane = blockIdx.x; lane < lane_count; lane += gridDim.x) {
+        leo_shared_phase_learning_signals_lane(pointer_table_addresses, step_buffer_addresses,
+            step_counts, base_ticks, lane_count, step_index, strength, lane);
+    }
+    grid.sync();
+    if (profile_thread) {
+        const unsigned long long now = clock64();
+        phase_profile_counters[LEO_CUDA_PHASE_PROFILE_LEARNING_SIGNALS] += now - phase_start;
+        phase_start = now;
+    }
+
+    for (unsigned int lane = blockIdx.x; lane < lane_count; lane += gridDim.x) {
+        leo_shared_phase_post_deltas_lane(pointer_table_addresses, step_buffer_addresses,
+            step_counts, lane_count, step_index, learning_trace_raw, strength, batch_scale,
+            delta_pointers, lane);
+    }
+    grid.sync();
+    if (profile_thread) {
+        const unsigned long long now = clock64();
+        phase_profile_counters[LEO_CUDA_PHASE_PROFILE_POST_DELTAS] += now - phase_start;
+        phase_start = now;
+    }
+
+    if (learning_trace_raw != 0U) {
+        for (unsigned int lane = blockIdx.x; lane < lane_count; lane += gridDim.x) {
+            leo_shared_phase_homeostasis_lane(pointer_table_addresses, step_counts, base_ticks,
+                lane_count, step_index, learning_trace_raw, batch_scale, delta_pointers, lane);
+        }
+    }
+    grid.sync();
+    if (profile_thread) {
+        const unsigned long long now = clock64();
+        phase_profile_counters[LEO_CUDA_PHASE_PROFILE_HOMEOSTASIS] += now - phase_start;
+        phase_start = now;
+    }
+
+    for (unsigned int lane = blockIdx.x; lane < lane_count; lane += gridDim.x) {
+        leo_shared_phase_capture_lane(pointer_table_addresses, step_buffer_addresses, step_counts,
+            lane_count, step_index, lane);
+    }
+
+    // A final barrier exists only on sampled profiling launches so capture can
+    // be timed to completion. It is outside the normal execution path and does
+    // not change any arithmetic or parameter-update ordering.
+    grid.sync();
+    if (profile_thread) {
+        const unsigned long long now = clock64();
+        phase_profile_counters[LEO_CUDA_PHASE_PROFILE_CAPTURE] += now - phase_start;
+        phase_profile_counters[LEO_CUDA_PHASE_PROFILE_SAMPLES] += 1ULL;
+    }
+}
+
 extern "C" __global__ void leo_apply_shared_wavefront_deltas(
     const unsigned long long* model_pointers,
     const unsigned long long* delta_pointers
