@@ -82,6 +82,117 @@ __device__ __forceinline__ bool leo_better(
         < leo_rotated_key(right_neuron, rotation, neuron_count);
 }
 
+// Exact selection records keep the original FP32 candidate bits while replacing
+// repeated float/tie comparisons with one unsigned comparison on the finite
+// [0, 1] fast path.  The high word is the nonnegative IEEE-754 value and the
+// low word reverses Leo's rotated tie key, so larger u64 records are exactly
+// the same order as `leo_better` for finite positive candidates.  Zero remains
+// the invalid/nonpositive sentinel.
+__device__ __forceinline__ unsigned long long leo_selection_record(
+    float value,
+    unsigned int neuron,
+    unsigned int rotation,
+    unsigned int neuron_count
+) {
+    // Preserve the legacy NaN fallback contract: `value <= 0` is false for NaN,
+    // so a non-finite candidate still retains its payload/neuron in the record.
+    if (value <= 0.0f) return 0ULL;
+    const unsigned int value_bits = __float_as_uint(value);
+    const unsigned int tie = 0xffffffffU - leo_rotated_key(neuron, rotation, neuron_count);
+    return ((unsigned long long)value_bits << 32U) | (unsigned long long)tie;
+}
+
+__device__ __forceinline__ bool leo_selection_record_is_finite(unsigned long long record) {
+    if (record == 0ULL) return true;
+    const unsigned int value_bits = (unsigned int)(record >> 32U);
+    return (value_bits & 0x7f800000U) != 0x7f800000U;
+}
+
+__device__ __forceinline__ float leo_selection_record_value(unsigned long long record) {
+    if (record == 0ULL) return -1.0f;
+    return __uint_as_float((unsigned int)(record >> 32U));
+}
+
+__device__ __forceinline__ unsigned int leo_selection_record_neuron(
+    unsigned long long record,
+    unsigned int rotation,
+    unsigned int neuron_count
+) {
+    if (record == 0ULL) return 0U;
+    const unsigned int inverted = (unsigned int)record;
+    const unsigned int rotated = 0xffffffffU - inverted;
+    return (unsigned int)(((unsigned long long)rotated + (unsigned long long)rotation)
+        % (unsigned long long)neuron_count);
+}
+
+__device__ __forceinline__ void leo_bitonic_sort_selection_keys(
+    unsigned long long* records,
+    unsigned int sort_size,
+    unsigned int first_width
+) {
+    const unsigned int lane = threadIdx.x;
+    for (unsigned int width = first_width; width <= sort_size; width <<= 1U) {
+        for (unsigned int stride = width >> 1U; stride > 0U; stride >>= 1U) {
+            for (unsigned int index = lane; index < sort_size; index += blockDim.x) {
+                const unsigned int other = index ^ stride;
+                if (other > index) {
+                    const unsigned long long left = records[index];
+                    const unsigned long long right = records[other];
+                    const bool better_first = (index & width) == 0U;
+                    const bool should_swap = better_first ? left < right : left > right;
+                    if (should_swap) {
+                        records[index] = right;
+                        records[other] = left;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// Rare numerical fallback.  It reconstructs the old float/neuron comparator
+// from the packed record and therefore preserves the established CUDA behavior
+// if a non-finite candidate ever reaches selection.
+__device__ __forceinline__ void leo_bitonic_sort_selection_records_legacy(
+    unsigned long long* records,
+    unsigned int sort_size,
+    unsigned int rotation,
+    unsigned int neuron_count
+) {
+    const unsigned int lane = threadIdx.x;
+    for (unsigned int width = 2U; width <= sort_size; width <<= 1U) {
+        for (unsigned int stride = width >> 1U; stride > 0U; stride >>= 1U) {
+            for (unsigned int index = lane; index < sort_size; index += blockDim.x) {
+                const unsigned int other = index ^ stride;
+                if (other > index) {
+                    const unsigned long long left = records[index];
+                    const unsigned long long right = records[other];
+                    const bool better_first = (index & width) == 0U;
+                    const bool left_better = leo_better(
+                        leo_selection_record_value(left),
+                        leo_selection_record_neuron(left, rotation, neuron_count),
+                        leo_selection_record_value(right),
+                        leo_selection_record_neuron(right, rotation, neuron_count),
+                        rotation,
+                        neuron_count
+                    );
+                    const bool should_swap = better_first ? !left_better : left_better;
+                    if (should_swap) {
+                        records[index] = right;
+                        records[other] = left;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+__device__ __forceinline__ bool leo_is_power_of_two(unsigned int value) {
+    return value != 0U && (value & (value - 1U)) == 0U;
+}
+
 __device__ __forceinline__ float leo_branch_jacobian(
     unsigned char branch,
     float excitability,
@@ -1690,7 +1801,8 @@ __device__ void leo_p_context_resolve_shared(
 __device__ __forceinline__ void leo_p_select_model_block(
     const unsigned long long* p,
     unsigned long long tick,
-    unsigned int model_block
+    unsigned int model_block,
+    unsigned long long* shared_selection_keys
 ) {
     const LeoConfig* cfg = leo_p_cptr<LeoConfig>(p, LEO_P_CONFIG);
     if (model_block >= cfg->block_count) return;
@@ -1714,9 +1826,20 @@ __device__ __forceinline__ void leo_p_select_model_block(
     float* winner_value = leo_p_ptr<float>(p, LEO_P_BLOCK_WINNER_VALUE);
     float* block_cutoff = leo_p_ptr<float>(p, LEO_P_BLOCK_CUTOFF);
     LeoStepCounters* counters = leo_p_ptr<LeoStepCounters>(p, LEO_P_COUNTERS);
+    const unsigned int rotation = (unsigned int)(tick % (unsigned long long)cfg->neuron_count);
+    const unsigned int start = model_block * cfg->neurons_per_block;
+
+    // Persistent/shared execution uses 256 threads for the production 256-neuron
+    // block.  Any power-of-two launch that covers the whole model block can use
+    // the same exact packed-key network; larger/non-power-of-two shapes retain
+    // the established serial top-k fallback below.
+    const bool fast_shape = cfg->neurons_per_block <= blockDim.x
+        && blockDim.x <= LEO_GLOBAL_SORT
+        && leo_is_power_of_two(blockDim.x);
+    bool saw_nonfinite = false;
 
     for (unsigned int local = threadIdx.x; local < cfg->neurons_per_block; local += blockDim.x) {
-        const unsigned int neuron = model_block * cfg->neurons_per_block + local;
+        const unsigned int neuron = start + local;
         float candidate = 0.0f;
         if (touched_epoch[neuron] == tag) {
             const unsigned long long branch_elapsed = tick >= branch_last_tick[neuron]
@@ -1752,11 +1875,82 @@ __device__ __forceinline__ void leo_p_select_model_block(
             }
         }
         candidate_activation[neuron] = candidate;
+        if (fast_shape) {
+            const unsigned long long record = leo_selection_record(
+                candidate, neuron, rotation, cfg->neuron_count
+            );
+            shared_selection_keys[threadIdx.x] = record;
+            saw_nonfinite |= !leo_selection_record_is_finite(record);
+        }
     }
-    __syncthreads();
+    if (fast_shape && threadIdx.x >= cfg->neurons_per_block) {
+        shared_selection_keys[threadIdx.x] = 0ULL;
+    }
 
+    // This replaces the old candidate-computation barrier while also voting on
+    // the rare non-finite fallback condition.
+    const bool nonfinite = __syncthreads_or(saw_nonfinite ? 1 : 0) != 0;
+
+    if (fast_shape && !nonfinite) {
+        leo_bitonic_sort_selection_keys(shared_selection_keys, blockDim.x, 2U);
+        if (threadIdx.x == 0U) {
+            const unsigned int keep = cfg->max_active_per_block;
+            unsigned int positive = 0U;
+            while (positive < blockDim.x && shared_selection_keys[positive] != 0ULL) {
+                positive += 1U;
+            }
+            const unsigned int winner_count = positive < keep ? positive : keep;
+            const unsigned int winner_base = model_block * keep;
+            for (unsigned int i = 0U; i < keep; ++i) {
+                if (i < winner_count) {
+                    const unsigned long long record = shared_selection_keys[i];
+                    winner_neuron[winner_base + i] = leo_selection_record_neuron(
+                        record, rotation, cfg->neuron_count
+                    );
+                    winner_value[winner_base + i] = leo_selection_record_value(record);
+                } else {
+                    winner_neuron[winner_base + i] = 0U;
+                    winner_value[winner_base + i] = -1.0f;
+                }
+            }
+            float cutoff = 0.0f;
+            if (positive > keep) {
+                // Preserve Leo's historical serial-insertion cutoff exactly.
+                // A final positive non-winner overwrites slot `keep`; only when
+                // that final positive is itself a winner does slot `keep` hold
+                // the true next-ranked candidate.
+                unsigned int last_positive_neuron = 0U;
+                float last_positive_value = 0.0f;
+                for (unsigned int local = cfg->neurons_per_block; local > 0U; --local) {
+                    const unsigned int candidate_neuron = start + local - 1U;
+                    const float candidate_value = candidate_activation[candidate_neuron];
+                    if (candidate_value > 0.0f) {
+                        last_positive_neuron = candidate_neuron;
+                        last_positive_value = candidate_value;
+                        break;
+                    }
+                }
+                bool last_is_winner = false;
+                for (unsigned int i = 0U; i < winner_count; ++i) {
+                    if (leo_selection_record_neuron(
+                        shared_selection_keys[i], rotation, cfg->neuron_count
+                    ) == last_positive_neuron) {
+                        last_is_winner = true;
+                        break;
+                    }
+                }
+                cutoff = last_is_winner
+                    ? leo_selection_record_value(shared_selection_keys[keep])
+                    : last_positive_value;
+            }
+            block_cutoff[model_block] = cutoff;
+            atomicAdd(&counters->block_selected, winner_count);
+        }
+        return;
+    }
+
+    // Exact legacy fallback for unsupported shapes and any non-finite candidate.
     if (threadIdx.x == 0U) {
-        const unsigned int rotation = (unsigned int)(tick % (unsigned long long)cfg->neuron_count);
         const unsigned int keep = cfg->max_active_per_block;
         float top_value[LEO_MAX_BLOCK_WINNERS + 1];
         unsigned int top_neuron[LEO_MAX_BLOCK_WINNERS + 1];
@@ -1765,7 +1959,6 @@ __device__ __forceinline__ void leo_p_select_model_block(
             top_neuron[i] = 0U;
         }
         unsigned int positive = 0U;
-        const unsigned int start = model_block * cfg->neurons_per_block;
         for (unsigned int local = 0U; local < cfg->neurons_per_block; ++local) {
             const unsigned int candidate_neuron = start + local;
             const float value = candidate_activation[candidate_neuron];
@@ -1810,10 +2003,14 @@ __device__ __forceinline__ void leo_p_select_model_block(
     }
 }
 
-__device__ void leo_p_select_blocks(const unsigned long long* p, unsigned long long tick) {
+__device__ void leo_p_select_blocks(
+    const unsigned long long* p,
+    unsigned long long tick,
+    unsigned long long* shared_selection_keys
+) {
     const LeoConfig* cfg = leo_p_cptr<LeoConfig>(p, LEO_P_CONFIG);
     for (unsigned int model_block = 0U; model_block < cfg->block_count; ++model_block) {
-        leo_p_select_model_block(p, tick, model_block);
+        leo_p_select_model_block(p, tick, model_block, shared_selection_keys);
         __syncthreads();
     }
 }
@@ -1821,8 +2018,7 @@ __device__ void leo_p_select_blocks(const unsigned long long* p, unsigned long l
 __device__ void leo_p_select_global(
     const unsigned long long* p,
     unsigned long long tick,
-    float* shared_values,
-    unsigned int* shared_neurons
+    unsigned long long* shared_selection_keys
 ) {
     const LeoConfig* cfg = leo_p_cptr<LeoConfig>(p, LEO_P_CONFIG);
     const unsigned int* block_winner_neuron = leo_p_cptr<unsigned int>(p, LEO_P_BLOCK_WINNER_NEURON);
@@ -1837,49 +2033,84 @@ __device__ void leo_p_select_global(
     LeoStepCounters* counters = leo_p_ptr<LeoStepCounters>(p, LEO_P_COUNTERS);
     const unsigned int lane = threadIdx.x;
     const unsigned int available = cfg->block_count * cfg->max_active_per_block;
+    const unsigned int rotation = (unsigned int)(tick % (unsigned long long)cfg->neuron_count);
+    const unsigned int run = cfg->max_active_per_block;
+    const bool presorted_runs = leo_is_power_of_two(run) && run <= LEO_MAX_BLOCK_WINNERS;
+    bool saw_nonfinite = false;
+
+    // Block-local winners are already in exact descending order.  For a
+    // power-of-two run, reverse every odd run while loading; that is exactly the
+    // bitonic-network state after completing widths <= run, so the global merge
+    // can begin at 2*run instead of paying those barriers again.
     for (unsigned int index = lane; index < LEO_GLOBAL_SORT; index += blockDim.x) {
-        if (index < available) {
-            shared_values[index] = block_winner_value[index];
-            shared_neurons[index] = block_winner_neuron[index];
+        unsigned int source = index;
+        if (index < available && presorted_runs) {
+            const unsigned int run_base = (index / run) * run;
+            const unsigned int offset = index - run_base;
+            if (((index / run) & 1U) != 0U) {
+                source = run_base + (run - 1U - offset);
+            }
+        }
+        if (source < available) {
+            const float value = block_winner_value[source];
+            const unsigned int neuron = block_winner_neuron[source];
+            const unsigned long long record = leo_selection_record(
+                value, neuron, rotation, cfg->neuron_count
+            );
+            shared_selection_keys[index] = record;
+            saw_nonfinite |= !leo_selection_record_is_finite(record);
         } else {
-            shared_values[index] = -1.0f;
-            shared_neurons[index] = 0U;
+            shared_selection_keys[index] = 0ULL;
         }
     }
-    __syncthreads();
-    const unsigned int rotation = (unsigned int)(tick % (unsigned long long)cfg->neuron_count);
-    for (unsigned int width = 2U; width <= LEO_GLOBAL_SORT; width <<= 1U) {
-        for (unsigned int stride = width >> 1U; stride > 0U; stride >>= 1U) {
-            for (unsigned int index = lane; index < LEO_GLOBAL_SORT; index += blockDim.x) {
-                const unsigned int other = index ^ stride;
-                if (other > index) {
-                    const bool better_first = (index & width) == 0U;
-                    const bool left_better = leo_better(
-                        shared_values[index], shared_neurons[index], shared_values[other], shared_neurons[other],
-                        rotation, cfg->neuron_count
-                    );
-                    const bool should_swap = better_first ? !left_better : left_better;
-                    if (should_swap) {
-                        const float value = shared_values[index];
-                        shared_values[index] = shared_values[other];
-                        shared_values[other] = value;
-                        const unsigned int neuron = shared_neurons[index];
-                        shared_neurons[index] = shared_neurons[other];
-                        shared_neurons[other] = neuron;
-                    }
+    const bool nonfinite = __syncthreads_or(saw_nonfinite ? 1 : 0) != 0;
+
+    if (nonfinite) {
+        // Undo the alternating-run load before reproducing the old full network;
+        // this keeps even pathological non-finite ordering byte-for-byte with
+        // the previous CUDA implementation.
+        if (presorted_runs) {
+            for (unsigned int index = lane; index < available; index += blockDim.x) {
+                const unsigned int run_index = index / run;
+                const unsigned int offset = index % run;
+                if ((run_index & 1U) != 0U && offset < run / 2U) {
+                    const unsigned int other = run_index * run + (run - 1U - offset);
+                    const unsigned long long value = shared_selection_keys[index];
+                    shared_selection_keys[index] = shared_selection_keys[other];
+                    shared_selection_keys[other] = value;
                 }
             }
             __syncthreads();
         }
+        leo_bitonic_sort_selection_records_legacy(
+            shared_selection_keys, LEO_GLOBAL_SORT, rotation, cfg->neuron_count
+        );
+    } else {
+        const unsigned int first_width = presorted_runs && run < LEO_GLOBAL_SORT
+            ? run << 1U
+            : 2U;
+        leo_bitonic_sort_selection_keys(
+            shared_selection_keys, LEO_GLOBAL_SORT, first_width
+        );
     }
+
     if (lane == 0U) {
         unsigned int selected = 0U;
-        while (selected < available && selected < LEO_GLOBAL_SORT && shared_values[selected] > 0.0f) selected += 1U;
+        while (selected < available && selected < LEO_GLOBAL_SORT
+            && leo_selection_record_value(shared_selection_keys[selected]) > 0.0f) {
+            selected += 1U;
+        }
         const unsigned int total = selected;
         const unsigned int cap = cfg->max_active_global;
         const unsigned int kept = total < cap ? total : cap;
         *active_count = kept;
-        *population_cutoff = total > cap ? leo_clamp(shared_values[cap], 0.0f, cfg->population_inhibition_max) : 0.0f;
+        *population_cutoff = total > cap
+            ? leo_clamp(
+                leo_selection_record_value(shared_selection_keys[cap]),
+                0.0f,
+                cfg->population_inhibition_max
+            )
+            : 0.0f;
         counters->global_clipped = total > cap ? total - cap : 0U;
         const float activity = (float)kept / (float)(cfg->neuron_count == 0U ? 1U : cfg->neuron_count);
         const float error = activity - cfg->target_activity;
@@ -1888,10 +2119,14 @@ __device__ void leo_p_select_global(
             0.0f, cfg->population_inhibition_max
         );
         for (unsigned int index = 0U; index < kept; ++index) {
-            const unsigned int neuron = shared_neurons[index];
+            const unsigned long long record = shared_selection_keys[index];
+            const unsigned int neuron = leo_selection_record_neuron(
+                record, rotation, cfg->neuron_count
+            );
+            const float value = leo_selection_record_value(record);
             active[index] = neuron;
-            active_value[index] = shared_values[index];
-            activation[neuron] = shared_values[index];
+            active_value[index] = value;
+            activation[neuron] = value;
             selected_epoch[neuron] = tick + 1ULL;
             leo_p_mark_learning_destination(p, neuron, tick + 1ULL);
         }
@@ -3008,8 +3243,7 @@ __device__ void leo_train_story_block(
     unsigned long long base_tick,
     unsigned int learning_trace_raw,
     float strength,
-    float* shared_values,
-    unsigned int* shared_neurons,
+    unsigned long long* shared_selection_keys,
     float* shared_latent,
     float* shared_reduction
 ) {
@@ -3047,9 +3281,9 @@ __device__ void leo_train_story_block(
         __syncthreads();
         leo_p_context_resolve(pointers, step.symbol, context_enabled, learning_trace && context_enabled);
         __syncthreads();
-        leo_p_select_blocks(pointers, tick);
+        leo_p_select_blocks(pointers, tick, shared_selection_keys);
         __syncthreads();
-        leo_p_select_global(pointers, tick, shared_values, shared_neurons);
+        leo_p_select_global(pointers, tick, shared_selection_keys);
         __syncthreads();
         leo_p_cache_surrogate(pointers, tick);
         __syncthreads();
@@ -3114,8 +3348,7 @@ __device__ void leo_advance_frozen_story_block(
     const LeoPersistentStep* steps,
     unsigned int step_count,
     unsigned long long base_tick,
-    float* shared_values,
-    unsigned int* shared_neurons
+    unsigned long long* shared_selection_keys
 ) {
     unsigned int* recurrent_list = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_LIST);
     unsigned int* recurrent_count = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_COUNT);
@@ -3138,9 +3371,9 @@ __device__ void leo_advance_frozen_story_block(
         __syncthreads();
         leo_p_context_advance_history(pointers, symbol);
         __syncthreads();
-        leo_p_select_blocks(pointers, tick);
+        leo_p_select_blocks(pointers, tick, shared_selection_keys);
         __syncthreads();
-        leo_p_select_global(pointers, tick, shared_values, shared_neurons);
+        leo_p_select_global(pointers, tick, shared_selection_keys);
         __syncthreads();
         leo_p_post_and_emit(pointers, tick);
         __syncthreads();
@@ -3153,16 +3386,14 @@ extern "C" __global__ void leo_advance_frozen_persistent(
     unsigned int step_count,
     unsigned long long base_tick
 ) {
-    __shared__ float shared_values[LEO_GLOBAL_SORT];
-    __shared__ unsigned int shared_neurons[LEO_GLOBAL_SORT];
+    __shared__ unsigned long long shared_selection_keys[LEO_GLOBAL_SORT];
     if (blockIdx.x != 0U) return;
     leo_advance_frozen_story_block(
         pointers,
         steps,
         step_count,
         base_tick,
-        shared_values,
-        shared_neurons
+        shared_selection_keys
     );
 }
 
@@ -3170,7 +3401,7 @@ extern "C" __global__ void leo_advance_frozen_persistent(
 // Cooperative frozen replay-prefix advancement. Frozen prefix state is exactly
 // the same as leo_advance_frozen_persistent, but independent model blocks are
 // evaluated by separate CUDA blocks. Grid barriers preserve the original phase
-// order, and block-local arithmetic/order within each model block is unchanged.
+// order; neuron-state arithmetic plus exact winner/cutoff ordering are unchanged.
 enum LeoCudaFrozenProfileCounter {
     LEO_CUDA_FROZEN_PROFILE_SAMPLES = 0,
     LEO_CUDA_FROZEN_PROFILE_PRE = 1,
@@ -3210,8 +3441,7 @@ __device__ __forceinline__ void leo_advance_frozen_cooperative_body(
     unsigned long long* profile_counters
 ) {
     cooperative_groups::grid_group grid = cooperative_groups::this_grid();
-    __shared__ float shared_values[LEO_GLOBAL_SORT];
-    __shared__ unsigned int shared_neurons[LEO_GLOBAL_SORT];
+    __shared__ unsigned long long shared_selection_keys[LEO_GLOBAL_SORT];
     const LeoConfig* cfg = leo_p_cptr<LeoConfig>(pointers, LEO_P_CONFIG);
     unsigned int* recurrent_list = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_LIST);
     unsigned int* recurrent_count = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_COUNT);
@@ -3244,7 +3474,7 @@ __device__ __forceinline__ void leo_advance_frozen_cooperative_body(
         for (unsigned int model_block = blockIdx.x;
              model_block < cfg->block_count;
              model_block += gridDim.x) {
-            leo_p_select_model_block(pointers, tick, model_block);
+            leo_p_select_model_block(pointers, tick, model_block, shared_selection_keys);
             __syncthreads();
         }
         leo_profile_phase_end<PROFILE>(
@@ -3253,7 +3483,7 @@ __device__ __forceinline__ void leo_advance_frozen_cooperative_body(
 
         phase_started = leo_profile_phase_start<PROFILE>();
         if (blockIdx.x == 0U) {
-            leo_p_select_global(pointers, tick, shared_values, shared_neurons);
+            leo_p_select_global(pointers, tick, shared_selection_keys);
             __syncthreads();
         }
         leo_profile_phase_end<PROFILE>(
@@ -3318,8 +3548,8 @@ enum LeoCudaReplayProfileCounter {
 
 // Single-story cooperative trainer used by replay and any other supervised
 // single-runtime step batch. Order-sensitive event delivery, input injection,
-// context resolution, global winner selection, and the forward reduction keep
-// their original block-local arithmetic. Independent model blocks, sparse rows,
+// context resolution, exact global winner ordering, and the forward reduction
+// keep their v1 semantics. Independent model blocks, sparse rows,
 // destinations, weights, homeostasis rows, and post/emit records use the whole
 // cooperative grid. This changes execution geometry only; FP32 equations,
 // target order, parameter visibility, and per-step barriers are unchanged.
@@ -3334,8 +3564,7 @@ __device__ __forceinline__ void leo_train_cooperative_body(
     unsigned long long* profile_counters
 ) {
     cooperative_groups::grid_group grid = cooperative_groups::this_grid();
-    __shared__ float shared_values[LEO_GLOBAL_SORT];
-    __shared__ unsigned int shared_neurons[LEO_GLOBAL_SORT];
+    __shared__ unsigned long long shared_selection_keys[LEO_GLOBAL_SORT];
     __shared__ float shared_latent[LEO_MAX_CONTEXT_DIM];
     __shared__ float shared_reduction[512];
     const LeoConfig* cfg = leo_p_cptr<LeoConfig>(pointers, LEO_P_CONFIG);
@@ -3394,7 +3623,7 @@ __device__ __forceinline__ void leo_train_cooperative_body(
         for (unsigned int model_block = blockIdx.x;
              model_block < cfg->block_count;
              model_block += gridDim.x) {
-            leo_p_select_model_block(pointers, tick, model_block);
+            leo_p_select_model_block(pointers, tick, model_block, shared_selection_keys);
             __syncthreads();
         }
         leo_profile_phase_end<PROFILE>(
@@ -3403,7 +3632,7 @@ __device__ __forceinline__ void leo_train_cooperative_body(
 
         phase_started = leo_profile_phase_start<PROFILE>();
         if (blockIdx.x == 0U) {
-            leo_p_select_global(pointers, tick, shared_values, shared_neurons);
+            leo_p_select_global(pointers, tick, shared_selection_keys);
             __syncthreads();
         }
         leo_profile_phase_end<PROFILE>(
@@ -3582,8 +3811,7 @@ extern "C" __global__ void leo_train_persistent(
     unsigned int learning_trace_raw,
     float strength
 ) {
-    __shared__ float shared_values[LEO_GLOBAL_SORT];
-    __shared__ unsigned int shared_neurons[LEO_GLOBAL_SORT];
+    __shared__ unsigned long long shared_selection_keys[LEO_GLOBAL_SORT];
     __shared__ float shared_latent[LEO_MAX_CONTEXT_DIM];
     __shared__ float shared_reduction[512];
     if (blockIdx.x != 0U) return;
@@ -3594,8 +3822,7 @@ extern "C" __global__ void leo_train_persistent(
         base_tick,
         learning_trace_raw,
         strength,
-        shared_values,
-        shared_neurons,
+        shared_selection_keys,
         shared_latent,
         shared_reduction
     );
@@ -3663,7 +3890,8 @@ __device__ __forceinline__ void leo_shared_phase_select_block(
     unsigned int lane_count,
     unsigned int step_index,
     unsigned int model_block_count,
-    unsigned int work_block
+    unsigned int work_block,
+    unsigned long long* shared_selection_keys
 ) {
     if (model_block_count == 0U) return;
     const unsigned int lane = work_block / model_block_count;
@@ -3676,7 +3904,10 @@ __device__ __forceinline__ void leo_shared_phase_select_block(
     const LeoConfig* cfg = leo_p_cptr<LeoConfig>(p, LEO_P_CONFIG);
     if (model_block >= cfg->block_count) return;
     const unsigned long long tick = base_ticks[lane] + (unsigned long long)step_index;
-    leo_p_select_model_block(p, tick, model_block);
+    leo_p_select_model_block(p, tick, model_block, shared_selection_keys);
+    // The fused wavefront may reuse this physical block for another model block.
+    // Wait for lane 0 to consume the sorted shared keys before that reuse.
+    __syncthreads();
 }
 
 __device__ __forceinline__ void leo_shared_phase_post_select_lane(
@@ -3686,15 +3917,14 @@ __device__ __forceinline__ void leo_shared_phase_post_select_lane(
     unsigned int lane_count,
     unsigned int step_index,
     unsigned int lane,
-    float* shared_values,
-    unsigned int* shared_neurons
+    unsigned long long* shared_selection_keys
 ) {
     if (lane >= lane_count || step_index >= step_counts[lane]) return;
     const unsigned long long* p = reinterpret_cast<const unsigned long long*>(
         pointer_table_addresses[lane]
     );
     const unsigned long long tick = base_ticks[lane] + (unsigned long long)step_index;
-    leo_p_select_global(p, tick, shared_values, shared_neurons);
+    leo_p_select_global(p, tick, shared_selection_keys);
 }
 
 __device__ __forceinline__ void leo_shared_phase_cache_surrogate_lane(
@@ -3930,8 +4160,9 @@ extern "C" __global__ void leo_shared_select_blocks(
     unsigned int step_index,
     unsigned int model_block_count
 ) {
+    __shared__ unsigned long long shared_selection_keys[LEO_GLOBAL_SORT];
     leo_shared_phase_select_block(pointer_table_addresses, step_counts, base_ticks,
-        lane_count, step_index, model_block_count, blockIdx.x);
+        lane_count, step_index, model_block_count, blockIdx.x, shared_selection_keys);
 }
 
 extern "C" __global__ void leo_shared_post_select(
@@ -3941,10 +4172,9 @@ extern "C" __global__ void leo_shared_post_select(
     unsigned int lane_count,
     unsigned int step_index
 ) {
-    __shared__ float shared_values[LEO_GLOBAL_SORT];
-    __shared__ unsigned int shared_neurons[LEO_GLOBAL_SORT];
+    __shared__ unsigned long long shared_selection_keys[LEO_GLOBAL_SORT];
     leo_shared_phase_post_select_lane(pointer_table_addresses, step_counts, base_ticks,
-        lane_count, step_index, blockIdx.x, shared_values, shared_neurons);
+        lane_count, step_index, blockIdx.x, shared_selection_keys);
 }
 
 extern "C" __global__ void leo_shared_cache_surrogate_worklist(
@@ -4047,8 +4277,7 @@ extern "C" __global__ void leo_shared_wavefront_fused(
     const unsigned long long* delta_pointers
 ) {
     cooperative_groups::grid_group grid = cooperative_groups::this_grid();
-    __shared__ float shared_values[LEO_GLOBAL_SORT];
-    __shared__ unsigned int shared_neurons[LEO_GLOBAL_SORT];
+    __shared__ unsigned long long shared_selection_keys[LEO_GLOBAL_SORT];
     __shared__ float shared_latent[LEO_MAX_CONTEXT_DIM];
     __shared__ float shared_reduction[512];
 
@@ -4061,13 +4290,13 @@ extern "C" __global__ void leo_shared_wavefront_fused(
     const unsigned int select_work = lane_count * model_block_count;
     for (unsigned int work = blockIdx.x; work < select_work; work += gridDim.x) {
         leo_shared_phase_select_block(pointer_table_addresses, step_counts, base_ticks,
-            lane_count, step_index, model_block_count, work);
+            lane_count, step_index, model_block_count, work, shared_selection_keys);
     }
     grid.sync();
 
     for (unsigned int lane = blockIdx.x; lane < lane_count; lane += gridDim.x) {
         leo_shared_phase_post_select_lane(pointer_table_addresses, step_counts, base_ticks,
-            lane_count, step_index, lane, shared_values, shared_neurons);
+            lane_count, step_index, lane, shared_selection_keys);
     }
     grid.sync();
 
@@ -4139,8 +4368,7 @@ extern "C" __global__ void leo_shared_wavefront_fused_profiled(
     unsigned long long* phase_profile_counters
 ) {
     cooperative_groups::grid_group grid = cooperative_groups::this_grid();
-    __shared__ float shared_values[LEO_GLOBAL_SORT];
-    __shared__ unsigned int shared_neurons[LEO_GLOBAL_SORT];
+    __shared__ unsigned long long shared_selection_keys[LEO_GLOBAL_SORT];
     __shared__ float shared_latent[LEO_MAX_CONTEXT_DIM];
     __shared__ float shared_reduction[512];
 
@@ -4166,7 +4394,7 @@ extern "C" __global__ void leo_shared_wavefront_fused_profiled(
     const unsigned int select_work = lane_count * model_block_count;
     for (unsigned int work = blockIdx.x; work < select_work; work += gridDim.x) {
         leo_shared_phase_select_block(pointer_table_addresses, step_counts, base_ticks,
-            lane_count, step_index, model_block_count, work);
+            lane_count, step_index, model_block_count, work, shared_selection_keys);
     }
     grid.sync();
     if (profile_thread) {
@@ -4177,7 +4405,7 @@ extern "C" __global__ void leo_shared_wavefront_fused_profiled(
 
     for (unsigned int lane = blockIdx.x; lane < lane_count; lane += gridDim.x) {
         leo_shared_phase_post_select_lane(pointer_table_addresses, step_counts, base_ticks,
-            lane_count, step_index, lane, shared_values, shared_neurons);
+            lane_count, step_index, lane, shared_selection_keys);
     }
     grid.sync();
     if (profile_thread) {
@@ -4448,8 +4676,7 @@ extern "C" __global__ void leo_train_story_batch(
     const LeoPersistentStep* steps = reinterpret_cast<const LeoPersistentStep*>(
         step_buffer_addresses[lane]
     );
-    __shared__ float shared_values[LEO_GLOBAL_SORT];
-    __shared__ unsigned int shared_neurons[LEO_GLOBAL_SORT];
+    __shared__ unsigned long long shared_selection_keys[LEO_GLOBAL_SORT];
     __shared__ float shared_latent[LEO_MAX_CONTEXT_DIM];
     __shared__ float shared_reduction[512];
     leo_train_story_block(
@@ -4459,8 +4686,7 @@ extern "C" __global__ void leo_train_story_batch(
         base_ticks[lane],
         learning_trace_raw,
         strength,
-        shared_values,
-        shared_neurons,
+        shared_selection_keys,
         shared_latent,
         shared_reduction
     );
