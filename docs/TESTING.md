@@ -121,7 +121,7 @@ For a model-quality comparison, record at minimum:
 
 The CPU runtime is the reference implementation. The single-GPU CUDA path is expected to preserve the v1 learning contract within the explicit conformance thresholds used by GPU tests.
 
-Experimental multi-GPU training is different: it uses batch-end device averaging and does not claim exact single-GPU wavefront update-order equivalence.
+Multi-GPU data parallelism preserves the logical story-batch reduction: one sparse delta per original story is flattened in canonical story order and one `1 / workers` mean is applied. Multi-GPU hardware tests should compare 1-GPU and N-GPU semantic counters/loss within the existing CPU/CUDA numerical thresholds and report scaling efficiency separately. Replay remains canonical/serial, so replay-on scaling is expected to be lower than base-pass scaling until model-parallel replay is implemented.
 
 ## 8. Regression-test rule
 

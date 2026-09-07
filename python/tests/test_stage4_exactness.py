@@ -114,6 +114,32 @@ def bitonic_sort_keys(records, first_width=2):
         width <<= 1
     return records
 
+
+
+def sparse_kway_merge(block_runs, limit=None):
+    positions = [0] * len(block_runs)
+    total = sum(sum(record != 0 for record in run) for run in block_runs)
+    needed = total if limit is None else min(total, limit)
+    merged = []
+    while len(merged) < needed:
+        best_record = 0
+        best_run = None
+        for run_index, run in enumerate(block_runs):
+            position = positions[run_index]
+            if position >= len(run):
+                continue
+            record = run[position]
+            if record == 0:
+                continue
+            if best_run is None or record > best_record:
+                best_record = record
+                best_run = run_index
+        if best_run is None:
+            break
+        merged.append(best_record)
+        positions[best_run] += 1
+    return merged
+
 def stage4_exact_select(values, keep, rotation, neuron_count):
     positive = [(value, neuron) for value, neuron in values if value > 0.0]
     # Total ordering corresponding to leo_better.
@@ -193,6 +219,57 @@ class Stage4ExactnessTests(unittest.TestCase):
         self.assertIn("Exact legacy fallback for unsupported shapes", cuda)
         self.assertIn("leo_p_select_model_block(p, tick, model_block, shared_selection_keys)", cuda)
         self.assertNotIn("float* shared_values,\n    unsigned int* shared_neurons", cuda)
+
+    def test_sparse_kway_global_merge_matches_full_exact_order(self):
+        rng = random.Random(777)
+        neuron_count = 32768
+        run = 8
+        for _ in range(200):
+            rotation = rng.randrange(neuron_count)
+            block_runs = []
+            all_records = []
+            for block in range(128):
+                records = []
+                positive = rng.randrange(0, 5)
+                for local in range(positive):
+                    neuron = block * 256 + rng.randrange(256)
+                    value = f32(rng.choice((0.1, 0.2, 0.3, rng.random())))
+                    records.append(selection_record(value, neuron, rotation, neuron_count))
+                records.sort(reverse=True)
+                records.extend([0] * (run - len(records)))
+                block_runs.append(records)
+                all_records.extend(record for record in records if record)
+
+            expected = sorted(all_records, reverse=True)
+            self.assertEqual(sparse_kway_merge(block_runs), expected)
+            self.assertEqual(sparse_kway_merge(block_runs, 17), expected[:17])
+
+    def test_cuda_sparse_selection_keeps_exact_dense_fallback(self):
+        cuda = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+        for marker in (
+            "leo_compact_positive_selection_records",
+            "leo_next_power_of_two(positive)",
+            "LEO_SPARSE_GLOBAL_THRESHOLD",
+            "const bool sparse_merge",
+            "run_position[LEO_SPARSE_GLOBAL_RUNS]",
+            "Dense/rare fallback",
+            "leo_bitonic_sort_selection_records_legacy",
+        ):
+            self.assertIn(marker, cuda)
+
+        # The sparse fast path must still use the exact packed record ordering.
+        sparse = cuda.split("if (sparse_merge)", 1)[1].split("} else {", 1)[0]
+        self.assertIn("leo_selection_record(", sparse)
+        self.assertIn("record > best_record", sparse)
+
+    def test_persistent_forward_reuses_exact_exponential(self):
+        cuda = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+        forward = cuda.split("__device__ void leo_p_forward", 1)[1].split(
+            "__device__ void leo_p_learning_signals_work", 1
+        )[0]
+        self.assertEqual(forward.count("expf(logits[output] - maximum)"), 1)
+        self.assertIn("probabilities[output] = exponential", forward)
+        self.assertIn("probabilities[output] / sum", forward)
 
     def test_historical_gpu_docs_point_to_current_v1_contract(self):
         main = (ROOT / "crates/leo-cli/src/main.rs").read_text()

@@ -4,6 +4,8 @@
 #define LEO_OUTPUTS 257
 #define LEO_MAX_BLOCK_WINNERS 64
 #define LEO_GLOBAL_SORT 1024
+#define LEO_SPARSE_GLOBAL_RUNS 128
+#define LEO_SPARSE_GLOBAL_THRESHOLD 128
 #define LEO_MAX_CONTEXT_ORDER 16
 #define LEO_MAX_CONTEXT_DIM 256
 
@@ -191,6 +193,63 @@ __device__ __forceinline__ void leo_bitonic_sort_selection_records_legacy(
 
 __device__ __forceinline__ bool leo_is_power_of_two(unsigned int value) {
     return value != 0U && (value & (value - 1U)) == 0U;
+}
+
+__device__ __forceinline__ unsigned int leo_next_power_of_two(unsigned int value) {
+    if (value <= 1U) return value;
+    value -= 1U;
+    value |= value >> 1U;
+    value |= value >> 2U;
+    value |= value >> 4U;
+    value |= value >> 8U;
+    value |= value >> 16U;
+    return value + 1U;
+}
+
+// Compact one finite positive selection record per thread into the front of the
+// shared selection buffer.  Scratch begins at blockDim.x, so this helper is
+// used only when blockDim.x <= LEO_GLOBAL_SORT / 2.  The compaction order is
+// intentionally irrelevant: the exact packed-key sort immediately establishes
+// Leo's activation/tie order.
+__device__ __forceinline__ unsigned int leo_compact_positive_selection_records(
+    unsigned long long record,
+    unsigned long long* shared_records
+) {
+    const unsigned int lane = threadIdx.x;
+    const unsigned int warp_lane = lane & 31U;
+    const unsigned int warp = lane >> 5U;
+    const unsigned int warp_count = (blockDim.x + 31U) >> 5U;
+    const unsigned int active_mask = __activemask();
+    const unsigned int positive_mask = __ballot_sync(active_mask, record != 0ULL);
+
+    if (warp_lane == 0U) {
+        shared_records[blockDim.x + warp] = (unsigned long long)__popc(positive_mask);
+    }
+    __syncthreads();
+
+    if (lane == 0U) {
+        unsigned int running = 0U;
+        for (unsigned int index = 0U; index < warp_count; ++index) {
+            const unsigned int count = (unsigned int)shared_records[blockDim.x + index];
+            shared_records[blockDim.x + index] = (unsigned long long)running;
+            running += count;
+        }
+        shared_records[blockDim.x + warp_count] = (unsigned long long)running;
+    }
+    __syncthreads();
+
+    const unsigned int total = (unsigned int)shared_records[blockDim.x + warp_count];
+    if (record != 0ULL) {
+        const unsigned int prior_mask = warp_lane == 0U
+            ? 0U
+            : ((1U << warp_lane) - 1U);
+        const unsigned int position =
+            (unsigned int)shared_records[blockDim.x + warp]
+            + __popc(positive_mask & prior_mask);
+        shared_records[position] = record;
+    }
+    __syncthreads();
+    return total;
 }
 
 __device__ __forceinline__ float leo_branch_jacobian(
@@ -1436,10 +1495,16 @@ __device__ __forceinline__ void leo_p_mark_touched(
 ) {
     unsigned long long* epoch = leo_p_ptr<unsigned long long>(p, LEO_P_TOUCHED_EPOCH);
     if (atomicExch(&epoch[neuron], tag) != tag) {
+        const LeoConfig* cfg = leo_p_cptr<LeoConfig>(p, LEO_P_CONFIG);
         unsigned int* count = leo_p_ptr<unsigned int>(p, LEO_P_TOUCHED_COUNT);
         unsigned int* list = leo_p_ptr<unsigned int>(p, LEO_P_TOUCHED_LIST);
+        float* block_cutoff = leo_p_ptr<float>(p, LEO_P_BLOCK_CUTOFF);
         const unsigned int position = atomicAdd(count, 1U);
         list[position] = neuron;
+        // Before selection, block_cutoff is transient scratch initialized to 0.
+        // Marking a touched block with 1 is safe because selection overwrites the
+        // slot with the exact cutoff before any surrogate phase consumes it.
+        atomicExch(&block_cutoff[neuron / cfg->neurons_per_block], 1.0f);
     }
 }
 
@@ -1464,6 +1529,9 @@ __device__ void leo_p_start_tick(const unsigned long long* p, unsigned long long
     float* activation = leo_p_ptr<float>(p, LEO_P_ACTIVATION);
     unsigned int* touched_count = leo_p_ptr<unsigned int>(p, LEO_P_TOUCHED_COUNT);
     unsigned int* destination_count = leo_p_ptr<unsigned int>(p, LEO_P_LEARNING_DESTINATION_COUNT);
+    unsigned int* winner_neuron = leo_p_ptr<unsigned int>(p, LEO_P_BLOCK_WINNER_NEURON);
+    float* winner_value = leo_p_ptr<float>(p, LEO_P_BLOCK_WINNER_VALUE);
+    float* block_cutoff = leo_p_ptr<float>(p, LEO_P_BLOCK_CUTOFF);
     LeoStepCounters* counters = leo_p_ptr<LeoStepCounters>(p, LEO_P_COUNTERS);
     const unsigned int thread = leo_p_global_thread();
     const unsigned int stride = leo_p_global_stride();
@@ -1472,6 +1540,18 @@ __device__ void leo_p_start_tick(const unsigned long long* p, unsigned long long
     if (thread == 0U) {
         *touched_count = 0U;
         *destination_count = 0U;
+    }
+    // Clear the small block-level selection frontier once per tick. Untouched
+    // blocks can then be skipped entirely instead of evaluating/sorting 256
+    // guaranteed-zero candidates. Clearing winner slots here prevents stale
+    // candidates from a prior tick from entering global selection.
+    for (unsigned int block = thread; block < cfg->block_count; block += stride) {
+        block_cutoff[block] = 0.0f;
+    }
+    const unsigned int winner_slots = cfg->block_count * cfg->max_active_per_block;
+    for (unsigned int index = thread; index < winner_slots; index += stride) {
+        winner_neuron[index] = 0U;
+        winner_value[index] = -1.0f;
     }
     __syncthreads();
     for (unsigned int index = thread; index < old_active_count; index += stride) {
@@ -1806,6 +1886,11 @@ __device__ __forceinline__ void leo_p_select_model_block(
 ) {
     const LeoConfig* cfg = leo_p_cptr<LeoConfig>(p, LEO_P_CONFIG);
     if (model_block >= cfg->block_count) return;
+    float* block_cutoff = leo_p_ptr<float>(p, LEO_P_BLOCK_CUTOFF);
+    // start_tick clears every block to 0 and mark_touched raises this transient
+    // marker to 1. An untouched block is therefore exactly equivalent to the
+    // legacy path evaluating 256 zero candidates, with no winners/cutoff.
+    if (block_cutoff[model_block] == 0.0f) return;
     const unsigned long long tag = tick + 1ULL;
     const float* threshold = leo_p_cptr<float>(p, LEO_P_THRESHOLD);
     const float* excitability = leo_p_cptr<float>(p, LEO_P_EXCITABILITY);
@@ -1824,19 +1909,20 @@ __device__ __forceinline__ void leo_p_select_model_block(
     float* candidate_activation = leo_p_ptr<float>(p, LEO_P_CANDIDATE_ACTIVATION);
     unsigned int* winner_neuron = leo_p_ptr<unsigned int>(p, LEO_P_BLOCK_WINNER_NEURON);
     float* winner_value = leo_p_ptr<float>(p, LEO_P_BLOCK_WINNER_VALUE);
-    float* block_cutoff = leo_p_ptr<float>(p, LEO_P_BLOCK_CUTOFF);
     LeoStepCounters* counters = leo_p_ptr<LeoStepCounters>(p, LEO_P_COUNTERS);
     const unsigned int rotation = (unsigned int)(tick % (unsigned long long)cfg->neuron_count);
     const unsigned int start = model_block * cfg->neurons_per_block;
 
-    // Persistent/shared execution uses 256 threads for the production 256-neuron
-    // block.  Any power-of-two launch that covers the whole model block can use
-    // the same exact packed-key network; larger/non-power-of-two shapes retain
-    // the established serial top-k fallback below.
+    // Production uses one thread per neuron in a 256-neuron model block.  The
+    // finite fast path keeps exact packed ordering, but now compacts positive
+    // candidates and sorts only the next power-of-two that can contain them.
+    // This removes most compare/synchronization stages on Leo's sparse steps.
     const bool fast_shape = cfg->neurons_per_block <= blockDim.x
         && blockDim.x <= LEO_GLOBAL_SORT
         && leo_is_power_of_two(blockDim.x);
+    const bool compact_shape = fast_shape && blockDim.x <= (LEO_GLOBAL_SORT / 2U);
     bool saw_nonfinite = false;
+    unsigned long long lane_record = 0ULL;
 
     for (unsigned int local = threadIdx.x; local < cfg->neurons_per_block; local += blockDim.x) {
         const unsigned int neuron = start + local;
@@ -1876,28 +1962,46 @@ __device__ __forceinline__ void leo_p_select_model_block(
         }
         candidate_activation[neuron] = candidate;
         if (fast_shape) {
-            const unsigned long long record = leo_selection_record(
+            lane_record = leo_selection_record(
                 candidate, neuron, rotation, cfg->neuron_count
             );
-            shared_selection_keys[threadIdx.x] = record;
-            saw_nonfinite |= !leo_selection_record_is_finite(record);
+            if (!compact_shape) shared_selection_keys[threadIdx.x] = lane_record;
+            saw_nonfinite |= !leo_selection_record_is_finite(lane_record);
         }
     }
-    if (fast_shape && threadIdx.x >= cfg->neurons_per_block) {
+    if (fast_shape && !compact_shape && threadIdx.x >= cfg->neurons_per_block) {
         shared_selection_keys[threadIdx.x] = 0ULL;
     }
 
-    // This replaces the old candidate-computation barrier while also voting on
-    // the rare non-finite fallback condition.
+    // This is both the candidate-computation barrier and the numerical fallback
+    // vote. Non-finite values intentionally retain the established legacy path.
     const bool nonfinite = __syncthreads_or(saw_nonfinite ? 1 : 0) != 0;
 
     if (fast_shape && !nonfinite) {
-        leo_bitonic_sort_selection_keys(shared_selection_keys, blockDim.x, 2U);
+        unsigned int positive = 0U;
+        unsigned int sort_size = blockDim.x;
+        if (compact_shape) {
+            positive = leo_compact_positive_selection_records(
+                lane_record, shared_selection_keys
+            );
+            sort_size = leo_next_power_of_two(positive);
+            for (unsigned int index = positive + threadIdx.x;
+                 index < sort_size;
+                 index += blockDim.x) {
+                shared_selection_keys[index] = 0ULL;
+            }
+            __syncthreads();
+        }
+
+        if (sort_size > 1U) {
+            leo_bitonic_sort_selection_keys(shared_selection_keys, sort_size, 2U);
+        }
         if (threadIdx.x == 0U) {
             const unsigned int keep = cfg->max_active_per_block;
-            unsigned int positive = 0U;
-            while (positive < blockDim.x && shared_selection_keys[positive] != 0ULL) {
-                positive += 1U;
+            if (!compact_shape) {
+                while (positive < blockDim.x && shared_selection_keys[positive] != 0ULL) {
+                    positive += 1U;
+                }
             }
             const unsigned int winner_count = positive < keep ? positive : keep;
             const unsigned int winner_base = model_block * keep;
@@ -2002,7 +2106,6 @@ __device__ __forceinline__ void leo_p_select_model_block(
         atomicAdd(&counters->block_selected, winner_count);
     }
 }
-
 __device__ void leo_p_select_blocks(
     const unsigned long long* p,
     unsigned long long tick,
@@ -2038,69 +2141,132 @@ __device__ void leo_p_select_global(
     const bool presorted_runs = leo_is_power_of_two(run) && run <= LEO_MAX_BLOCK_WINNERS;
     bool saw_nonfinite = false;
 
-    // Block-local winners are already in exact descending order.  For a
-    // power-of-two run, reverse every odd run while loading; that is exactly the
-    // bitonic-network state after completing widths <= run, so the global merge
-    // can begin at 2*run instead of paying those barriers again.
-    for (unsigned int index = lane; index < LEO_GLOBAL_SORT; index += blockDim.x) {
-        unsigned int source = index;
-        if (index < available && presorted_runs) {
-            const unsigned int run_base = (index / run) * run;
-            const unsigned int offset = index - run_base;
-            if (((index / run) & 1U) != 0U) {
-                source = run_base + (run - 1U - offset);
-            }
-        }
-        if (source < available) {
-            const float value = block_winner_value[source];
-            const unsigned int neuron = block_winner_neuron[source];
-            const unsigned long long record = leo_selection_record(
-                value, neuron, rotation, cfg->neuron_count
-            );
-            shared_selection_keys[index] = record;
-            saw_nonfinite |= !leo_selection_record_is_finite(record);
-        } else {
-            shared_selection_keys[index] = 0ULL;
-        }
+    // The per-block selector already emits compact sorted runs.  First inspect
+    // only those runs for the rare numerical fallback condition.  On Leo's
+    // sparse production path the summed run length is usually tiny, so a k-way
+    // merge avoids constructing and synchronizing a fixed 1024-entry network.
+    for (unsigned int index = lane; index < available; index += blockDim.x) {
+        saw_nonfinite |= !isfinite(block_winner_value[index]);
     }
     const bool nonfinite = __syncthreads_or(saw_nonfinite ? 1 : 0) != 0;
+    const unsigned int sparse_total = counters->block_selected;
+    const bool sparse_merge = !nonfinite
+        && presorted_runs
+        && cfg->block_count <= LEO_SPARSE_GLOBAL_RUNS
+        && sparse_total <= LEO_SPARSE_GLOBAL_THRESHOLD;
 
-    if (nonfinite) {
-        // Undo the alternating-run load before reproducing the old full network;
-        // this keeps even pathological non-finite ordering byte-for-byte with
-        // the previous CUDA implementation.
-        if (presorted_runs) {
-            for (unsigned int index = lane; index < available; index += blockDim.x) {
-                const unsigned int run_index = index / run;
-                const unsigned int offset = index % run;
-                if ((run_index & 1U) != 0U && offset < run / 2U) {
-                    const unsigned int other = run_index * run + (run - 1U - offset);
-                    const unsigned long long value = shared_selection_keys[index];
-                    shared_selection_keys[index] = shared_selection_keys[other];
-                    shared_selection_keys[other] = value;
+    unsigned int total = 0U;
+
+    if (sparse_merge) {
+        if (lane == 0U) {
+            unsigned char run_position[LEO_SPARSE_GLOBAL_RUNS];
+            for (unsigned int index = 0U; index < cfg->block_count; ++index) {
+                run_position[index] = 0U;
+            }
+
+            const unsigned int cap = cfg->max_active_global;
+            const unsigned int needed = sparse_total > cap
+                ? cap + 1U
+                : sparse_total;
+            unsigned int produced = 0U;
+
+            while (produced < needed) {
+                unsigned long long best_record = 0ULL;
+                unsigned int best_run = 0xffffffffU;
+
+                for (unsigned int run_index = 0U;
+                     run_index < cfg->block_count;
+                     ++run_index) {
+                    const unsigned int position = (unsigned int)run_position[run_index];
+                    if (position >= run) continue;
+                    const unsigned int source = run_index * run + position;
+                    const float value = block_winner_value[source];
+                    if (value <= 0.0f) continue;
+                    const unsigned long long record = leo_selection_record(
+                        value,
+                        block_winner_neuron[source],
+                        rotation,
+                        cfg->neuron_count
+                    );
+                    if (best_run == 0xffffffffU || record > best_record) {
+                        best_record = record;
+                        best_run = run_index;
+                    }
+                }
+
+                if (best_run == 0xffffffffU) break;
+                shared_selection_keys[produced++] = best_record;
+                run_position[best_run] += 1U;
+            }
+            total = sparse_total;
+        }
+        __syncthreads();
+    } else {
+        // Dense/rare fallback: retain the established exact global bitonic
+        // network, including the non-finite comparator path.
+        bool load_nonfinite = false;
+        for (unsigned int index = lane; index < LEO_GLOBAL_SORT; index += blockDim.x) {
+            unsigned int source = index;
+            if (index < available && presorted_runs) {
+                const unsigned int run_base = (index / run) * run;
+                const unsigned int offset = index - run_base;
+                if (((index / run) & 1U) != 0U) {
+                    source = run_base + (run - 1U - offset);
                 }
             }
-            __syncthreads();
+            if (source < available) {
+                const float value = block_winner_value[source];
+                const unsigned int neuron = block_winner_neuron[source];
+                const unsigned long long record = leo_selection_record(
+                    value, neuron, rotation, cfg->neuron_count
+                );
+                shared_selection_keys[index] = record;
+                load_nonfinite |= !leo_selection_record_is_finite(record);
+            } else {
+                shared_selection_keys[index] = 0ULL;
+            }
         }
-        leo_bitonic_sort_selection_records_legacy(
-            shared_selection_keys, LEO_GLOBAL_SORT, rotation, cfg->neuron_count
-        );
-    } else {
-        const unsigned int first_width = presorted_runs && run < LEO_GLOBAL_SORT
-            ? run << 1U
-            : 2U;
-        leo_bitonic_sort_selection_keys(
-            shared_selection_keys, LEO_GLOBAL_SORT, first_width
-        );
+        const bool loaded_nonfinite = __syncthreads_or(load_nonfinite ? 1 : 0) != 0;
+
+        if (loaded_nonfinite) {
+            if (presorted_runs) {
+                for (unsigned int index = lane; index < available; index += blockDim.x) {
+                    const unsigned int run_index = index / run;
+                    const unsigned int offset = index % run;
+                    if ((run_index & 1U) != 0U && offset < run / 2U) {
+                        const unsigned int other = run_index * run + (run - 1U - offset);
+                        const unsigned long long value = shared_selection_keys[index];
+                        shared_selection_keys[index] = shared_selection_keys[other];
+                        shared_selection_keys[other] = value;
+                    }
+                }
+                __syncthreads();
+            }
+            leo_bitonic_sort_selection_records_legacy(
+                shared_selection_keys, LEO_GLOBAL_SORT, rotation, cfg->neuron_count
+            );
+        } else {
+            const unsigned int first_width = presorted_runs && run < LEO_GLOBAL_SORT
+                ? run << 1U
+                : 2U;
+            leo_bitonic_sort_selection_keys(
+                shared_selection_keys, LEO_GLOBAL_SORT, first_width
+            );
+        }
+
+        if (lane == 0U) {
+            while (total < available && total < LEO_GLOBAL_SORT
+                && leo_selection_record_value(shared_selection_keys[total]) > 0.0f) {
+                total += 1U;
+            }
+        }
+        __syncthreads();
     }
 
     if (lane == 0U) {
-        unsigned int selected = 0U;
-        while (selected < available && selected < LEO_GLOBAL_SORT
-            && leo_selection_record_value(shared_selection_keys[selected]) > 0.0f) {
-            selected += 1U;
-        }
-        const unsigned int total = selected;
+        // `total` is lane-local in the dense path and set directly above.  In
+        // the sparse path use the exact summed block winner count.
+        if (sparse_merge) total = sparse_total;
         const unsigned int cap = cfg->max_active_global;
         const unsigned int kept = total < cap ? total : cap;
         *active_count = kept;
@@ -2132,7 +2298,6 @@ __device__ void leo_p_select_global(
         }
     }
 }
-
 __device__ void leo_p_cache_surrogate_work(const unsigned long long* p, unsigned long long tick,
     unsigned int thread,
     unsigned int stride
@@ -2393,11 +2558,23 @@ __device__ __forceinline__ void leo_p_post_and_emit_work(
         const unsigned int ring_position = bucket * cfg->max_active_global + index;
         ring_source[ring_position] = neuron;
         ring_activation[ring_position] = value;
-        const unsigned long long ring_base = (unsigned long long)ring_position * cfg->synapses_per_neuron;
-        const unsigned long long source_base = (unsigned long long)neuron * cfg->synapses_per_neuron;
-        for (unsigned int local = 0U; local < cfg->synapses_per_neuron; ++local) {
-            ring_weight[ring_base + local] = recurrent_weight[source_base + local];
-        }
+    }
+
+    // Snapshot delayed recurrent weights as one flat sparse worklist instead of
+    // assigning all synapses of an active neuron to a single thread.  The
+    // copied values and slot order are identical; only CUDA work distribution
+    // changes, which is especially important when ~10-20 neurons are active.
+    const unsigned int weight_work = count * cfg->synapses_per_neuron;
+    for (unsigned int edge = thread; edge < weight_work; edge += stride) {
+        const unsigned int active_index = edge / cfg->synapses_per_neuron;
+        const unsigned int local = edge - active_index * cfg->synapses_per_neuron;
+        const unsigned int neuron = active[active_index];
+        const unsigned int ring_position = bucket * cfg->max_active_global + active_index;
+        const unsigned long long ring_slot =
+            (unsigned long long)ring_position * cfg->synapses_per_neuron + local;
+        const unsigned long long source_slot =
+            (unsigned long long)neuron * cfg->synapses_per_neuron + local;
+        ring_weight[ring_slot] = recurrent_weight[source_slot];
     }
 }
 
@@ -2478,7 +2655,16 @@ __device__ void leo_p_forward(
     }
     const float maximum = reduction[0];
     for (unsigned int output = lane; output < 512U; output += blockDim.x) {
-        reduction[output] = output < LEO_OUTPUTS ? expf(logits[output] - maximum) : 0.0f;
+        if (output < LEO_OUTPUTS) {
+            const float exponential = expf(logits[output] - maximum);
+            // `probabilities` is not consumed until after the sum reduction, so
+            // retain the exact FP32 exponential here instead of evaluating
+            // expf a second time for normalization.
+            probabilities[output] = exponential;
+            reduction[output] = exponential;
+        } else {
+            reduction[output] = 0.0f;
+        }
     }
     __syncthreads();
     if (lane < 256U) reduction[lane] += reduction[lane + 256U];
@@ -2490,7 +2676,9 @@ __device__ void leo_p_forward(
     const float sum = reduction[0];
     for (unsigned int output = lane; output < LEO_OUTPUTS; output += blockDim.x) {
         const bool valid = sum == sum && sum > 0.0f && sum < 3.402823466e+38F;
-        const float probability = valid ? expf(logits[output] - maximum) / sum : 1.0f / (float)LEO_OUTPUTS;
+        const float probability = valid
+            ? probabilities[output] / sum
+            : 1.0f / (float)LEO_OUTPUTS;
         probabilities[output] = probability;
         errors[output] = target_index >= 0 ? probability - (output == (unsigned int)target_index ? 1.0f : 0.0f) : 0.0f;
     }

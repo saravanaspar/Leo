@@ -13,14 +13,11 @@ use super::resume::{
 use super::validation::{
     evaluate_model, meaningful_improvement, print_prediction_evaluation, update_best_validation,
 };
-use super::TrainingEngine;
+use super::{configured_multi_gpu_devices, TrainingEngine};
 use crate::json_escape;
 use leo_core::semantics::{EXECUTION_SEMANTICS_NAME, LEO_RELEASE_VERSION, TRAINING_POLICY_NAME};
-use leo_core::{
-    available_gpu_devices, BackendKind, BackendRuntime, LeoError, LeoResult, Permission,
-};
+use leo_core::{BackendKind, BackendRuntime, LeoError, LeoResult, Permission};
 use leo_format::load_model;
-use std::env;
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug)]
@@ -62,15 +59,7 @@ pub(crate) fn run_training(request: TrainRequest<'_>) -> LeoResult<()> {
         .workers
         .unwrap_or_else(|| if backend == BackendKind::Gpu { 64 } else { 1 });
     let max_training_bytes = request.max_training_bytes;
-    let multi_gpu_requested = backend == BackendKind::Gpu
-        && env::var("LEO_MULTI_GPU")
-            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-    let multi_gpu_devices = if multi_gpu_requested {
-        available_gpu_devices().unwrap_or(1).min(workers).max(1)
-    } else {
-        1
-    };
+    let multi_gpu_devices = configured_multi_gpu_devices(backend, workers.min(story_limit.max(1)))?;
     let multi_gpu_enabled = multi_gpu_devices > 1;
     if passes == 0 || story_limit == 0 || workers == 0 || max_training_bytes == Some(0) {
         return Err(LeoError::usage(
@@ -94,7 +83,7 @@ pub(crate) fn run_training(request: TrainRequest<'_>) -> LeoResult<()> {
     let mut stopped_by_byte_limit = false;
 
     let synchronization = if multi_gpu_enabled {
-        "gpu_multi_device_batch_mean_experimental"
+        "gpu_multi_device_story_mean_exact"
     } else if backend == BackendKind::Gpu && workers > 1 {
         "gpu_shared_wavefront_mean"
     } else {
@@ -183,7 +172,7 @@ pub(crate) fn run_training(request: TrainRequest<'_>) -> LeoResult<()> {
     }
 
     println!(
-        "{{\"event\":\"training_start\",\"leo_version\":\"{}\",\"training_policy\":\"{}\",\"execution_semantics\":\"{}\",\"dataset_id\":\"{}\",\"requested_backend\":\"{}\",\"backend\":\"{}\",\"passes\":{},\"stories_per_pass\":{},\"workers\":{},\"synchronization\":\"{}\",\"gpu_devices\":{},\"multi_gpu_experimental\":{},\"architecture\":\"fixed_sparse_recurrent_latent_context\",\"gpu_native_story_batch\":{},\"context_embedding_dim\":{},\"context_dropout_rate\":{},\"end_document_weight\":{},\"replay_fraction\":{},\"replay_segment_targets\":{}}}",
+        "{{\"event\":\"training_start\",\"leo_version\":\"{}\",\"training_policy\":\"{}\",\"execution_semantics\":\"{}\",\"dataset_id\":\"{}\",\"requested_backend\":\"{}\",\"backend\":\"{}\",\"passes\":{},\"stories_per_pass\":{},\"workers\":{},\"synchronization\":\"{}\",\"gpu_devices\":{},\"multi_gpu_experimental\":{},\"multi_gpu_exact_data_parallel\":{},\"architecture\":\"fixed_sparse_recurrent_latent_context\",\"gpu_native_story_batch\":{},\"context_embedding_dim\":{},\"context_dropout_rate\":{},\"end_document_weight\":{},\"replay_fraction\":{},\"replay_segment_targets\":{}}}",
         LEO_RELEASE_VERSION,
         TRAINING_POLICY_NAME,
         EXECUTION_SEMANTICS_NAME,
@@ -195,6 +184,7 @@ pub(crate) fn run_training(request: TrainRequest<'_>) -> LeoResult<()> {
         workers,
         synchronization,
         multi_gpu_devices,
+        multi_gpu_enabled,
         multi_gpu_enabled,
         backend == BackendKind::Gpu && workers > 1,
         runtime.model().config.context.embedding_dim,
@@ -213,7 +203,7 @@ pub(crate) fn run_training(request: TrainRequest<'_>) -> LeoResult<()> {
 
     if multi_gpu_enabled {
         eprintln!(
-            "{{\"event\":\"multi_gpu_training_warning\",\"devices\":{},\"semantics\":\"batch_end_device_mean\",\"exact_single_gpu_wavefront_equivalence\":false}}",
+            "{{\"event\":\"multi_gpu_training\",\"devices\":{},\"semantics\":\"flat_story_delta_mean\",\"exact_logical_batch_mean\":true,\"replay_parallel\":false}}",
             multi_gpu_devices,
         );
     }

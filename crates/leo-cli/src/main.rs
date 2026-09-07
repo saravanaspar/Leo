@@ -19,9 +19,9 @@ use training::{
     advance_checkpoint_deadline, read_story_batch, shuffled_story_order, TrainingResumeState,
 };
 use training::{
-    evaluate_model, open_dataset, print_learning_quality, print_prediction_evaluation,
-    replay_target_range, run_training, train_document_pass, train_story_batch, ActivityDiagnostics,
-    StoryBatchPrefetcher, TrainRequest,
+    configured_multi_gpu_devices, evaluate_model, open_dataset, print_learning_quality,
+    print_prediction_evaluation, replay_target_range, run_training, train_document_pass,
+    train_story_batch, ActivityDiagnostics, StoryBatchPrefetcher, TrainRequest, TrainingEngine,
 };
 
 fn main() {
@@ -674,6 +674,10 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
         let story_limit = requested_stories
             .unwrap_or(dataset.len())
             .min(dataset.len());
+        let effective_workers = workers.min(story_limit.max(1));
+        let multi_gpu_devices =
+            configured_multi_gpu_devices(runtime.resolved_backend(), effective_workers)?;
+        let mut training_engine = TrainingEngine::new(runtime.model(), multi_gpu_devices)?;
         let max_input_bytes = arguments.optional_u64("max-bytes")?;
         if max_input_bytes == Some(0) {
             return Err(LeoError::internal(
@@ -707,7 +711,8 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
                 prefetcher.request(next_position, workers, remaining_bytes)?;
             }
             input_bytes = next_input_bytes;
-            let report = train_story_batch(&mut runtime, stories, Permission::Training)?;
+            let report =
+                training_engine.train_batch(&mut runtime, stories, Permission::Training)?;
             weighted_loss += report.mean_loss * report.targets as f64;
             targets = targets.saturating_add(report.targets as u64);
             replay_segments = replay_segments.saturating_add(report.replay_segments);
@@ -728,13 +733,14 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
         let projected_input_bytes = 2_000_000_000f64;
         let projected_seconds = elapsed / input_bytes.max(1) as f64 * projected_input_bytes;
         println!(
-            "{{\"event\":\"training_benchmark\",\"model\":\"{}\",\"neurons\":{},\"fixed_synapses\":{},\"context_slots\":{},\"context_embedding_dim\":{},\"workers\":{},\"stories\":{},\"input_bytes\":{},\"training_steps\":{},\"base_training_targets\":{},\"replay_fraction\":{},\"replay_segments\":{},\"replay_steps\":{},\"replay_prefix_steps\":{},\"replay_execution_steps\":{},\"replay_step_fraction\":{},\"replay_prefix_step_fraction\":{},\"execution_steps_with_prefix\":{},\"seconds\":{},\"input_bytes_per_second\":{},\"steps_per_second\":{},\"execution_steps_per_second\":{},\"mean_loss\":{},\"bits_per_byte\":{},\"active_fraction\":{},\"recurrent_events_per_step\":{},\"context_cells_per_step\":{},\"context_probes_per_step\":{},\"output_madds_per_step\":{},\"projected_seconds_1gb_2_epochs\":{},\"projected_days_1gb_2_epochs\":{}}}",
+            "{{\"event\":\"training_benchmark\",\"model\":\"{}\",\"neurons\":{},\"fixed_synapses\":{},\"context_slots\":{},\"context_embedding_dim\":{},\"workers\":{},\"gpu_devices\":{},\"stories\":{},\"input_bytes\":{},\"training_steps\":{},\"base_training_targets\":{},\"replay_fraction\":{},\"replay_segments\":{},\"replay_steps\":{},\"replay_prefix_steps\":{},\"replay_execution_steps\":{},\"replay_step_fraction\":{},\"replay_prefix_step_fraction\":{},\"execution_steps_with_prefix\":{},\"seconds\":{},\"input_bytes_per_second\":{},\"steps_per_second\":{},\"execution_steps_per_second\":{},\"mean_loss\":{},\"bits_per_byte\":{},\"active_fraction\":{},\"recurrent_events_per_step\":{},\"context_cells_per_step\":{},\"context_probes_per_step\":{},\"output_madds_per_step\":{},\"projected_seconds_1gb_2_epochs\":{},\"projected_days_1gb_2_epochs\":{}}}",
             json_escape(&runtime.model().config.model.name),
             runtime.model().neuron_count(),
             runtime.model().recurrent.weight.len(),
             runtime.model().context.keys.len(),
             runtime.model().config.context.embedding_dim,
-            workers.min(story_limit.max(1)),
+            effective_workers,
+            multi_gpu_devices,
             position,
             input_bytes,
             activity.steps,

@@ -15,8 +15,8 @@ pub(crate) use validation::{evaluate_model, print_learning_quality, print_predic
 
 use leo_core::symbols::{BEGIN_DOCUMENT, END_DOCUMENT};
 use leo_core::{
-    apply_mean_deltas, merged_parameter_changes, BackendKind, BackendRuntime,
-    DeviceStoryBatchReport, LeoError, LeoResult, MergeMetrics, Model, ParameterChanges, Permission,
+    apply_mean_deltas, available_gpu_devices, merged_parameter_changes, BackendKind,
+    BackendRuntime, LeoError, LeoResult, MergeMetrics, Model, ParameterChanges, Permission,
     SparseModelDelta, StepMetrics,
 };
 use std::sync::{Arc, OnceLock};
@@ -301,6 +301,29 @@ pub(crate) struct BatchTrainingReport {
 /// Deep training boundary used by the CLI. It owns execution coordination;
 /// the canonical `BackendRuntime` remains explicit because checkpointing and
 /// evaluation synchronize against that same model owner.
+pub(crate) fn configured_multi_gpu_devices(
+    backend: BackendKind,
+    workers: usize,
+) -> LeoResult<usize> {
+    if backend != BackendKind::Gpu || workers == 0 {
+        return Ok(1);
+    }
+    let requested = std::env::var("LEO_MULTI_GPU")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !requested || workers == 1 {
+        return Ok(1);
+    }
+
+    let visible = available_gpu_devices()?;
+    if visible < 2 {
+        return Err(LeoError::backend(
+            "LEO_MULTI_GPU requested, but fewer than two CUDA devices are visible",
+        ));
+    }
+    Ok(visible.min(workers))
+}
+
 pub(crate) struct TrainingEngine {
     multi_gpu: Option<MultiGpuBatchTrainer>,
 }
@@ -328,11 +351,85 @@ impl TrainingEngine {
     }
 }
 
-// Multi-GPU replicas remain resident on their CUDA devices. After each
-// independent device shard completes, only the parameter rows/context slots
-// touched by the merged batch are pushed back to each replica.
+// Multi-GPU replicas remain resident on their CUDA devices. Each device owns a
+// contiguous subset of the logical story workers, but the canonical reducer
+// always receives one delta per original story in original story order. This is
+// Leo's data-parallel axis: device placement changes execution only; workers,
+// denominator, and the canonical mean barrier do not change.
 struct MultiGpuBatchTrainer {
-    runtimes: Vec<BackendRuntime>,
+    // Device 0 is the existing canonical CUDA runtime. Only devices 1..N-1
+    // need extra full-model replicas, so a model that fits on one GPU does not
+    // require two copies on GPU 0 merely to enable data parallelism.
+    replicas: Vec<BackendRuntime>,
+    device_count: usize,
+}
+
+struct MultiGpuShardResult {
+    story_start: usize,
+    story_losses: Vec<Vec<f32>>,
+    activity: ActivityDiagnostics,
+    story_deltas: Vec<SparseModelDelta>,
+    story_changes: Vec<ParameterChanges>,
+}
+
+fn balanced_story_range(total: usize, shards: usize, shard_index: usize) -> std::ops::Range<usize> {
+    let base = total / shards;
+    let extra = total % shards;
+    let start = shard_index * base + shard_index.min(extra);
+    let len = base + usize::from(shard_index < extra);
+    start..start + len
+}
+
+fn aggregate_device_story_metrics(
+    story_metrics: Vec<Vec<StepMetrics>>,
+) -> (Vec<Vec<f32>>, ActivityDiagnostics) {
+    let mut story_losses = Vec::with_capacity(story_metrics.len());
+    let mut activity = ActivityDiagnostics::default();
+
+    for metrics_for_story in story_metrics {
+        let mut losses = Vec::with_capacity(metrics_for_story.len());
+        for metrics in metrics_for_story {
+            if let Some(loss) = metrics.loss {
+                losses.push(loss);
+            }
+            activity.record(metrics);
+        }
+        story_losses.push(losses);
+    }
+
+    (story_losses, activity)
+}
+
+fn run_multi_gpu_shard(
+    worker: &mut BackendRuntime,
+    shard: &[Vec<u8>],
+    story_start: usize,
+    permission: Permission,
+) -> LeoResult<MultiGpuShardResult> {
+    let report = worker
+        .training_story_batch_deltas(shard, permission)?
+        .ok_or_else(|| {
+            LeoError::internal("multi-GPU shard did not enter GPU-native story batching")
+        })?;
+
+    if report.story_deltas.len() != shard.len()
+        || report.story_changes.len() != shard.len()
+        || report.story_metrics.len() != shard.len()
+    {
+        return Err(LeoError::internal(
+            "multi-GPU device shard did not return one result per logical story",
+        ));
+    }
+
+    let (story_losses, activity) = aggregate_device_story_metrics(report.story_metrics);
+
+    Ok(MultiGpuShardResult {
+        story_start,
+        story_losses,
+        activity,
+        story_deltas: report.story_deltas,
+        story_changes: report.story_changes,
+    })
 }
 
 impl MultiGpuBatchTrainer {
@@ -343,15 +440,22 @@ impl MultiGpuBatchTrainer {
             ));
         }
 
-        let mut runtimes = Vec::with_capacity(device_count);
-        for device_index in 0..device_count {
-            runtimes.push(BackendRuntime::new_gpu_on_device(
+        // The caller's canonical runtime already owns visible CUDA device 0.
+        // Allocate replicas only on the remaining devices. This keeps the DDP
+        // memory rule intuitive: the model must fit once on every participating
+        // GPU; device 0 is not penalized with a second complete copy.
+        let mut replicas = Vec::with_capacity(device_count.saturating_sub(1));
+        for device_index in 1..device_count {
+            replicas.push(BackendRuntime::new_gpu_on_device(
                 model.clone(),
                 device_index,
             )?);
         }
 
-        Ok(Self { runtimes })
+        Ok(Self {
+            replicas,
+            device_count,
+        })
     }
 
     fn train_story_batch(
@@ -360,70 +464,52 @@ impl MultiGpuBatchTrainer {
         stories: Vec<Vec<u8>>,
         permission: Permission,
     ) -> LeoResult<BatchTrainingReport> {
-        let device_count = self.runtimes.len().min(stories.len());
-
-        if device_count < 2 || stories.len() % device_count != 0 || stories.len() / device_count < 2
-        {
+        let device_count = self.device_count.min(stories.len());
+        if device_count < 2 {
             return train_story_batch(canonical, stories, permission);
         }
+        let replica_count = device_count - 1;
 
         canonical.synchronize_model()?;
-        let base = Arc::new(canonical.model().clone());
+        let base_revision = canonical.model().parameter_revision;
+        let base_model = canonical.model().clone();
 
-        // Normally these replicas already equal the canonical model because
-        // sparse synchronization happened at the end of the previous batch.
-        //
-        // If an out-of-band operation changed the canonical revision, do one
-        // full repair upload for correctness.
-        for worker in &mut self.runtimes[..device_count] {
-            if worker.model().parameter_revision != base.parameter_revision {
-                *worker.model_mut()? = base.as_ref().clone();
+        // Device 0 is the canonical runtime and participates directly in the
+        // initial story pass. The retained-delta CUDA path leaves its canonical
+        // parameters unchanged until the flat cross-device mean below.
+        canonical.reset_transient_state()?;
+
+        // Normally secondary replicas already equal canonical because sparse
+        // synchronization happens at the end of every logical batch. Repair a
+        // replica fully only after an out-of-band canonical revision change.
+        for worker in &mut self.replicas[..replica_count] {
+            if worker.model().parameter_revision != base_revision {
+                *worker.model_mut()? = base_model.clone();
             }
-
             worker.reset_transient_state()?;
-            worker.enable_parameter_tracking();
         }
-
-        let stories_per_device = stories.len() / device_count;
 
         let results = thread::scope(|scope| {
             let mut handles = Vec::with_capacity(device_count);
 
-            for (worker, shard) in self.runtimes[..device_count]
-                .iter_mut()
-                .zip(stories.chunks_exact(stories_per_device))
-            {
-                let base = Arc::clone(&base);
+            let range = balanced_story_range(stories.len(), device_count, 0);
+            let shard = &stories[range.clone()];
+            let canonical_worker: &mut BackendRuntime = &mut *canonical;
+            handles.push(scope.spawn(move || {
+                run_multi_gpu_shard(canonical_worker, shard, range.start, permission)
+            }));
 
-                handles.push(scope.spawn(
-                    move || -> LeoResult<(
-                        SparseModelDelta,
-                        ParameterChanges,
-                        DeviceStoryBatchReport,
-                    )> {
-                        let report = worker
-                            .training_story_batch(shard, permission)?
-                            .ok_or_else(|| {
-                                LeoError::internal(
-                                    "multi-GPU shard did not enter GPU-native story batching",
-                                )
-                            })?;
-
-                        let changes = worker.parameter_changes()?;
-
-                        let delta = SparseModelDelta::between_tracked(
-                            base.as_ref(),
-                            worker.model(),
-                            &changes,
-                        )?;
-
-                        Ok((delta, changes, report))
-                    },
-                ));
+            for (replica_index, worker) in self.replicas[..replica_count].iter_mut().enumerate() {
+                let device_index = replica_index + 1;
+                let range = balanced_story_range(stories.len(), device_count, device_index);
+                let shard = &stories[range.clone()];
+                handles
+                    .push(scope.spawn(move || {
+                        run_multi_gpu_shard(worker, shard, range.start, permission)
+                    }));
             }
 
             let mut results = Vec::with_capacity(device_count);
-
             for handle in handles {
                 results.push(
                     handle
@@ -431,75 +517,100 @@ impl MultiGpuBatchTrainer {
                         .map_err(|_| LeoError::internal("multi-GPU training worker panicked"))??,
                 );
             }
-
             Ok::<_, LeoError>(results)
         })?;
 
-        let deltas = results
-            .iter()
-            .map(|(delta, _, _)| delta.clone())
-            .collect::<Vec<_>>();
+        // Thread handles are joined in device order, but sort explicitly by
+        // canonical story position so future placement policies cannot change
+        // FP32 reduction order accidentally.
+        let mut results = results;
+        results.sort_by_key(|result| result.story_start);
 
-        let raw_changes = results
-            .iter()
-            .map(|(_, changes, _)| changes.clone())
-            .collect::<Vec<_>>();
+        let mut deltas = Vec::with_capacity(stories.len());
+        let mut raw_changes = Vec::with_capacity(stories.len());
+        let mut losses_by_story = Vec::with_capacity(stories.len());
+        let mut activity = ActivityDiagnostics::default();
+        let mut min_stories_per_device = usize::MAX;
+        let mut max_stories_per_device = 0usize;
+
+        for result in results {
+            let shard_story_count = result.story_deltas.len();
+            min_stories_per_device = min_stories_per_device.min(shard_story_count);
+            max_stories_per_device = max_stories_per_device.max(shard_story_count);
+            deltas.extend(result.story_deltas);
+            raw_changes.extend(result.story_changes);
+            losses_by_story.extend(result.story_losses);
+            activity.add(result.activity);
+        }
+
+        if deltas.len() != stories.len()
+            || raw_changes.len() != stories.len()
+            || losses_by_story.len() != stories.len()
+        {
+            return Err(LeoError::internal(
+                "multi-GPU flattened logical batch does not match story count",
+            ));
+        }
+
+        // Aggregate loss in canonical story/target order after flattening so
+        // device partitioning cannot change reporting reduction order.
+        let mut loss_sum = 0.0f64;
+        let mut targets = 0usize;
+        for losses in &losses_by_story {
+            for &loss in losses {
+                loss_sum += loss as f64;
+                targets = targets.saturating_add(1);
+            }
+        }
 
         // ----------------------------------------------------
-        // CPU canonical merge
+        // One flat canonical mean across the original logical workers.
         // ----------------------------------------------------
-
         let merge_started = Instant::now();
-
         let (merged, sync_changes) = {
             let model = canonical.model_mut()?;
-
             let merged = apply_mean_deltas(model, &deltas)?;
-
             let sync_changes = merged_parameter_changes(model, &deltas, &raw_changes)?;
-
             (merged, sync_changes)
         };
 
+        // `model_mut` deliberately marks a CUDA host mirror dirty. Because GPU
+        // 0 already contains the old canonical image, upload only the sparse
+        // rows changed by the flat mean instead of paying a full-model H2D copy
+        // before replay. CPU/reference backends treat this as a no-op.
+        canonical.commit_sparse_host_model(&sync_changes)?;
+        canonical.reset_transient_state()?;
         let merge_seconds = merge_started.elapsed().as_secs_f64();
 
-        canonical.reset_transient_state()?;
-
         // ----------------------------------------------------
-        // Sparse canonical -> GPU replica synchronization
-        //
-        // Runs simultaneously for GPU 0 and GPU 1.
+        // Sparse canonical -> secondary GPU replicas, concurrently. Device 0
+        // is already current from commit_sparse_host_model above.
         // ----------------------------------------------------
-
         let sync_started = Instant::now();
-
         let canonical_model = canonical.model();
-
         thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(device_count);
-
-            for worker in &mut self.runtimes[..device_count] {
+            let mut handles = Vec::with_capacity(replica_count);
+            for worker in &mut self.replicas[..replica_count] {
                 let changes = &sync_changes;
-
                 handles.push(
                     scope.spawn(move || worker.synchronize_sparse_model(canonical_model, changes)),
                 );
             }
-
             for handle in handles {
                 handle.join().map_err(|_| {
                     LeoError::internal("multi-GPU sparse synchronization worker panicked")
                 })??;
             }
-
             Ok::<_, LeoError>(())
         })?;
-
         let sync_seconds = sync_started.elapsed().as_secs_f64();
 
         eprintln!(
-            "{{\"event\":\"multi_gpu_sparse_sync\",\"devices\":{},\"threshold\":{},\"recurrent\":{},\"input\":{},\"output_neurons\":{},\"context_slots\":{},\"output_bias\":{},\"context_output\":{},\"merge_ms\":{:.3},\"replica_sync_ms\":{:.3}}}",
+            "{{\"event\":\"multi_gpu_sparse_sync\",\"devices\":{},\"logical_stories\":{},\"stories_per_device_min\":{},\"stories_per_device_max\":{},\"exact_flat_story_mean\":true,\"canonical_device0_reused\":true,\"threshold\":{},\"recurrent\":{},\"input\":{},\"output_neurons\":{},\"context_slots\":{},\"output_bias\":{},\"context_output\":{},\"merge_ms\":{:.3},\"replica_sync_ms\":{:.3}}}",
             device_count,
+            stories.len(),
+            min_stories_per_device,
+            max_stories_per_device,
             sync_changes.threshold.len(),
             sync_changes.recurrent_weight.len(),
             sync_changes.input_weight.len(),
@@ -511,36 +622,11 @@ impl MultiGpuBatchTrainer {
             sync_seconds * 1000.0,
         );
 
-        // ----------------------------------------------------
-        // Combine initial-pass metrics, then apply the same replay policy on
-        // the canonical backend regardless of how many GPUs produced the
-        // initial deltas. Backend selection changes execution, not learning.
-        // ----------------------------------------------------
-
-        let mut activity = ActivityDiagnostics::default();
-        let mut loss_sum = 0.0f64;
-        let mut targets = 0usize;
-        let mut story_count = 0usize;
-        let mut losses_by_story = Vec::with_capacity(stories.len());
-
-        for (_, _, report) in results {
-            for story_metrics in report.story_metrics {
-                story_count = story_count.saturating_add(1);
-                let mut losses = Vec::with_capacity(story_metrics.len());
-
-                for metrics in story_metrics {
-                    if let Some(loss) = metrics.loss {
-                        losses.push(loss);
-                        loss_sum += loss as f64;
-                        targets = targets.saturating_add(1);
-                    }
-
-                    activity.record(metrics);
-                }
-                losses_by_story.push(losses);
-            }
-        }
-
+        // Replay stays in canonical story/range order. Until a true device-side
+        // model-parallel replay executor exists, moving it across devices would
+        // either alter parameter visibility or add a host/device barrier per
+        // replay step. Preserve learning semantics and synchronize the resulting
+        // sparse changes back to secondary data-parallel replicas afterward.
         canonical.enable_parameter_tracking();
         let replay = apply_batch_replay_policy(canonical, &stories, &losses_by_story, permission)?;
         activity.add(replay.activity);
@@ -549,8 +635,8 @@ impl MultiGpuBatchTrainer {
             let replay_changes = canonical.parameter_changes()?;
             let canonical_model = canonical.model();
             thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(device_count);
-                for worker in &mut self.runtimes[..device_count] {
+                let mut handles = Vec::with_capacity(replica_count);
+                for worker in &mut self.replicas[..replica_count] {
                     let changes = &replay_changes;
                     handles.push(
                         scope.spawn(move || {
@@ -570,20 +656,19 @@ impl MultiGpuBatchTrainer {
         Ok(BatchTrainingReport {
             mean_loss: loss_sum / targets.max(1) as f64,
             targets,
-            stories: story_count,
+            stories: stories.len(),
             activity,
             replay_segments: replay.replay_segments,
             replay_steps: replay.replay_steps,
             replay_prefix_steps: replay.prefix_steps,
             merge: MergeMetrics {
-                workers: story_count,
+                workers: stories.len(),
                 fixed_parameter_updates: merged.fixed_parameter_updates,
                 context_keys: merged.context_keys,
             },
         })
     }
 }
-
 fn apply_batch_replay_policy(
     runtime: &mut BackendRuntime,
     stories: &[Vec<u8>],
@@ -986,4 +1071,49 @@ fn replay_target_range_impl(
         target_steps,
         timing,
     })
+}
+
+#[cfg(test)]
+mod multi_gpu_partition_tests {
+    use super::balanced_story_range;
+
+    #[test]
+    fn balanced_story_ranges_cover_logical_batch_in_order() {
+        for total in 2usize..=16 {
+            for shards in 2usize..=total {
+                let ranges = (0..shards)
+                    .map(|index| balanced_story_range(total, shards, index))
+                    .collect::<Vec<_>>();
+                assert_eq!(ranges.first().expect("range").start, 0);
+                assert_eq!(ranges.last().expect("range").end, total);
+                for pair in ranges.windows(2) {
+                    assert_eq!(pair[0].end, pair[1].start);
+                }
+                let lengths = ranges.iter().map(|range| range.len()).collect::<Vec<_>>();
+                let min = *lengths.iter().min().expect("length");
+                let max = *lengths.iter().max().expect("length");
+                assert!(max - min <= 1);
+                assert_eq!(lengths.iter().sum::<usize>(), total);
+            }
+        }
+    }
+
+    #[test]
+    fn sixteen_devices_can_own_one_story_each() {
+        let ranges = (0..16)
+            .map(|index| balanced_story_range(16, 16, index))
+            .collect::<Vec<_>>();
+        assert!(ranges.iter().all(|range| range.len() == 1));
+        for (story, range) in ranges.iter().enumerate() {
+            assert_eq!(range.clone(), story..story + 1);
+        }
+    }
+
+    #[test]
+    fn uneven_device_count_preserves_story_order() {
+        let ranges = (0..3)
+            .map(|index| balanced_story_range(16, 3, index))
+            .collect::<Vec<_>>();
+        assert_eq!(ranges, vec![0..6, 6..11, 11..16]);
+    }
 }
