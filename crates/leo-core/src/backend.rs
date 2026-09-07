@@ -5,7 +5,7 @@
 //! with persistent model and transient recurrent/eligibility state on device.
 //! Both executors use the same serialized checkpoint representation.
 
-use crate::parallel::MergeMetrics;
+use crate::parallel::{MergeMetrics, SparseModelDelta};
 use crate::runtime::ParameterChanges;
 use crate::{LeoError, LeoResult, Model, Permission, Runtime, StepMetrics};
 use std::fmt::{Display, Formatter};
@@ -293,6 +293,17 @@ pub struct DeviceStoryBatchReport {
     pub merge: MergeMetrics,
 }
 
+/// GPU-native logical-story results retained before the device-local mean.
+/// Multi-device data parallelism uses this additive interface to flatten every
+/// story delta back into canonical worker order and apply one exact mean.
+#[derive(Debug)]
+pub struct DeviceStoryBatchDeltaReport {
+    pub story_metrics: Vec<Vec<StepMetrics>>,
+    pub merge: MergeMetrics,
+    pub story_deltas: Vec<SparseModelDelta>,
+    pub story_changes: Vec<ParameterChanges>,
+}
+
 pub trait RuntimeBackend: Send {
     fn backend_kind(&self) -> BackendKind;
     fn capabilities(&self) -> BackendCapabilities;
@@ -309,6 +320,13 @@ pub trait RuntimeBackend: Send {
         _changes: &ParameterChanges,
     ) -> LeoResult<()> {
         *self.model_mut()? = canonical.clone();
+        Ok(())
+    }
+
+    /// Commit sparse values from this backend's already-updated host model to
+    /// its resident device image. CPU/reference backends need no action because
+    /// their host model is the executor state.
+    fn commit_sparse_host_model(&mut self, _changes: &ParameterChanges) -> LeoResult<()> {
         Ok(())
     }
     fn probabilities(&self) -> &[f32];
@@ -354,6 +372,17 @@ pub trait RuntimeBackend: Send {
         _stories: &[Vec<u8>],
         _permission: Permission,
     ) -> LeoResult<Option<DeviceStoryBatchReport>> {
+        Ok(None)
+    }
+
+    /// Optional GPU-native whole-story batch execution that retains each
+    /// private story delta instead of exposing only the device-local mean.
+    /// The default keeps third-party/runtime implementations source-compatible.
+    fn training_story_batch_deltas(
+        &mut self,
+        _stories: &[Vec<u8>],
+        _permission: Permission,
+    ) -> LeoResult<Option<DeviceStoryBatchDeltaReport>> {
         Ok(None)
     }
 }
@@ -461,6 +490,37 @@ impl GpuRuntime {
             shared_batch_lanes: Vec::new(),
         })
     }
+
+    fn run_story_batch_cuda(
+        &mut self,
+        stories: &[Vec<u8>],
+        permission: Permission,
+        retain_story_deltas: bool,
+    ) -> LeoResult<Option<crate::cuda::CudaStoryBatchReport>> {
+        if stories.is_empty() || (stories.len() < 2 && !retain_story_deltas) {
+            return Ok(None);
+        }
+        if stories.len() > crate::cuda::GPU_STORY_BATCH_MAX_LANES {
+            return Err(LeoError::backend(format!(
+                "GPU-native story batching supports at most {} stories per batch; got {}",
+                crate::cuda::GPU_STORY_BATCH_MAX_LANES,
+                stories.len()
+            )));
+        }
+
+        while self.shared_batch_lanes.len() < stories.len() {
+            let lane = self.runtime.allocate_shared_batch_lane()?;
+            self.shared_batch_lanes.push(lane);
+        }
+        crate::cuda::train_story_batch_shared_device(
+            &mut self.runtime,
+            &mut self.shared_batch_lanes[..stories.len()],
+            stories,
+            permission,
+            retain_story_deltas,
+        )
+        .map(Some)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -514,6 +574,10 @@ impl RuntimeBackend for GpuRuntime {
         self.runtime.synchronize_sparse_model(canonical, changes)
     }
 
+    fn commit_sparse_host_model(&mut self, changes: &ParameterChanges) -> LeoResult<()> {
+        self.runtime.upload_current_sparse_model(changes)
+    }
+
     fn probabilities(&self) -> &[f32] {
         self.runtime.probabilities()
     }
@@ -564,30 +628,28 @@ impl RuntimeBackend for GpuRuntime {
         stories: &[Vec<u8>],
         permission: Permission,
     ) -> LeoResult<Option<DeviceStoryBatchReport>> {
-        if stories.len() < 2 {
+        let Some(report) = self.run_story_batch_cuda(stories, permission, false)? else {
             return Ok(None);
-        }
-        if stories.len() > crate::cuda::GPU_STORY_BATCH_MAX_LANES {
-            return Err(LeoError::backend(format!(
-                "GPU-native story batching supports at most {} stories per batch; got {}",
-                crate::cuda::GPU_STORY_BATCH_MAX_LANES,
-                stories.len()
-            )));
-        }
-
-        while self.shared_batch_lanes.len() < stories.len() {
-            let lane = self.runtime.allocate_shared_batch_lane()?;
-            self.shared_batch_lanes.push(lane);
-        }
-        let (story_metrics, merge) = crate::cuda::train_story_batch_shared_device(
-            &mut self.runtime,
-            &mut self.shared_batch_lanes[..stories.len()],
-            stories,
-            permission,
-        )?;
+        };
         Ok(Some(DeviceStoryBatchReport {
-            story_metrics,
-            merge,
+            story_metrics: report.story_metrics,
+            merge: report.merge,
+        }))
+    }
+
+    fn training_story_batch_deltas(
+        &mut self,
+        stories: &[Vec<u8>],
+        permission: Permission,
+    ) -> LeoResult<Option<DeviceStoryBatchDeltaReport>> {
+        let Some(report) = self.run_story_batch_cuda(stories, permission, true)? else {
+            return Ok(None);
+        };
+        Ok(Some(DeviceStoryBatchDeltaReport {
+            story_metrics: report.story_metrics,
+            merge: report.merge,
+            story_deltas: report.story_deltas,
+            story_changes: report.story_changes,
         }))
     }
 }
@@ -698,6 +760,10 @@ impl BackendRuntime {
         self.inner.synchronize_sparse_model(canonical, changes)
     }
 
+    pub fn commit_sparse_host_model(&mut self, changes: &ParameterChanges) -> LeoResult<()> {
+        self.inner.commit_sparse_host_model(changes)
+    }
+
     pub fn probabilities(&self) -> &[f32] {
         self.inner.probabilities()
     }
@@ -749,6 +815,14 @@ impl BackendRuntime {
         permission: Permission,
     ) -> LeoResult<Option<DeviceStoryBatchReport>> {
         self.inner.training_story_batch(stories, permission)
+    }
+
+    pub fn training_story_batch_deltas(
+        &mut self,
+        stories: &[Vec<u8>],
+        permission: Permission,
+    ) -> LeoResult<Option<DeviceStoryBatchDeltaReport>> {
+        self.inner.training_story_batch_deltas(stories, permission)
     }
 }
 

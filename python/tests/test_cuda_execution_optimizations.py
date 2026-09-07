@@ -402,6 +402,105 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertNotIn("fn meaningful_improvement", main)
 
 
+    def test_multi_gpu_flattens_story_deltas_before_one_canonical_mean(self):
+        training = (ROOT / "crates/leo-cli/src/training.rs").read_text()
+        backend = (ROOT / "crates/leo-core/src/backend.rs").read_text()
+        cuda = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
+        lifecycle = (ROOT / "crates/leo-cli/src/training/lifecycle.rs").read_text()
+        main = (ROOT / "crates/leo-cli/src/main.rs").read_text()
+
+        multi = training.split("struct MultiGpuBatchTrainer", 1)[1].split(
+            "fn apply_batch_replay_policy", 1
+        )[0]
+        self.assertIn("balanced_story_range", multi)
+        self.assertIn("training_story_batch_deltas", multi)
+        self.assertIn("results.sort_by_key(|result| result.story_start)", multi)
+        self.assertIn("deltas.extend(result.story_deltas)", multi)
+        self.assertEqual(multi.count("apply_mean_deltas(model, &deltas)"), 1)
+        self.assertIn("exact_flat_story_mean\\\":true", multi)
+        self.assertNotIn("stories.len() % device_count", multi)
+        self.assertNotIn("stories.len() / device_count < 2", multi)
+
+        self.assertIn("DeviceStoryBatchDeltaReport", backend)
+        self.assertIn("retain_story_deltas", cuda)
+        self.assertIn("do NOT first build a device-local mean", cuda)
+        self.assertIn("gpu_multi_device_story_mean_exact", lifecycle)
+        self.assertIn("flat_story_delta_mean", lifecycle)
+
+        # Benchmark must exercise the same distributed training engine; otherwise
+        # scaling measurements would silently benchmark only GPU 0.
+        benchmark = main.split("fn command_benchmark", 1)[1].split(
+            "fn command_doctor", 1
+        )[0]
+        self.assertIn("configured_multi_gpu_devices", benchmark)
+        self.assertIn("TrainingEngine::new", benchmark)
+        self.assertIn("training_engine.train_batch", benchmark)
+        self.assertIn("\\\"gpu_devices\\\"", benchmark)
+
+    def test_multi_gpu_partition_supports_uneven_and_one_story_per_device(self):
+        training = (ROOT / "crates/leo-cli/src/training.rs").read_text()
+        backend = (ROOT / "crates/leo-core/src/backend.rs").read_text()
+
+        self.assertIn("fn balanced_story_range", training)
+        self.assertIn("run_multi_gpu_shard", training)
+        self.assertNotIn("if shard.len() == 1", training)
+        self.assertIn("(stories.len() < 2 && !retain_story_deltas)", backend)
+        self.assertIn("sixteen_devices_can_own_one_story_each", training)
+        self.assertIn("uneven_device_count_preserves_story_order", training)
+
+    def test_multi_gpu_reuses_canonical_device_zero_and_sparse_commits_mean(self):
+        training = (ROOT / "crates/leo-cli/src/training.rs").read_text()
+        backend = (ROOT / "crates/leo-core/src/backend.rs").read_text()
+        cuda = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
+
+        multi = training.split("struct MultiGpuBatchTrainer", 1)[1].split(
+            "fn apply_batch_replay_policy", 1
+        )[0]
+        self.assertIn("Vec::with_capacity(device_count.saturating_sub(1))", multi)
+        self.assertIn("for device_index in 1..device_count", multi)
+        self.assertNotIn("for device_index in 0..device_count", multi)
+        self.assertIn("canonical_worker: &mut BackendRuntime = &mut *canonical", multi)
+        self.assertIn("canonical.commit_sparse_host_model(&sync_changes)?", multi)
+        self.assertIn(r'canonical_device0_reused\":true', multi)
+        self.assertIn("fn commit_sparse_host_model", backend)
+        self.assertIn("self.runtime.upload_current_sparse_model(changes)", backend)
+        self.assertIn("pub(crate) fn upload_current_sparse_model", cuda)
+
+    def test_explicit_multi_gpu_request_fails_instead_of_silent_single_gpu_fallback(self):
+        training = (ROOT / "crates/leo-cli/src/training.rs").read_text()
+        lifecycle = (ROOT / "crates/leo-cli/src/training/lifecycle.rs").read_text()
+        main = (ROOT / "crates/leo-cli/src/main.rs").read_text()
+
+        self.assertIn("pub(crate) fn configured_multi_gpu_devices", training)
+        self.assertIn("-> LeoResult<usize>", training)
+        self.assertIn(
+            "LEO_MULTI_GPU requested, but fewer than two CUDA devices are visible",
+            training,
+        )
+        self.assertIn("configured_multi_gpu_devices(backend, workers.min(story_limit.max(1)))?", lifecycle)
+        self.assertIn("configured_multi_gpu_devices(runtime.resolved_backend(), effective_workers)?", main)
+
+    def test_persistent_selection_skips_exactly_untouched_blocks(self):
+        cuda = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+
+        mark_touched = cuda.split(
+            "__device__ __forceinline__ void leo_p_mark_touched", 1
+        )[1].split("__device__ __forceinline__ void leo_p_mark_learning_destination", 1)[0]
+        self.assertIn("LEO_P_BLOCK_CUTOFF", mark_touched)
+        self.assertIn("atomicExch(&block_cutoff[neuron / cfg->neurons_per_block], 1.0f)", mark_touched)
+
+        start_tick = cuda.split("__device__ void leo_p_start_tick", 1)[1].split(
+            "__device__ void leo_p_deliver_events", 1
+        )[0]
+        self.assertIn("block_cutoff[block] = 0.0f", start_tick)
+        self.assertIn("winner_value[index] = -1.0f", start_tick)
+
+        select_block = cuda.split(
+            "__device__ __forceinline__ void leo_p_select_model_block", 1
+        )[1].split("__device__ void leo_p_select_blocks", 1)[0]
+        self.assertIn("if (block_cutoff[model_block] == 0.0f) return", select_block)
+        self.assertIn("block_cutoff[model_block] = cutoff", select_block)
+
 
 if __name__ == "__main__":
     unittest.main()

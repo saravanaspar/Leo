@@ -37,7 +37,7 @@ Leo v1.0.1 is the current patch release of the clean v1 durability baseline for 
 | CUDA Graph sparse apply/reset | Legacy capability retained; exact v1 story batching uses one batch-end sparse sync |
 | Async pinned H2D/D2H pipeline | Supported |
 | Cooperative fused wavefront | Preferred when hardware supports it |
-| Multi-GPU training | **Experimental** batch-end device mean |
+| Multi-GPU training | Exact logical-batch data parallelism implemented; multi-GPU hardware validation required; replay remains canonical/serial |
 | FP16/BF16 training | Not part of v1.0.1 |
 | Dynamic topology growth | Not part of v1.0.1 |
 | Pre-v1 artifact compatibility | Intentionally not supported |
@@ -62,7 +62,7 @@ Leo v1.0.1 is the current patch release of the clean v1 durability baseline for 
 - inspect / checkpoint / rollback
 - training and frozen benchmarks
 - single-GPU CUDA verification and hardware profiling
-- optional experimental multi-GPU synchronization
+- exact multi-GPU data parallelism over the existing logical story workers
 
 </details>
 
@@ -405,9 +405,10 @@ bash ./scripts/profile_cuda.sh \
 The GPU GitHub Actions workflow only runs when the repository/org variable `LEO_GPU_RUNNER` names a configured GPU runner. Otherwise it safely skips instead of pretending GPU validation occurred.
 
 <details>
-<summary><strong>Experimental multi-GPU mode</strong></summary>
+<summary><strong>Exact multi-GPU data parallelism (multi-GPU hardware validation required)</strong></summary>
 
-Enable it explicitly:
+Leo's story workers are its data-parallel axis. Keep the logical worker count
+fixed and distribute those workers over the visible GPUs:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 LEO_MULTI_GPU=1 \
@@ -416,23 +417,35 @@ CUDA_VISIBLE_DEVICES=0,1 LEO_MULTI_GPU=1 \
   --train-bytes data/prepared/tinystories.train.bytes \
   --train-index data/prepared/tinystories.train.idx \
   --passes 1 \
-  --workers 64 \
+  --workers 16 \
   --backend gpu
 ```
 
-Current synchronization is:
+The synchronization identity is:
 
 ```text
-gpu_multi_device_batch_mean_experimental
+gpu_multi_device_story_mean_exact
 ```
 
-Multi-GPU training performs batch-end device averaging and therefore reports:
+Each GPU starts its assigned stories from the same canonical revision. Leo
+retains one sparse delta per original story, restores canonical story order,
+and executes one flat `1 / workers` mean. It does **not** average device means.
+Uneven device counts are supported, including 16 GPUs with one logical story
+worker per GPU when `--workers 16`. GPU 0 reuses the canonical CUDA runtime,
+so multi-GPU mode does not allocate a second full model copy on the first GPU;
+only secondary devices receive canonical replicas. VRAM is not pooled: every
+GPU needs one canonical/replica image plus the private mutable story-lane state
+for the workers assigned to that device. Adding GPUs distributes those lane
+states rather than combining device memory. An explicit `LEO_MULTI_GPU=1`
+request fails if fewer than two CUDA devices are visible.
 
-```text
-exact_single_gpu_wavefront_equivalence=false
-```
-
-Do not treat multi-GPU results as byte-for-byte equivalent to the single-GPU wavefront update order.
+Replay remains on the canonical backend in story/range order. Consequently,
+base-pass data parallelism can scale well while full replay-on throughput is
+still limited by the serial replay fraction. See [docs/SCALING.md](docs/SCALING.md)
+for the scaling model and benchmark procedure. GPU scheduling may still produce
+the tiny numerical differences covered by the normal CPU/CUDA conformance
+thresholds; the logical denominator, update barrier, replay policy, and FP32
+learning equations are unchanged.
 
 </details>
 

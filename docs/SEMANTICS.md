@@ -67,9 +67,25 @@ Training policy answers **what computation occurs**. Selecting GPU must not sile
 
 ## Multi-GPU semantics
 
-Multi-GPU remains explicitly distinguishable from exact single-GPU wavefront ordering. Device shards begin from one canonical revision, produce sparse deltas, and merge them synchronously at the batch boundary. The merged canonical changes are synchronized back to persistent GPU replicas. Replay is then applied to the canonical backend under the same TrainingPolicy v1 and replay changes are sparsely synchronized to replicas.
+Leo's logical story workers are the data-parallel unit. Multi-GPU execution may
+place those workers on different physical CUDA devices, but every worker begins
+from the same canonical parameter revision and retains its own sparse story
+delta. Device-local means are not used for the cross-device result. Story
+deltas are restored to canonical story order and passed once to the same
+`apply_mean_deltas` barrier, so the logical denominator remains exactly
+`1 / workers` even for uneven device partitions or one-story-per-device layouts.
 
-The run log records the synchronization mode so multi-GPU experiments are not confused with exact single-GPU ordering.
+The merged canonical sparse changes are synchronized back to persistent GPU
+replicas. Replay is then applied to the canonical backend under the same
+TrainingPolicy v1, in the same story/range order, and replay changes are sparsely
+synchronized to replicas. Replay is not yet model-parallel across devices.
+
+The synchronization identity `gpu_multi_device_story_mean_exact` records this
+contract. It replaces the old experimental device-mean identity; an in-progress
+resume created with that older synchronization identity is rejected rather than
+silently mixing reduction semantics. Physical CUDA scheduling is still subject
+to the normal CPU/CUDA numerical conformance thresholds; no claim of byte-for-byte
+kernel scheduling identity is made.
 
 ## Changes that require a semantic version change
 

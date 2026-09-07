@@ -23,7 +23,8 @@ use std::fmt::{Display, Formatter};
 pub use artifact::{digest_bytes, digest_file, ArtifactDigest, Sha256, DIGEST_ALGORITHM};
 pub use backend::{
     available_gpu_devices, BackendCapabilities, BackendKind, BackendRuntime, DeviceAccess,
-    DeviceBufferSpec, DeviceModelLayout, DeviceScalarType, DeviceStoryBatchReport, RuntimeBackend,
+    DeviceBufferSpec, DeviceModelLayout, DeviceScalarType, DeviceStoryBatchDeltaReport,
+    DeviceStoryBatchReport, RuntimeBackend,
 };
 pub use config::Config;
 pub use metrics::{StepMetrics, TrainingStatistics};

@@ -18,5 +18,5 @@ Persistent learned state remains represented by `Model` and `PSCLS100`; transien
 - CUDA may optimize launches, persistent execution, phase fusion, device layout, and batching while preserving ExecutionSemantics v1.
 - Model access/checkpointing explicitly synchronizes the backend.
 - Worker deltas are tied to a canonical parameter revision and stale deltas are rejected.
-- Multi-GPU batch-end device-mean synchronization is logged as a distinct synchronization semantic and is not represented as bit-identical single-GPU wavefront execution.
+- Multi-GPU data parallelism retains one delta per original logical story and performs one flat canonical `1 / workers` mean; physical GPU scheduling remains covered by the normal CPU/CUDA numerical-conformance contract. Replay remains canonical/serial until a device-side model-parallel replay executor exists.
 - CUDA/NVRTC remain dynamically loaded so CPU-only execution has no hard CUDA runtime link dependency.

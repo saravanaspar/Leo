@@ -1443,6 +1443,13 @@ pub(crate) struct CudaBatchLane {
 
 unsafe impl Send for CudaBatchLane {}
 
+pub(crate) struct CudaStoryBatchReport {
+    pub(crate) story_metrics: Vec<Vec<StepMetrics>>,
+    pub(crate) merge: MergeMetrics,
+    pub(crate) story_deltas: Vec<SparseModelDelta>,
+    pub(crate) story_changes: Vec<ParameterChanges>,
+}
+
 impl CudaBatchLane {
     fn owned_buffers(&self) -> Vec<DeviceBuffer> {
         let b = self.buffers;
@@ -5261,7 +5268,10 @@ impl CudaRuntime {
     /// Upload sparse values from the canonical host mirror into this runtime's
     /// resident canonical CUDA parameter buffers. This deliberately does not
     /// clone the complete model and does not touch transient state.
-    fn upload_current_sparse_model(&mut self, changes: &ParameterChanges) -> LeoResult<()> {
+    pub(crate) fn upload_current_sparse_model(
+        &mut self,
+        changes: &ParameterChanges,
+    ) -> LeoResult<()> {
         let b = self.buffers;
         let to_u32 = |label: &str, indices: &[usize]| -> LeoResult<Vec<u32>> {
             indices.iter().map(|&value| as_u32(label, value)).collect()
@@ -6749,7 +6759,8 @@ pub(crate) fn train_story_batch_shared_device(
     lanes: &mut [CudaBatchLane],
     stories: &[Vec<u8>],
     permission: Permission,
-) -> LeoResult<(Vec<Vec<StepMetrics>>, MergeMetrics)> {
+    retain_story_deltas: bool,
+) -> LeoResult<CudaStoryBatchReport> {
     if stories.is_empty() {
         return Err(LeoError::cuda("GPU shared story batch cannot be empty"));
     }
@@ -7287,55 +7298,77 @@ pub(crate) fn train_story_batch_shared_device(
         deltas.push(delta);
     }
 
-    let merge = apply_mean_deltas(&mut coordinator.model, &deltas)?;
-    let sync_changes = merged_parameter_changes(&mut coordinator.model, &deltas, &raw_changes)?;
-    coordinator.upload_current_sparse_model(&sync_changes)?;
+    // Multi-device data parallelism needs the original per-story deltas so the
+    // outer canonical reducer can perform one flat 1/workers mean. In that mode
+    // do NOT first build a device-local mean: it would be thrown away after the
+    // cross-device canonical reduction and would also force an unnecessary full
+    // canonical-to-lane copy on every device. The outer trainer sparse-syncs the
+    // globally merged canonical model into this coordinator, and the deliberately
+    // stale lane revisions are repaired from that image at the next batch start.
+    let (merge, retained_deltas, retained_changes) = if retain_story_deltas {
+        (
+            MergeMetrics {
+                workers: lanes.len(),
+                fixed_parameter_updates: 0,
+                context_keys: 0,
+            },
+            deltas,
+            raw_changes,
+        )
+    } else {
+        let merge = apply_mean_deltas(&mut coordinator.model, &deltas)?;
+        let sync_changes = merged_parameter_changes(&mut coordinator.model, &deltas, &raw_changes)?;
+        coordinator.upload_current_sparse_model(&sync_changes)?;
 
-    if coordinator.track_parameter_changes {
-        accumulate_indices(
-            &sync_changes.threshold,
-            &mut coordinator.accumulated_threshold_mark,
-            &mut coordinator.accumulated_changes.threshold,
-        );
-        accumulate_indices(
-            &sync_changes.recurrent_weight,
-            &mut coordinator.accumulated_recurrent_mark,
-            &mut coordinator.accumulated_changes.recurrent_weight,
-        );
-        accumulate_indices(
-            &sync_changes.input_weight,
-            &mut coordinator.accumulated_input_mark,
-            &mut coordinator.accumulated_changes.input_weight,
-        );
-        accumulate_indices(
-            &sync_changes.output_neurons,
-            &mut coordinator.accumulated_output_mark,
-            &mut coordinator.accumulated_changes.output_neurons,
-        );
-        accumulate_indices(
-            &sync_changes.context_slots,
-            &mut coordinator.accumulated_context_mark,
-            &mut coordinator.accumulated_changes.context_slots,
-        );
-        coordinator.accumulated_changes.output_bias_dirty |= sync_changes.output_bias_dirty;
-        coordinator.accumulated_changes.context_output_dirty |= sync_changes.context_output_dirty;
-    }
+        if coordinator.track_parameter_changes {
+            accumulate_indices(
+                &sync_changes.threshold,
+                &mut coordinator.accumulated_threshold_mark,
+                &mut coordinator.accumulated_changes.threshold,
+            );
+            accumulate_indices(
+                &sync_changes.recurrent_weight,
+                &mut coordinator.accumulated_recurrent_mark,
+                &mut coordinator.accumulated_changes.recurrent_weight,
+            );
+            accumulate_indices(
+                &sync_changes.input_weight,
+                &mut coordinator.accumulated_input_mark,
+                &mut coordinator.accumulated_changes.input_weight,
+            );
+            accumulate_indices(
+                &sync_changes.output_neurons,
+                &mut coordinator.accumulated_output_mark,
+                &mut coordinator.accumulated_changes.output_neurons,
+            );
+            accumulate_indices(
+                &sync_changes.context_slots,
+                &mut coordinator.accumulated_context_mark,
+                &mut coordinator.accumulated_changes.context_slots,
+            );
+            coordinator.accumulated_changes.output_bias_dirty |= sync_changes.output_bias_dirty;
+            coordinator.accumulated_changes.context_output_dirty |=
+                sync_changes.context_output_dirty;
+        }
 
-    // Restore active lanes from the new canonical device image using fast D2D
-    // copies. This is intentionally full learned-state copy: on P100-class
-    // bandwidth it is cheap relative to story compute, avoids a second sparse
-    // synchronization implementation, and keeps inactive-lane repair explicit.
-    for lane in lanes.iter() {
-        coordinator.copy_canonical_parameters_to_batch_lane_async(lane)?;
-    }
-    coordinator.shared.driver.check(
-        unsafe { (coordinator.shared.driver.stream_synchronize)(coordinator.transfer_stream) },
-        "cuStreamSynchronize(batch lane canonical restore)",
-    )?;
-    let merged_revision = coordinator.model.parameter_revision;
-    for lane in lanes.iter_mut() {
-        lane.model_revision = merged_revision;
-    }
+        // Single-device execution keeps lanes hot from the newly merged
+        // canonical device image. Multi-device execution intentionally skips
+        // this copy because the device-local merge is deferred to the outer
+        // flat reducer.
+        for lane in lanes.iter() {
+            coordinator.copy_canonical_parameters_to_batch_lane_async(lane)?;
+        }
+        coordinator.shared.driver.check(
+            unsafe { (coordinator.shared.driver.stream_synchronize)(coordinator.transfer_stream) },
+            "cuStreamSynchronize(batch lane canonical restore)",
+        )?;
+        let merged_revision = coordinator.model.parameter_revision;
+        for lane in lanes.iter_mut() {
+            lane.model_revision = merged_revision;
+        }
+
+        (merge, Vec::new(), Vec::new())
+    };
 
     coordinator.execution_tuner.observe_batch(
         lanes.len(),
@@ -7356,7 +7389,12 @@ pub(crate) fn train_story_batch_shared_device(
     }
     coordinator.reset_transient_state()?;
 
-    Ok((story_metrics, merge))
+    Ok(CudaStoryBatchReport {
+        story_metrics,
+        merge,
+        story_deltas: retained_deltas,
+        story_changes: retained_changes,
+    })
 }
 
 fn cuda_execution_profile_key(model: &Model, shared: &SharedCuda) -> String {

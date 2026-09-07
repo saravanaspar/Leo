@@ -4,6 +4,14 @@ All notable project changes should be recorded here.
 
 ## Unreleased
 
+- Replace experimental mean-of-device-means training with exact logical-story data parallelism: retain one sparse delta per story, restore canonical story order, and apply one flat `1 / workers` canonical mean across 2..N visible GPUs, including uneven partitions and one-story-per-device layouts.
+- Make `benchmark --train` use the same multi-GPU `TrainingEngine` as real training and report `gpu_devices`, so scaling measurements cannot silently fall back to GPU 0.
+- Defer redundant device-local canonical merging/copies in multi-GPU shards; only the globally merged sparse canonical state is synchronized back to resident replicas.
+- Reuse the canonical CUDA runtime as the device-0 data-parallel worker instead of allocating a second full model on GPU 0; secondary devices alone own replicas, and the flat canonical mean is sparse-committed before replay.
+- Fail an explicit `LEO_MULTI_GPU=1` request when fewer than two CUDA devices are visible instead of silently degrading to single-GPU execution.
+- Compact finite positive block candidates before exact packed-key sorting and use an exact sparse k-way merge of already-sorted block-winner runs, retaining the dense/non-finite bitonic fallback and historical cutoff behavior.
+- Flatten recurrent delayed-weight snapshot copies across CUDA threads and reuse the already-computed FP32 softmax exponential in the persistent forward path.
+- Add multi-GPU scaling documentation, source/reference regression tests, and a live scaling benchmark utility while keeping FP32, 30% replay, logical workers, replay ordering, checkpoint schema, and CUDA ABI v1 unchanged.
 - Replace serial persistent per-block top-k selection with an exact packed-key parallel network on supported power-of-two CUDA shapes, preserving the historical block-cutoff quirk and retaining the legacy fallback for unsupported/non-finite cases.
 - Accelerate persistent global winner selection with the same exact packed key and reuse already-sorted per-block winner runs to skip completed bitonic stages without changing active-neuron order.
 - Add reference tests proving packed-key ordering, historical cutoff reconstruction, and pre-sorted-run merge equivalence to Leo's v1 comparator.
