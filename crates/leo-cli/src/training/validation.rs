@@ -1,11 +1,9 @@
 //! Frozen validation/evaluation services used by training and `leo eval`.
 
+use super::configured_multi_gpu_devices;
 use super::metrics::{ActivityDiagnostics, EvaluationMetrics};
 use leo_core::symbols::{BEGIN_DOCUMENT, END_DOCUMENT};
-use leo_core::{
-    available_gpu_devices, BackendKind, BackendRuntime, LeoError, LeoResult, Model, Permission,
-    StepMetrics,
-};
+use leo_core::{BackendKind, BackendRuntime, LeoError, LeoResult, Model, Permission, StepMetrics};
 use leo_data::PreparedDataset;
 use std::thread;
 
@@ -17,14 +15,10 @@ pub(crate) fn evaluate_model(
 ) -> LeoResult<EvaluationMetrics> {
     let limit = story_limit.unwrap_or(dataset.len()).min(dataset.len());
 
-    let gpu_devices = if backend == BackendKind::Gpu {
-        available_gpu_devices()
-            .unwrap_or(1)
-            .max(1)
-            .min(limit.max(1))
-    } else {
-        1
-    };
+    // Reuse the training device-group gate so explicit multi-GPU validation
+    // has the same visible-device-0 and homogeneous-GPU requirements as exact
+    // training. Without LEO_MULTI_GPU it remains single-device.
+    let gpu_devices = configured_multi_gpu_devices(backend, limit.max(1))?;
 
     if backend == BackendKind::Gpu && gpu_devices > 1 && limit > 1 {
         let mut runtimes = Vec::with_capacity(gpu_devices);

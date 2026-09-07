@@ -13,7 +13,7 @@ use super::resume::{
 use super::validation::{
     evaluate_model, meaningful_improvement, print_prediction_evaluation, update_best_validation,
 };
-use super::{configured_multi_gpu_devices, TrainingEngine};
+use super::{configured_multi_gpu_devices, TrainingEngine, GPU_REFERENCE_WORKERS};
 use crate::json_escape;
 use leo_core::semantics::{EXECUTION_SEMANTICS_NAME, LEO_RELEASE_VERSION, TRAINING_POLICY_NAME};
 use leo_core::{BackendKind, BackendRuntime, LeoError, LeoResult, Permission};
@@ -55,9 +55,13 @@ pub(crate) fn run_training(request: TrainRequest<'_>) -> LeoResult<()> {
         .story_limit
         .unwrap_or(dataset.len())
         .min(dataset.len());
-    let workers = request
-        .workers
-        .unwrap_or_else(|| if backend == BackendKind::Gpu { 64 } else { 1 });
+    let workers = request.workers.unwrap_or_else(|| {
+        if backend == BackendKind::Gpu {
+            GPU_REFERENCE_WORKERS
+        } else {
+            1
+        }
+    });
     let max_training_bytes = request.max_training_bytes;
     let multi_gpu_devices = configured_multi_gpu_devices(backend, workers.min(story_limit.max(1)))?;
     let multi_gpu_enabled = multi_gpu_devices > 1;
@@ -82,10 +86,8 @@ pub(crate) fn run_training(request: TrainRequest<'_>) -> LeoResult<()> {
     let mut stopped_early = false;
     let mut stopped_by_byte_limit = false;
 
-    let synchronization = if multi_gpu_enabled {
-        "gpu_multi_device_story_mean_exact"
-    } else if backend == BackendKind::Gpu && workers > 1 {
-        "gpu_shared_wavefront_mean"
+    let synchronization = if backend == BackendKind::Gpu && workers > 1 {
+        "gpu_story_mean_exact_v1"
     } else {
         "one_story_per_worker"
     };

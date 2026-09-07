@@ -22,6 +22,7 @@ use training::{
     configured_multi_gpu_devices, evaluate_model, open_dataset, print_learning_quality,
     print_prediction_evaluation, replay_target_range, run_training, train_document_pass,
     train_story_batch, ActivityDiagnostics, StoryBatchPrefetcher, TrainRequest, TrainingEngine,
+    GPU_REFERENCE_WORKERS,
 };
 
 fn main() {
@@ -660,7 +661,7 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
         let mut runtime = BackendRuntime::new(load_model(model_path)?, requested_backend)?;
         let workers = arguments.optional_usize("workers")?.unwrap_or_else(|| {
             if runtime.resolved_backend() == BackendKind::Gpu {
-                64
+                GPU_REFERENCE_WORKERS
             } else {
                 1
             }
@@ -693,6 +694,8 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
         let mut replay_segments = 0usize;
         let mut replay_steps = 0u64;
         let mut replay_prefix_steps = 0u64;
+        let mut replay_seconds = 0.0f64;
+        let mut replay_sync_seconds = 0.0f64;
         let story_order: Vec<usize> = (0..story_limit).collect();
         let prefetcher = StoryBatchPrefetcher::spawn(&dataset, story_order, "training benchmark")?;
         if position < story_limit {
@@ -718,6 +721,8 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
             replay_segments = replay_segments.saturating_add(report.replay_segments);
             replay_steps = replay_steps.saturating_add(report.replay_steps);
             replay_prefix_steps = replay_prefix_steps.saturating_add(report.replay_prefix_steps);
+            replay_seconds += report.replay_seconds;
+            replay_sync_seconds += report.replay_sync_seconds;
             activity.add(report.activity);
             position = next_position;
             if max_input_bytes.is_some_and(|limit| input_bytes >= limit) {
@@ -730,10 +735,12 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
             ));
         }
         let elapsed = started.elapsed().as_secs_f64();
+        runtime.synchronize_model()?;
+        let training_state_sha256 = training_state_hash(runtime.model());
         let projected_input_bytes = 2_000_000_000f64;
         let projected_seconds = elapsed / input_bytes.max(1) as f64 * projected_input_bytes;
         println!(
-            "{{\"event\":\"training_benchmark\",\"model\":\"{}\",\"neurons\":{},\"fixed_synapses\":{},\"context_slots\":{},\"context_embedding_dim\":{},\"workers\":{},\"gpu_devices\":{},\"stories\":{},\"input_bytes\":{},\"training_steps\":{},\"base_training_targets\":{},\"replay_fraction\":{},\"replay_segments\":{},\"replay_steps\":{},\"replay_prefix_steps\":{},\"replay_execution_steps\":{},\"replay_step_fraction\":{},\"replay_prefix_step_fraction\":{},\"execution_steps_with_prefix\":{},\"seconds\":{},\"input_bytes_per_second\":{},\"steps_per_second\":{},\"execution_steps_per_second\":{},\"mean_loss\":{},\"bits_per_byte\":{},\"active_fraction\":{},\"recurrent_events_per_step\":{},\"context_cells_per_step\":{},\"context_probes_per_step\":{},\"output_madds_per_step\":{},\"projected_seconds_1gb_2_epochs\":{},\"projected_days_1gb_2_epochs\":{}}}",
+            "{{\"event\":\"training_benchmark\",\"model\":\"{}\",\"neurons\":{},\"fixed_synapses\":{},\"context_slots\":{},\"context_embedding_dim\":{},\"workers\":{},\"gpu_devices\":{},\"stories\":{},\"input_bytes\":{},\"training_steps\":{},\"base_training_targets\":{},\"replay_fraction\":{},\"replay_segments\":{},\"replay_steps\":{},\"replay_prefix_steps\":{},\"replay_execution_steps\":{},\"replay_step_fraction\":{},\"replay_prefix_step_fraction\":{},\"replay_seconds\":{},\"replay_sync_seconds\":{},\"replay_wall_fraction\":{},\"serial_replay_speedup_ceiling\":{},\"execution_steps_with_prefix\":{},\"seconds\":{},\"input_bytes_per_second\":{},\"steps_per_second\":{},\"execution_steps_per_second\":{},\"mean_loss\":{},\"bits_per_byte\":{},\"active_fraction\":{},\"recurrent_events_per_step\":{},\"context_cells_per_step\":{},\"context_probes_per_step\":{},\"output_madds_per_step\":{},\"training_state_sha256\":\"{}\",\"projected_seconds_1gb_2_epochs\":{},\"projected_days_1gb_2_epochs\":{}}}",
             json_escape(&runtime.model().config.model.name),
             runtime.model().neuron_count(),
             runtime.model().recurrent.weight.len(),
@@ -752,6 +759,10 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
             replay_steps.saturating_add(replay_prefix_steps),
             replay_steps as f64 / activity.steps.max(1) as f64,
             replay_prefix_steps as f64 / targets.max(1) as f64,
+            replay_seconds,
+            replay_sync_seconds,
+            replay_seconds / elapsed.max(1.0e-9),
+            if replay_seconds > 0.0 { elapsed / replay_seconds } else { 0.0 },
             activity.steps.saturating_add(replay_prefix_steps),
             elapsed,
             input_bytes as f64 / elapsed.max(1.0e-9),
@@ -764,6 +775,7 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
             activity.context_cells_per_step(),
             activity.context_probes_per_step(),
             activity.output_madds_per_step(),
+            training_state_sha256,
             projected_seconds,
             projected_seconds / 86_400.0,
         );
@@ -1169,6 +1181,23 @@ fn model_state_hash(model: &Model) -> ArtifactDigest {
     for value in &model.context.observations {
         hash.update(&value.to_le_bytes());
     }
+    hash.finalize()
+}
+
+fn training_state_hash(model: &Model) -> ArtifactDigest {
+    let mut hash = Sha256::new();
+    hash.update(model_state_hash(model).as_bytes());
+    hash.update(&model.generation.to_le_bytes());
+    hash.update(&model.parameter_revision.to_le_bytes());
+    hash.update(&model.statistics.processed_bytes.to_le_bytes());
+    hash.update(&model.statistics.processed_stories.to_le_bytes());
+    hash.update(&model.statistics.training_loss_sum.to_bits().to_le_bytes());
+    hash.update(&model.statistics.training_targets.to_le_bytes());
+    hash.update(&model.statistics.active_neurons_sum.to_le_bytes());
+    hash.update(&model.statistics.active_neurons_peak.to_le_bytes());
+    hash.update(&model.statistics.synaptic_events.to_le_bytes());
+    hash.update(&model.statistics.numerical_rejections.to_le_bytes());
+    hash.update(&model.statistics.persistent_ticks.to_le_bytes());
     hash.finalize()
 }
 

@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import selectors
 import subprocess
 import sys
 import time
@@ -29,12 +30,23 @@ def parse_args():
         default=4,
         help="rerun a GPU-count case until CUDA autotuning is no longer present",
     )
+    parser.add_argument(
+        "--counts",
+        default=None,
+        help="comma-separated GPU counts to test (for example 1,2); defaults to powers of two plus all visible devices",
+    )
     return parser.parse_args()
 
 
 def discover_devices(explicit):
     if explicit:
         devices = [item.strip() for item in explicit.split(",") if item.strip()]
+    elif os.environ.get("CUDA_VISIBLE_DEVICES", "").strip():
+        visible = os.environ["CUDA_VISIBLE_DEVICES"].strip()
+        if visible == "-1":
+            devices = []
+        else:
+            devices = [item.strip() for item in visible.split(",") if item.strip()]
     else:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader,nounits"],
@@ -60,10 +72,43 @@ def counts_to_test(device_count):
     return counts
 
 
+def gpu_heartbeat(devices):
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+                "-i",
+                ",".join(devices),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "gpu telemetry unavailable"
+    if result.returncode != 0:
+        return "gpu telemetry unavailable"
+    rows = []
+    for raw in result.stdout.splitlines():
+        fields = [field.strip() for field in raw.split(",")]
+        if len(fields) == 4:
+            rows.append(
+                f"gpu{fields[0]}={fields[1]}% {fields[2]}/{fields[3]} MiB"
+            )
+    return "; ".join(rows) if rows else "gpu telemetry unavailable"
+
+
 def run_case(args, devices, count):
     visible = devices[:count]
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ",".join(visible)
+    # Device selection is already expressed by CUDA_VISIBLE_DEVICES. Avoid a
+    # caller's stale LEO_CUDA_DEVICE choosing the wrong visible ordinal.
+    env.pop("LEO_CUDA_DEVICE", None)
     env["LEO_MULTI_GPU"] = "1" if count > 1 else "0"
 
     # Keep final throughput measurements free of optional profilers/debuggers.
@@ -104,28 +149,47 @@ def run_case(args, devices, count):
     started = time.monotonic()
     last_heartbeat = started
 
-    assert proc.stdout is not None
-    for line in proc.stdout:
+    def consume(line):
+        nonlocal benchmark
         print(line, end="", flush=True)
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
-            event = None
-        if event:
-            if event.get("event") == "training_benchmark":
-                benchmark = event
-            elif event.get("event") in {"multi_gpu_training", "multi_gpu_sparse_sync"}:
-                multi_events.append(event)
-            if event.get("event") in {
-                "cuda_profile",
-                "cuda_autotune_resumed",
-                "cuda_autotune_complete",
-            }:
-                tuning_events.append(event)
-        now = time.monotonic()
-        if now - last_heartbeat >= 10:
-            print(f"[scaling heartbeat] {now-started:.1f}s", flush=True)
-            last_heartbeat = now
+            return
+        if event.get("event") == "training_benchmark":
+            benchmark = event
+        elif event.get("event") in {"multi_gpu_training", "multi_gpu_sparse_sync"}:
+            multi_events.append(event)
+        # cuda_profile is low-cadence production telemetry even after tuning
+        # completes. Only autotune lifecycle events contaminate throughput.
+        if event.get("event") in {
+            "cuda_autotune_resumed",
+            "cuda_autotune_complete",
+        }:
+            tuning_events.append(event)
+
+    assert proc.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    try:
+        while True:
+            for key, _ in selector.select(timeout=1.0):
+                line = key.fileobj.readline()
+                if line:
+                    consume(line)
+            now = time.monotonic()
+            if now - last_heartbeat >= 10:
+                print(
+                    f"[scaling heartbeat] {now-started:.1f}s | {gpu_heartbeat(visible)}",
+                    flush=True,
+                )
+                last_heartbeat = now
+            if proc.poll() is not None:
+                for line in proc.stdout:
+                    consume(line)
+                break
+    finally:
+        selector.close()
 
     rc = proc.wait()
     if rc != 0:
@@ -136,12 +200,13 @@ def run_case(args, devices, count):
         raise RuntimeError(
             f"requested {count} GPUs but Leo reported gpu_devices={benchmark.get('gpu_devices')}"
         )
+    if not benchmark.get("training_state_sha256"):
+        raise RuntimeError("training benchmark emitted no final training_state_sha256")
     if count > 1 and not any(
         event.get("exact_flat_story_mean") is True for event in multi_events
     ):
         raise RuntimeError("multi-GPU run did not report exact_flat_story_mean=true")
     return benchmark, tuning_events
-
 
 def run_clean_case(args, devices, count):
     for attempt in range(1, args.max_attempts + 1):
@@ -170,6 +235,7 @@ def semantic_signature(result):
             "replay_segments",
             "replay_steps",
             "replay_prefix_steps",
+            "training_state_sha256",
         )
     }
 
@@ -190,7 +256,12 @@ def main():
 
     devices = discover_devices(args.devices)
     max_devices = min(len(devices), args.workers)
-    counts = counts_to_test(max_devices)
+    if args.counts:
+        counts = sorted({int(value.strip()) for value in args.counts.split(",") if value.strip()})
+        if not counts or counts[0] != 1 or any(value < 1 or value > max_devices for value in counts):
+            raise ValueError(f"--counts must include 1 and stay within 1..{max_devices}")
+    else:
+        counts = counts_to_test(max_devices)
     print(f"Detected devices: {devices}", flush=True)
     print(f"Testing GPU counts: {counts}", flush=True)
 
@@ -218,7 +289,8 @@ def main():
         efficiency = speedup / count
         same = semantic_signature(result) == base_signature
         loss_delta = abs(float(result["mean_loss"]) - base_loss)
-        semantic_ok = same and loss_delta <= 1.0e-6
+        state_equal = result.get("training_state_sha256") == base.get("training_state_sha256")
+        semantic_ok = same and state_equal and loss_delta <= 1.0e-6
         all_semantic &= semantic_ok
         print(
             f"{count:5d} {rate:14.3f} {speedup:10.3f} {efficiency:12.3f} "
@@ -226,7 +298,7 @@ def main():
         )
 
     print("\nBase semantic signature:", base_signature)
-    print("Semantic workload/loss check:", "OK" if all_semantic else "MISMATCH")
+    print("Exact workload/final-state check:", "OK" if all_semantic else "MISMATCH")
     if not all_semantic:
         return 2
     return 0

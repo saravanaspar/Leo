@@ -5,7 +5,7 @@
 //! with persistent model and transient recurrent/eligibility state on device.
 //! Both executors use the same serialized checkpoint representation.
 
-use crate::parallel::{MergeMetrics, SparseModelDelta};
+use crate::parallel::{MergeMetrics, PackedSparseModelUpdate, SparseModelDelta};
 use crate::runtime::ParameterChanges;
 use crate::{LeoError, LeoResult, Model, Permission, Runtime, StepMetrics};
 use std::fmt::{Display, Formatter};
@@ -116,6 +116,36 @@ fn gpu_device_count() -> LeoResult<usize> {
 
 pub fn available_gpu_devices() -> LeoResult<usize> {
     gpu_device_count()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuDeviceCompatibility {
+    pub ordinal: usize,
+    pub name: String,
+    pub compute_major: i32,
+    pub compute_minor: i32,
+}
+
+#[cfg(target_os = "linux")]
+pub fn visible_gpu_device_compatibility() -> LeoResult<Vec<GpuDeviceCompatibility>> {
+    crate::cuda::CudaRuntime::visible_device_compatibility().map(|profiles| {
+        profiles
+            .into_iter()
+            .map(|profile| GpuDeviceCompatibility {
+                ordinal: profile.ordinal,
+                name: profile.name,
+                compute_major: profile.compute_major,
+                compute_minor: profile.compute_minor,
+            })
+            .collect()
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn visible_gpu_device_compatibility() -> LeoResult<Vec<GpuDeviceCompatibility>> {
+    Err(LeoError::backend(
+        "the CUDA backend is supported only on Linux builds",
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,10 +353,22 @@ pub trait RuntimeBackend: Send {
         Ok(())
     }
 
+    /// Apply a canonical sparse packet prepared once by the training
+    /// coordinator. The default keeps third-party backends source-compatible
+    /// and updates only their host model; CUDA overrides this to scatter the
+    /// same packed values into its canonical image and resident story lanes.
+    fn synchronize_packed_model(&mut self, update: &PackedSparseModelUpdate) -> LeoResult<()> {
+        update.apply_to_model(self.model_mut()?)
+    }
+
     /// Commit sparse values from this backend's already-updated host model to
     /// its resident device image. CPU/reference backends need no action because
     /// their host model is the executor state.
     fn commit_sparse_host_model(&mut self, _changes: &ParameterChanges) -> LeoResult<()> {
+        Ok(())
+    }
+
+    fn commit_packed_host_model(&mut self, _update: &PackedSparseModelUpdate) -> LeoResult<()> {
         Ok(())
     }
     fn probabilities(&self) -> &[f32];
@@ -571,11 +613,25 @@ impl RuntimeBackend for GpuRuntime {
         canonical: &Model,
         changes: &ParameterChanges,
     ) -> LeoResult<()> {
-        self.runtime.synchronize_sparse_model(canonical, changes)
+        let update = PackedSparseModelUpdate::from_model(canonical, changes)?;
+        self.runtime
+            .synchronize_packed_model(&update, &mut self.shared_batch_lanes)
+    }
+
+    fn synchronize_packed_model(&mut self, update: &PackedSparseModelUpdate) -> LeoResult<()> {
+        self.runtime
+            .synchronize_packed_model(update, &mut self.shared_batch_lanes)
     }
 
     fn commit_sparse_host_model(&mut self, changes: &ParameterChanges) -> LeoResult<()> {
-        self.runtime.upload_current_sparse_model(changes)
+        let update = PackedSparseModelUpdate::from_model(self.runtime.model(), changes)?;
+        self.runtime
+            .commit_packed_host_model(&update, &mut self.shared_batch_lanes)
+    }
+
+    fn commit_packed_host_model(&mut self, update: &PackedSparseModelUpdate) -> LeoResult<()> {
+        self.runtime
+            .commit_packed_host_model(update, &mut self.shared_batch_lanes)
     }
 
     fn probabilities(&self) -> &[f32] {
@@ -760,8 +816,16 @@ impl BackendRuntime {
         self.inner.synchronize_sparse_model(canonical, changes)
     }
 
+    pub fn synchronize_packed_model(&mut self, update: &PackedSparseModelUpdate) -> LeoResult<()> {
+        self.inner.synchronize_packed_model(update)
+    }
+
     pub fn commit_sparse_host_model(&mut self, changes: &ParameterChanges) -> LeoResult<()> {
         self.inner.commit_sparse_host_model(changes)
+    }
+
+    pub fn commit_packed_host_model(&mut self, update: &PackedSparseModelUpdate) -> LeoResult<()> {
+        self.inner.commit_packed_host_model(update)
     }
 
     pub fn probabilities(&self) -> &[f32] {

@@ -80,12 +80,13 @@ replicas. Replay is then applied to the canonical backend under the same
 TrainingPolicy v1, in the same story/range order, and replay changes are sparsely
 synchronized to replicas. Replay is not yet model-parallel across devices.
 
-The synchronization identity `gpu_multi_device_story_mean_exact` records this
-contract. It replaces the old experimental device-mean identity; an in-progress
-resume created with that older synchronization identity is rejected rather than
-silently mixing reduction semantics. Physical CUDA scheduling is still subject
-to the normal CPU/CUDA numerical conformance thresholds; no claim of byte-for-byte
-kernel scheduling identity is made.
+The synchronization identity `gpu_story_mean_exact_v1` records this contract and
+is independent of physical GPU count. Earlier exact names
+`gpu_shared_wavefront_mean` and `gpu_multi_device_story_mean_exact` are accepted
+as resume aliases; experimental device-mean identities are not. Exact multi-GPU
+mode requires homogeneous CUDA devices, and the 2+ GPU hardware gate compares a
+SHA-256 digest of the complete persistent training state across 1-GPU and 2-GPU
+runs.
 
 ## Changes that require a semantic version change
 

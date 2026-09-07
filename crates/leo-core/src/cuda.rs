@@ -11,8 +11,8 @@ use crate::cuda_plan::{
     CudaTuningLimits,
 };
 use crate::parallel::{
-    apply_mean_deltas, merged_parameter_changes, MergeMetrics, SparseModelDelta, StatisticsDelta,
-    TrackedModelValues,
+    apply_mean_deltas, merged_parameter_changes, MergeMetrics, PackedSparseModelUpdate,
+    SparseModelDelta, StatisticsDelta, TrackedModelValues,
 };
 use crate::runtime::ParameterChanges;
 use crate::symbols::{
@@ -1406,6 +1406,13 @@ pub(crate) struct CudaRuntime {
     host_batch_step_buffers: PinnedHostBuffer,
     host_batch_step_counts: PinnedHostBuffer,
     host_batch_base_ticks: PinnedHostBuffer,
+    host_batch_change_counts: PinnedHostBuffer,
+    batch_snapshot_device_f32: DeviceBuffer,
+    batch_snapshot_device_u32: DeviceBuffer,
+    batch_snapshot_device_u64: DeviceBuffer,
+    batch_snapshot_host_f32: PinnedHostBuffer,
+    batch_snapshot_host_u32: PinnedHostBuffer,
+    batch_snapshot_host_u64: PinnedHostBuffer,
     sparse_apply_graph: Option<CuGraphExec>,
     sparse_apply_graph_plan: Option<(u32, u32)>,
     sparse_apply_graph_disabled: bool,
@@ -1448,6 +1455,30 @@ pub(crate) struct CudaStoryBatchReport {
     pub(crate) merge: MergeMetrics,
     pub(crate) story_deltas: Vec<SparseModelDelta>,
     pub(crate) story_changes: Vec<ParameterChanges>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SnapshotSpan {
+    offset: usize,
+    len: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BatchLaneSnapshotLayout {
+    threshold_indices: SnapshotSpan,
+    recurrent_indices: SnapshotSpan,
+    input_indices: SnapshotSpan,
+    output_indices: SnapshotSpan,
+    context_indices: SnapshotSpan,
+    context_observations: SnapshotSpan,
+    context_keys: SnapshotSpan,
+    threshold_values: SnapshotSpan,
+    recurrent_values: SnapshotSpan,
+    input_values: SnapshotSpan,
+    output_values: SnapshotSpan,
+    context_embeddings: SnapshotSpan,
+    output_bias: Option<SnapshotSpan>,
+    context_output: Option<SnapshotSpan>,
 }
 
 impl CudaBatchLane {
@@ -1580,7 +1611,67 @@ impl Drop for CudaBatchLane {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CudaDeviceCompatibility {
+    pub(crate) ordinal: usize,
+    pub(crate) name: String,
+    pub(crate) compute_major: i32,
+    pub(crate) compute_minor: i32,
+}
+
 impl CudaRuntime {
+    pub(crate) fn visible_device_compatibility() -> LeoResult<Vec<CudaDeviceCompatibility>> {
+        let driver = DriverFunctions::load()?;
+        driver.check(unsafe { (driver.init)(0) }, "cuInit")?;
+        let mut count = 0;
+        driver.check(
+            unsafe { (driver.device_get_count)(&mut count) },
+            "cuDeviceGetCount",
+        )?;
+        if count <= 0 {
+            return Err(LeoError::cuda("CUDA driver reported no GPU devices"));
+        }
+
+        let mut profiles = Vec::with_capacity(count as usize);
+        for ordinal in 0..count as usize {
+            let mut device = 0;
+            driver.check(
+                unsafe { (driver.device_get)(&mut device, ordinal as c_int) },
+                "cuDeviceGet",
+            )?;
+            let mut compute_major = 0;
+            let mut compute_minor = 0;
+            driver.check(
+                unsafe {
+                    (driver.device_get_attribute)(
+                        &mut compute_major,
+                        CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                        device,
+                    )
+                },
+                "cuDeviceGetAttribute(compute major)",
+            )?;
+            driver.check(
+                unsafe {
+                    (driver.device_get_attribute)(
+                        &mut compute_minor,
+                        CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                        device,
+                    )
+                },
+                "cuDeviceGetAttribute(compute minor)",
+            )?;
+            let hardware = query_cuda_hardware_identity(&driver, device, ordinal)?;
+            profiles.push(CudaDeviceCompatibility {
+                ordinal,
+                name: hardware.name,
+                compute_major,
+                compute_minor,
+            });
+        }
+        Ok(profiles)
+    }
+
     pub(crate) fn probe() -> LeoResult<usize> {
         let driver = DriverFunctions::load()?;
         let _nvrtc = NvrtcFunctions::load()?;
@@ -1893,6 +1984,13 @@ impl CudaRuntime {
             host_batch_step_buffers: PinnedHostBuffer::default(),
             host_batch_step_counts: PinnedHostBuffer::default(),
             host_batch_base_ticks: PinnedHostBuffer::default(),
+            host_batch_change_counts: PinnedHostBuffer::default(),
+            batch_snapshot_device_f32: DeviceBuffer::default(),
+            batch_snapshot_device_u32: DeviceBuffer::default(),
+            batch_snapshot_device_u64: DeviceBuffer::default(),
+            batch_snapshot_host_f32: PinnedHostBuffer::default(),
+            batch_snapshot_host_u32: PinnedHostBuffer::default(),
+            batch_snapshot_host_u64: PinnedHostBuffer::default(),
             sparse_apply_graph: None,
             sparse_apply_graph_plan: None,
             sparse_apply_graph_disabled: false,
@@ -2447,317 +2545,241 @@ impl CudaRuntime {
         Ok(self.accumulated_changes.clone())
     }
 
-    // Overwrite only canonical rows/slots touched by the merged multi-GPU
-    // batch. The CUDA model therefore remains resident between batches.
-    pub(crate) fn synchronize_sparse_model(
+    /// Apply one host-packed canonical sparse update to this runtime and every
+    /// resident logical-story lane. Packing is performed once by the training
+    /// coordinator; on each device the index/value payload is uploaded once
+    /// and fanned out to all lane parameter images with device-side scatters.
+    /// This is the steady-state multi-GPU synchronization path and prevents a
+    /// full canonical-to-lane model copy at the beginning of the next batch.
+    pub(crate) fn synchronize_packed_model(
         &mut self,
-        canonical: &Model,
-        changes: &ParameterChanges,
+        update: &PackedSparseModelUpdate,
+        lanes: &mut [CudaBatchLane],
+    ) -> LeoResult<()> {
+        self.apply_packed_sparse_update(update, lanes, true)
+    }
+
+    /// Commit a canonical host merge to device 0 and its resident story lanes.
+    /// Unlike replica synchronization this preserves parameter-tracking mode;
+    /// replay enables tracking immediately after this batch barrier.
+    pub(crate) fn commit_packed_host_model(
+        &mut self,
+        update: &PackedSparseModelUpdate,
+        lanes: &mut [CudaBatchLane],
+    ) -> LeoResult<()> {
+        self.apply_packed_sparse_update(update, lanes, false)
+    }
+
+    fn apply_packed_sparse_update(
+        &mut self,
+        update: &PackedSparseModelUpdate,
+        lanes: &mut [CudaBatchLane],
+        clear_tracking: bool,
     ) -> LeoResult<()> {
         self.make_current()?;
+        update.apply_to_model(&mut self.model)?;
 
-        if self.model_dirty {
-            return Err(LeoError::cuda(
-                "cannot sparse-sync a CUDA replica with a dirty host model",
-            ));
-        }
+        let scratch = self.buffers;
+        let mut targets = Vec::with_capacity(lanes.len().saturating_add(1));
+        targets.push(self.buffers);
+        targets.extend(lanes.iter().map(|lane| lane.buffers));
 
-        let b = self.buffers;
-
-        let to_u32 = |name: &str, indices: &[usize]| -> LeoResult<Vec<u32>> {
-            indices.iter().map(|&value| as_u32(name, value)).collect()
-        };
-
-        // ----------------------------------------------------
-        // Generic sparse f32 row overwrite
-        // ----------------------------------------------------
-
-        let scatter_f32 = |runtime: &mut CudaRuntime,
+        let scatter_f32 = |runtime: &CudaRuntime,
                            target: DeviceBuffer,
                            index_buffer: DeviceBuffer,
                            value_buffer: DeviceBuffer,
-                           indices: &[usize],
-                           source: &[f32],
+                           count: usize,
                            label: &str|
          -> LeoResult<()> {
-            if indices.is_empty() {
+            if count == 0 {
                 return Ok(());
             }
-
-            let device_indices = to_u32(label, indices)?;
-
-            let mut values = Vec::with_capacity(indices.len());
-
-            for &index in indices {
-                let value = source.get(index).copied().ok_or_else(|| {
-                    LeoError::cuda(format!("{label} sparse sync index is out of range"))
-                })?;
-
-                values.push(value);
-            }
-
-            runtime.copy_to_device(index_buffer, &device_indices)?;
-
-            runtime.copy_to_device(value_buffer, &values)?;
-
             let mut target_ptr = target.pointer;
             let mut indices_ptr = index_buffer.pointer;
-            let mut count = as_u32(label, indices.len())?;
+            let mut count = as_u32(label, count)?;
             let mut values_ptr = value_buffer.pointer;
-
             let mut params = [
                 param(&mut target_ptr),
                 param(&mut indices_ptr),
                 param(&mut count),
                 param(&mut values_ptr),
             ];
-
             runtime.launch(
                 runtime.shared.kernels.scatter_f32,
-                indices.len(),
+                count as usize,
                 THREADS,
                 &mut params,
-            )?;
-
-            Ok(())
+            )
         };
 
-        scatter_f32(
-            self,
-            b.threshold,
-            b.changed_threshold_list,
-            b.gather_threshold,
-            &changes.threshold,
-            &canonical.neurons.threshold,
-            "threshold",
-        )?;
-
-        scatter_f32(
-            self,
-            b.recurrent_weight,
-            b.changed_recurrent_list,
-            b.gather_recurrent,
-            &changes.recurrent_weight,
-            &canonical.recurrent.weight,
-            "recurrent",
-        )?;
-
-        scatter_f32(
-            self,
-            b.input_weight,
-            b.changed_input_list,
-            b.gather_input,
-            &changes.input_weight,
-            &canonical.input.weights,
-            "input",
-        )?;
-
-        // ----------------------------------------------------
-        // Output rows
-        //
-        // Host layout:
-        //     [output][neuron]
-        //
-        // CUDA layout:
-        //     [neuron][output]
-        // ----------------------------------------------------
-
-        if !changes.output_neurons.is_empty() {
-            let device_indices = to_u32("output neuron", &changes.output_neurons)?;
-
-            let neuron_count = canonical.neuron_count();
-
-            let mut values =
-                Vec::with_capacity(changes.output_neurons.len().saturating_mul(OUTPUT_CLASSES));
-
-            for &neuron in &changes.output_neurons {
-                if neuron >= neuron_count {
-                    return Err(LeoError::cuda(
-                        "output neuron sparse sync index is out of range",
-                    ));
-                }
-
-                for output in 0..OUTPUT_CLASSES {
-                    values.push(canonical.output.weights[output * neuron_count + neuron]);
-                }
+        if !update.threshold_indices.is_empty() {
+            self.copy_to_device(scratch.changed_threshold_list, &update.threshold_indices)?;
+            self.copy_to_device(scratch.gather_threshold, &update.threshold_values)?;
+            for target in &targets {
+                scatter_f32(
+                    self,
+                    target.threshold,
+                    scratch.changed_threshold_list,
+                    scratch.gather_threshold,
+                    update.threshold_indices.len(),
+                    "threshold count",
+                )?;
             }
-
-            self.copy_to_device(b.changed_output_list, &device_indices)?;
-
-            self.copy_to_device(b.gather_output, &values)?;
-
-            let mut target = b.output_weight.pointer;
-            let mut indices = b.changed_output_list.pointer;
-
-            let mut count = as_u32("output neuron count", changes.output_neurons.len())?;
-
-            let mut packed = b.gather_output.pointer;
-
-            let mut params = [
-                param(&mut target),
-                param(&mut indices),
-                param(&mut count),
-                param(&mut packed),
-            ];
-
-            self.launch(
-                self.shared.kernels.scatter_output,
-                values.len(),
-                THREADS,
-                &mut params,
-            )?;
         }
 
-        // ----------------------------------------------------
-        // Context rows
-        // ----------------------------------------------------
-
-        if !changes.context_slots.is_empty() {
-            let device_slots = to_u32("context slot", &changes.context_slots)?;
-
-            let dim = canonical.config.context.embedding_dim;
-
-            let mut keys = Vec::with_capacity(changes.context_slots.len());
-
-            let mut observations = Vec::with_capacity(changes.context_slots.len());
-
-            let mut embeddings =
-                Vec::with_capacity(changes.context_slots.len().saturating_mul(dim));
-
-            for &slot in &changes.context_slots {
-                if slot >= canonical.context.keys.len() {
-                    return Err(LeoError::cuda("context sparse sync slot is out of range"));
-                }
-
-                keys.push(canonical.context.keys[slot]);
-
-                observations.push(canonical.context.observations[slot]);
-
-                let start = slot * dim;
-
-                embeddings.extend_from_slice(&canonical.context.embeddings[start..start + dim]);
+        if !update.recurrent_indices.is_empty() {
+            self.copy_to_device(scratch.changed_recurrent_list, &update.recurrent_indices)?;
+            self.copy_to_device(scratch.gather_recurrent, &update.recurrent_values)?;
+            for target in &targets {
+                scatter_f32(
+                    self,
+                    target.recurrent_weight,
+                    scratch.changed_recurrent_list,
+                    scratch.gather_recurrent,
+                    update.recurrent_indices.len(),
+                    "recurrent count",
+                )?;
             }
+        }
 
-            self.copy_to_device(b.changed_context_list, &device_slots)?;
+        if !update.input_indices.is_empty() {
+            self.copy_to_device(scratch.changed_input_list, &update.input_indices)?;
+            self.copy_to_device(scratch.gather_input, &update.input_values)?;
+            for target in &targets {
+                scatter_f32(
+                    self,
+                    target.input_weight,
+                    scratch.changed_input_list,
+                    scratch.gather_input,
+                    update.input_indices.len(),
+                    "input count",
+                )?;
+            }
+        }
 
-            self.copy_to_device(b.gather_context_keys, &keys)?;
+        if !update.output_neurons.is_empty() {
+            let expected = update.output_neurons.len().saturating_mul(OUTPUT_CLASSES);
+            if update.output_values_by_neuron.len() != expected {
+                return Err(LeoError::cuda(
+                    "packed output value count does not match changed output rows",
+                ));
+            }
+            self.copy_to_device(scratch.changed_output_list, &update.output_neurons)?;
+            self.copy_to_device(scratch.gather_output, &update.output_values_by_neuron)?;
+            for target in &targets {
+                let mut target_ptr = target.output_weight.pointer;
+                let mut indices_ptr = scratch.changed_output_list.pointer;
+                let mut count = as_u32("output neuron count", update.output_neurons.len())?;
+                let mut packed_ptr = scratch.gather_output.pointer;
+                let mut params = [
+                    param(&mut target_ptr),
+                    param(&mut indices_ptr),
+                    param(&mut count),
+                    param(&mut packed_ptr),
+                ];
+                self.launch(
+                    self.shared.kernels.scatter_output,
+                    expected,
+                    THREADS,
+                    &mut params,
+                )?;
+            }
+        }
 
-            self.copy_to_device(b.gather_context_observations, &observations)?;
-
-            self.copy_to_device(b.gather_context_embeddings, &embeddings)?;
-
-            let mut target_keys = b.context_keys.pointer;
-
-            let mut target_observations = b.context_observations.pointer;
-
-            let mut target_embeddings = b.context_embeddings.pointer;
-
-            let mut embedding_dim = as_u32("context embedding dim", dim)?;
-
-            let mut slots = b.changed_context_list.pointer;
-
-            let mut count = as_u32("context slot count", changes.context_slots.len())?;
-
-            let mut source_keys = b.gather_context_keys.pointer;
-
-            let mut source_observations = b.gather_context_observations.pointer;
-
-            let mut source_embeddings = b.gather_context_embeddings.pointer;
-
-            let mut params = [
-                param(&mut target_keys),
-                param(&mut target_observations),
-                param(&mut target_embeddings),
-                param(&mut embedding_dim),
-                param(&mut slots),
-                param(&mut count),
-                param(&mut source_keys),
-                param(&mut source_observations),
-                param(&mut source_embeddings),
-            ];
-
-            self.launch(
-                self.shared.kernels.scatter_context,
-                embeddings.len().max(changes.context_slots.len()),
-                THREADS,
-                &mut params,
+        if !update.context_slots.is_empty() {
+            let dim = self.model.config.context.embedding_dim;
+            if update.context_keys.len() != update.context_slots.len()
+                || update.context_observations.len() != update.context_slots.len()
+                || update.context_embeddings.len() != update.context_slots.len().saturating_mul(dim)
+            {
+                return Err(LeoError::cuda(
+                    "packed context rows have invalid dimensions",
+                ));
+            }
+            self.copy_to_device(scratch.changed_context_list, &update.context_slots)?;
+            self.copy_to_device(scratch.gather_context_keys, &update.context_keys)?;
+            self.copy_to_device(
+                scratch.gather_context_observations,
+                &update.context_observations,
             )?;
+            self.copy_to_device(
+                scratch.gather_context_embeddings,
+                &update.context_embeddings,
+            )?;
+            for target in &targets {
+                let mut target_keys = target.context_keys.pointer;
+                let mut target_observations = target.context_observations.pointer;
+                let mut target_embeddings = target.context_embeddings.pointer;
+                let mut embedding_dim = as_u32("context embedding dim", dim)?;
+                let mut slots = scratch.changed_context_list.pointer;
+                let mut count = as_u32("context slot count", update.context_slots.len())?;
+                let mut source_keys = scratch.gather_context_keys.pointer;
+                let mut source_observations = scratch.gather_context_observations.pointer;
+                let mut source_embeddings = scratch.gather_context_embeddings.pointer;
+                let mut params = [
+                    param(&mut target_keys),
+                    param(&mut target_observations),
+                    param(&mut target_embeddings),
+                    param(&mut embedding_dim),
+                    param(&mut slots),
+                    param(&mut count),
+                    param(&mut source_keys),
+                    param(&mut source_observations),
+                    param(&mut source_embeddings),
+                ];
+                self.launch(
+                    self.shared.kernels.scatter_context,
+                    update
+                        .context_embeddings
+                        .len()
+                        .max(update.context_slots.len()),
+                    THREADS,
+                    &mut params,
+                )?;
+            }
         }
 
-        // Small dense vectors; copying these whole is cheaper than
-        // building another sparse representation.
-        if changes.output_bias_dirty {
-            self.copy_to_device(b.output_bias, &canonical.output.bias)?;
+        if let Some(values) = &update.output_bias {
+            if values.len() != OUTPUT_CLASSES {
+                return Err(LeoError::cuda("packed output bias has invalid dimensions"));
+            }
+            self.copy_to_device(scratch.output_bias, values)?;
+            for lane in lanes.iter() {
+                self.copy_device_to_device_async_on(
+                    lane.buffers.output_bias,
+                    scratch.output_bias,
+                    self.compute_stream,
+                )?;
+            }
         }
 
-        if changes.context_output_dirty {
-            self.copy_to_device(b.context_output_weight, &canonical.context.output_weights)?;
+        if let Some(values) = &update.context_output_weights {
+            if values.len() != self.model.context.output_weights.len() {
+                return Err(LeoError::cuda(
+                    "packed context output weights have invalid dimensions",
+                ));
+            }
+            self.copy_to_device(scratch.context_output_weight, values)?;
+            for lane in lanes.iter() {
+                self.copy_device_to_device_async_on(
+                    lane.buffers.context_output_weight,
+                    scratch.context_output_weight,
+                    self.compute_stream,
+                )?;
+            }
         }
 
         self.synchronize()?;
-
-        // ----------------------------------------------------
-        // Sparse host mirror synchronization
-        // ----------------------------------------------------
-
-        for &index in &changes.threshold {
-            self.model.neurons.threshold[index] = canonical.neurons.threshold[index];
+        let revision = update.parameter_revision;
+        for lane in lanes.iter_mut() {
+            lane.model_revision = revision;
         }
-
-        for &index in &changes.recurrent_weight {
-            self.model.recurrent.weight[index] = canonical.recurrent.weight[index];
-        }
-
-        for &index in &changes.input_weight {
-            self.model.input.weights[index] = canonical.input.weights[index];
-        }
-
-        let neuron_count = canonical.neuron_count();
-
-        for &neuron in &changes.output_neurons {
-            for output in 0..OUTPUT_CLASSES {
-                let index = output * neuron_count + neuron;
-
-                self.model.output.weights[index] = canonical.output.weights[index];
-            }
-        }
-
-        let dim = canonical.config.context.embedding_dim;
-
-        for &slot in &changes.context_slots {
-            self.model.context.keys[slot] = canonical.context.keys[slot];
-
-            self.model.context.observations[slot] = canonical.context.observations[slot];
-
-            let start = slot * dim;
-
-            self.model.context.embeddings[start..start + dim]
-                .copy_from_slice(&canonical.context.embeddings[start..start + dim]);
-        }
-
-        if changes.output_bias_dirty {
-            self.model.output.bias.clone_from(&canonical.output.bias);
-        }
-
-        if changes.context_output_dirty {
-            self.model
-                .context
-                .output_weights
-                .clone_from(&canonical.context.output_weights);
-        }
-
-        self.model.generation = canonical.generation;
-
-        self.model.parameter_revision = canonical.parameter_revision;
-
-        self.model.statistics = canonical.statistics.clone();
-
         self.model_dirty = false;
-        self.track_parameter_changes = false;
-
+        if clear_tracking {
+            self.track_parameter_changes = false;
+        }
         self.output_bias_dirty_since_sync = false;
         self.context_output_dirty_since_sync = false;
-
         Ok(())
     }
 
@@ -4804,6 +4826,11 @@ impl CudaRuntime {
         self.host_batch_base_ticks = self.allocate_pinned_host(
             GPU_STORY_BATCH_MAX_LANES.saturating_mul(mem::size_of::<u64>()),
         )?;
+        self.host_batch_change_counts = self.allocate_pinned_host(
+            GPU_STORY_BATCH_MAX_LANES
+                .saturating_mul(5)
+                .saturating_mul(mem::size_of::<u32>()),
+        )?;
         self.buffers = b;
         Ok(())
     }
@@ -5063,393 +5090,421 @@ impl CudaRuntime {
         Ok(())
     }
 
-    fn snapshot_batch_lane_values(
+    fn snapshot_batch_lane_values_batched(
         &mut self,
-        lane: &CudaBatchLane,
-        output_bias_dirty: bool,
-        context_output_dirty: bool,
-        revision_increment: u64,
-        statistics: StatisticsDelta,
-    ) -> LeoResult<(ParameterChanges, TrackedModelValues)> {
-        let b = lane.buffers;
-        let threshold =
-            self.read_change_list(b.changed_threshold_list, b.changed_threshold_count)?;
-        let recurrent_weight =
-            self.read_change_list(b.changed_recurrent_list, b.changed_recurrent_count)?;
-        let input_weight = self.read_change_list(b.changed_input_list, b.changed_input_count)?;
-        let output_neurons =
-            self.read_change_list(b.changed_output_list, b.changed_output_count)?;
-        let context_slots =
-            self.read_change_list(b.changed_context_list, b.changed_context_count)?;
-        let changes = ParameterChanges {
-            threshold,
-            recurrent_weight,
-            input_weight,
-            output_neurons,
-            context_slots,
-            output_bias_dirty,
-            context_output_dirty,
-        };
-        let scratch = self.buffers;
+        lanes: &[CudaBatchLane],
+        output_bias_dirty: &[bool],
+        context_output_dirty: &[bool],
+        revision_increment: &[u64],
+        statistics: &[StatisticsDelta],
+    ) -> LeoResult<Vec<(ParameterChanges, TrackedModelValues)>> {
+        self.make_current()?;
+        let lane_count = lanes.len();
+        if output_bias_dirty.len() != lane_count
+            || context_output_dirty.len() != lane_count
+            || revision_increment.len() != lane_count
+            || statistics.len() != lane_count
+        {
+            return Err(LeoError::cuda(
+                "batched story snapshot metadata does not match lane count",
+            ));
+        }
+        if lane_count == 0 {
+            return Ok(Vec::new());
+        }
 
-        if !changes.threshold.is_empty() {
-            self.launch_gather_f32(
-                b.threshold,
-                b.changed_threshold_list,
+        // Compact all five change counters from every lane into one device
+        // vector, then download that vector with one D2H operation. This first
+        // tiny synchronization is required to size the variable payload.
+        let count_elements = lane_count.saturating_mul(5);
+        self.ensure_batch_snapshot_capacity(0, count_elements, 0)?;
+        self.record_event(
+            self.events.compute_done,
+            self.compute_stream,
+            "cuEventRecord(batch snapshot counts ready)",
+        )?;
+        self.stream_wait_event(
+            self.transfer_stream,
+            self.events.compute_done,
+            "cuStreamWaitEvent(batch snapshot counts ready)",
+        )?;
+        for (lane_index, lane) in lanes.iter().enumerate() {
+            let b = lane.buffers;
+            for (kind, count_buffer) in [
                 b.changed_threshold_count,
-                scratch.gather_threshold,
-                changes.threshold.len(),
-            )?;
-        }
-        if !changes.recurrent_weight.is_empty() {
-            self.launch_gather_f32(
-                b.recurrent_weight,
-                b.changed_recurrent_list,
                 b.changed_recurrent_count,
-                scratch.gather_recurrent,
-                changes.recurrent_weight.len(),
-            )?;
-        }
-        if !changes.input_weight.is_empty() {
-            self.launch_gather_f32(
-                b.input_weight,
-                b.changed_input_list,
                 b.changed_input_count,
-                scratch.gather_input,
-                changes.input_weight.len(),
-            )?;
-        }
-        if !changes.output_neurons.is_empty() {
-            let mut source = b.output_weight.pointer;
-            let mut indices = b.changed_output_list.pointer;
-            let mut count = b.changed_output_count.pointer;
-            let mut output = scratch.gather_output.pointer;
-            let mut params = [
-                param(&mut source),
-                param(&mut indices),
-                param(&mut count),
-                param(&mut output),
-            ];
-            self.launch(
-                self.shared.kernels.gather_output,
-                changes.output_neurons.len().saturating_mul(OUTPUT_CLASSES),
-                THREADS,
-                &mut params,
-            )?;
-        }
-        if !changes.context_slots.is_empty() {
-            let mut keys = b.context_keys.pointer;
-            let mut observations = b.context_observations.pointer;
-            let mut embeddings = b.context_embeddings.pointer;
-            let mut embedding_dim = as_u32(
-                "context embedding dim",
-                self.model.config.context.embedding_dim,
-            )?;
-            let mut indices = b.changed_context_list.pointer;
-            let mut count = b.changed_context_count.pointer;
-            let mut out_keys = scratch.gather_context_keys.pointer;
-            let mut out_obs = scratch.gather_context_observations.pointer;
-            let mut out_embeddings = scratch.gather_context_embeddings.pointer;
-            let mut params = [
-                param(&mut keys),
-                param(&mut observations),
-                param(&mut embeddings),
-                param(&mut embedding_dim),
-                param(&mut indices),
-                param(&mut count),
-                param(&mut out_keys),
-                param(&mut out_obs),
-                param(&mut out_embeddings),
-            ];
-            self.launch(
-                self.shared.kernels.gather_context,
-                changes
-                    .context_slots
-                    .len()
-                    .saturating_mul(self.model.config.context.embedding_dim)
-                    .max(changes.context_slots.len()),
-                THREADS,
-                &mut params,
-            )?;
-        }
-        self.synchronize()?;
-
-        let mut values = TrackedModelValues {
-            revision_increment,
-            statistics,
-            ..TrackedModelValues::default()
-        };
-        values.threshold = vec![0.0; changes.threshold.len()];
-        values.recurrent_weight = vec![0.0; changes.recurrent_weight.len()];
-        values.input_weight = vec![0.0; changes.input_weight.len()];
-        values.output_weight_by_neuron =
-            vec![0.0; changes.output_neurons.len().saturating_mul(OUTPUT_CLASSES)];
-        values.context_keys = vec![0; changes.context_slots.len()];
-        values.context_observations = vec![0; changes.context_slots.len()];
-        let context_dim = self.model.config.context.embedding_dim;
-        values.context_embeddings =
-            vec![0.0; changes.context_slots.len().saturating_mul(context_dim)];
-
-        if !values.threshold.is_empty() {
-            self.copy_from_device_prefix(scratch.gather_threshold, &mut values.threshold)?;
-        }
-        if !values.recurrent_weight.is_empty() {
-            self.copy_from_device_prefix(scratch.gather_recurrent, &mut values.recurrent_weight)?;
-        }
-        if !values.input_weight.is_empty() {
-            self.copy_from_device_prefix(scratch.gather_input, &mut values.input_weight)?;
-        }
-        if !values.output_weight_by_neuron.is_empty() {
-            self.copy_from_device_prefix(
-                scratch.gather_output,
-                &mut values.output_weight_by_neuron,
-            )?;
-        }
-        if output_bias_dirty {
-            let mut output_bias = vec![0.0; OUTPUT_CLASSES];
-            self.copy_from_device(b.output_bias, &mut output_bias)?;
-            values.output_bias = Some(output_bias);
-        }
-        if !values.context_keys.is_empty() {
-            self.copy_from_device_prefix(scratch.gather_context_keys, &mut values.context_keys)?;
-            self.copy_from_device_prefix(
-                scratch.gather_context_observations,
-                &mut values.context_observations,
-            )?;
-            self.copy_from_device_prefix(
-                scratch.gather_context_embeddings,
-                &mut values.context_embeddings,
-            )?;
-        }
-        if context_output_dirty {
-            let mut context_output = vec![0.0; self.model.context.output_weights.len()];
-            self.copy_from_device(b.context_output_weight, &mut context_output)?;
-            values.context_output_weight = Some(context_output);
-        }
-
-        for (marks, list, count, changed_count) in [
-            (
-                b.changed_threshold_marks,
-                b.changed_threshold_list,
-                b.changed_threshold_count,
-                changes.threshold.len(),
-            ),
-            (
-                b.changed_recurrent_marks,
-                b.changed_recurrent_list,
-                b.changed_recurrent_count,
-                changes.recurrent_weight.len(),
-            ),
-            (
-                b.changed_input_marks,
-                b.changed_input_list,
-                b.changed_input_count,
-                changes.input_weight.len(),
-            ),
-            (
-                b.changed_output_marks,
-                b.changed_output_list,
                 b.changed_output_count,
-                changes.output_neurons.len(),
-            ),
-            (
-                b.changed_context_marks,
-                b.changed_context_list,
                 b.changed_context_count,
-                changes.context_slots.len(),
-            ),
-        ] {
-            self.clear_change_list(marks, list, count, changed_count)?;
-        }
-        self.synchronize()?;
-        Ok((changes, values))
-    }
-
-    /// Upload sparse values from the canonical host mirror into this runtime's
-    /// resident canonical CUDA parameter buffers. This deliberately does not
-    /// clone the complete model and does not touch transient state.
-    pub(crate) fn upload_current_sparse_model(
-        &mut self,
-        changes: &ParameterChanges,
-    ) -> LeoResult<()> {
-        let b = self.buffers;
-        let to_u32 = |label: &str, indices: &[usize]| -> LeoResult<Vec<u32>> {
-            indices.iter().map(|&value| as_u32(label, value)).collect()
-        };
-
-        let threshold_indices = to_u32("threshold", &changes.threshold)?;
-        let threshold_values = changes
-            .threshold
-            .iter()
-            .map(|&index| self.model.neurons.threshold[index])
-            .collect::<Vec<_>>();
-        let recurrent_indices = to_u32("recurrent", &changes.recurrent_weight)?;
-        let recurrent_values = changes
-            .recurrent_weight
-            .iter()
-            .map(|&index| self.model.recurrent.weight[index])
-            .collect::<Vec<_>>();
-        let input_indices = to_u32("input", &changes.input_weight)?;
-        let input_values = changes
-            .input_weight
-            .iter()
-            .map(|&index| self.model.input.weights[index])
-            .collect::<Vec<_>>();
-        let output_indices = to_u32("output neuron", &changes.output_neurons)?;
-        let neuron_count = self.model.neuron_count();
-        let mut output_values =
-            Vec::with_capacity(changes.output_neurons.len().saturating_mul(OUTPUT_CLASSES));
-        for &neuron in &changes.output_neurons {
-            if neuron >= neuron_count {
-                return Err(LeoError::cuda(
-                    "output neuron sparse upload index is out of range",
-                ));
-            }
-            for output in 0..OUTPUT_CLASSES {
-                output_values.push(self.model.output.weights[output * neuron_count + neuron]);
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                self.copy_device_to_device_async_on(
+                    device_sub_buffer::<u32>(
+                        self.batch_snapshot_device_u32,
+                        lane_index * 5 + kind,
+                        1,
+                    )?,
+                    count_buffer,
+                    self.transfer_stream,
+                )?;
             }
         }
-        let context_indices = to_u32("context slot", &changes.context_slots)?;
-        let dim = self.model.config.context.embedding_dim;
-        let mut context_keys = Vec::with_capacity(changes.context_slots.len());
-        let mut context_observations = Vec::with_capacity(changes.context_slots.len());
-        let mut context_embeddings =
-            Vec::with_capacity(changes.context_slots.len().saturating_mul(dim));
-        for &slot in &changes.context_slots {
-            if slot >= self.model.context.keys.len() {
-                return Err(LeoError::cuda("context sparse upload slot is out of range"));
-            }
-            context_keys.push(self.model.context.keys[slot]);
-            context_observations.push(self.model.context.observations[slot]);
-            let start = slot * dim;
-            context_embeddings
-                .extend_from_slice(&self.model.context.embeddings[start..start + dim]);
+        self.copy_device_to_pinned_async_on::<u32>(
+            self.host_batch_change_counts,
+            self.batch_snapshot_device_u32,
+            count_elements,
+            self.transfer_stream,
+        )?;
+        self.shared.driver.check(
+            unsafe { (self.shared.driver.stream_synchronize)(self.transfer_stream) },
+            "cuStreamSynchronize(batch snapshot counts)",
+        )?;
+        let counts = pinned_read_vec::<u32>(self.host_batch_change_counts, count_elements)?;
+
+        fn take_span(cursor: &mut usize, len: usize) -> SnapshotSpan {
+            let span = SnapshotSpan {
+                offset: *cursor,
+                len,
+            };
+            *cursor = (*cursor).saturating_add(len);
+            span
         }
-        let output_bias = changes
-            .output_bias_dirty
-            .then(|| self.model.output.bias.clone());
-        let context_output = changes
-            .context_output_dirty
-            .then(|| self.model.context.output_weights.clone());
 
-        let scatter_f32 = |target: DeviceBuffer,
-                           index_buffer: DeviceBuffer,
-                           value_buffer: DeviceBuffer,
-                           indices: &[u32],
-                           values: &[f32],
-                           label: &str|
-         -> LeoResult<()> {
-            if indices.is_empty() {
-                return Ok(());
+        let context_dim = self.model.config.context.embedding_dim;
+        let context_output_len = self.model.context.output_weights.len();
+        let mut u32_cursor = 0usize;
+        let mut u64_cursor = 0usize;
+        let mut f32_cursor = 0usize;
+        let mut layouts = Vec::with_capacity(lane_count);
+        for lane_index in 0..lane_count {
+            let base = lane_index * 5;
+            let threshold_count = counts[base] as usize;
+            let recurrent_count = counts[base + 1] as usize;
+            let input_count = counts[base + 2] as usize;
+            let output_count = counts[base + 3] as usize;
+            let context_count = counts[base + 4] as usize;
+            layouts.push(BatchLaneSnapshotLayout {
+                threshold_indices: take_span(&mut u32_cursor, threshold_count),
+                recurrent_indices: take_span(&mut u32_cursor, recurrent_count),
+                input_indices: take_span(&mut u32_cursor, input_count),
+                output_indices: take_span(&mut u32_cursor, output_count),
+                context_indices: take_span(&mut u32_cursor, context_count),
+                context_observations: take_span(&mut u32_cursor, context_count),
+                context_keys: take_span(&mut u64_cursor, context_count),
+                threshold_values: take_span(&mut f32_cursor, threshold_count),
+                recurrent_values: take_span(&mut f32_cursor, recurrent_count),
+                input_values: take_span(&mut f32_cursor, input_count),
+                output_values: take_span(
+                    &mut f32_cursor,
+                    output_count.saturating_mul(OUTPUT_CLASSES),
+                ),
+                context_embeddings: take_span(
+                    &mut f32_cursor,
+                    context_count.saturating_mul(context_dim),
+                ),
+                output_bias: output_bias_dirty[lane_index]
+                    .then(|| take_span(&mut f32_cursor, OUTPUT_CLASSES)),
+                context_output: context_output_dirty[lane_index]
+                    .then(|| take_span(&mut f32_cursor, context_output_len)),
+            });
+        }
+
+        self.ensure_batch_snapshot_capacity(f32_cursor, u32_cursor, u64_cursor)?;
+
+        // Pack every sparse index list into the aggregate u32 device buffer.
+        // These are device-local copies and can overlap the value-gather kernels
+        // below; the context-observation spans occupy separate u32 regions.
+        for (lane, layout) in lanes.iter().zip(&layouts) {
+            let b = lane.buffers;
+            for (span, source) in [
+                (layout.threshold_indices, b.changed_threshold_list),
+                (layout.recurrent_indices, b.changed_recurrent_list),
+                (layout.input_indices, b.changed_input_list),
+                (layout.output_indices, b.changed_output_list),
+                (layout.context_indices, b.changed_context_list),
+            ] {
+                if span.len != 0 {
+                    self.copy_device_to_device_async_on(
+                        device_sub_buffer::<u32>(
+                            self.batch_snapshot_device_u32,
+                            span.offset,
+                            span.len,
+                        )?,
+                        device_sub_buffer::<u32>(source, 0, span.len)?,
+                        self.transfer_stream,
+                    )?;
+                }
             }
-            self.copy_to_device(index_buffer, indices)?;
-            self.copy_to_device(value_buffer, values)?;
-            let mut target_ptr = target.pointer;
-            let mut indices_ptr = index_buffer.pointer;
-            let mut count = as_u32(label, indices.len())?;
-            let mut values_ptr = value_buffer.pointer;
-            let mut params = [
-                param(&mut target_ptr),
-                param(&mut indices_ptr),
-                param(&mut count),
-                param(&mut values_ptr),
-            ];
-            self.launch(
-                self.shared.kernels.scatter_f32,
-                indices.len(),
-                THREADS,
-                &mut params,
-            )
-        };
-        scatter_f32(
-            b.threshold,
-            b.changed_threshold_list,
-            b.gather_threshold,
-            &threshold_indices,
-            &threshold_values,
-            "threshold count",
+        }
+
+        // Queue every gather first. Each lane writes to a disjoint region of
+        // the aggregate device buffers, so no per-lane synchronization is
+        // needed even though the canonical runtime owns the kernels/stream.
+        for (lane, layout) in lanes.iter().zip(&layouts) {
+            let b = lane.buffers;
+            if layout.threshold_values.len != 0 {
+                self.launch_gather_f32(
+                    b.threshold,
+                    b.changed_threshold_list,
+                    b.changed_threshold_count,
+                    device_sub_buffer::<f32>(
+                        self.batch_snapshot_device_f32,
+                        layout.threshold_values.offset,
+                        layout.threshold_values.len,
+                    )?,
+                    layout.threshold_values.len,
+                )?;
+            }
+            if layout.recurrent_values.len != 0 {
+                self.launch_gather_f32(
+                    b.recurrent_weight,
+                    b.changed_recurrent_list,
+                    b.changed_recurrent_count,
+                    device_sub_buffer::<f32>(
+                        self.batch_snapshot_device_f32,
+                        layout.recurrent_values.offset,
+                        layout.recurrent_values.len,
+                    )?,
+                    layout.recurrent_values.len,
+                )?;
+            }
+            if layout.input_values.len != 0 {
+                self.launch_gather_f32(
+                    b.input_weight,
+                    b.changed_input_list,
+                    b.changed_input_count,
+                    device_sub_buffer::<f32>(
+                        self.batch_snapshot_device_f32,
+                        layout.input_values.offset,
+                        layout.input_values.len,
+                    )?,
+                    layout.input_values.len,
+                )?;
+            }
+            if layout.output_indices.len != 0 {
+                let mut source = b.output_weight.pointer;
+                let mut indices = b.changed_output_list.pointer;
+                let mut count = b.changed_output_count.pointer;
+                let output_buffer = device_sub_buffer::<f32>(
+                    self.batch_snapshot_device_f32,
+                    layout.output_values.offset,
+                    layout.output_values.len,
+                )?;
+                let mut output = output_buffer.pointer;
+                let mut params = [
+                    param(&mut source),
+                    param(&mut indices),
+                    param(&mut count),
+                    param(&mut output),
+                ];
+                self.launch(
+                    self.shared.kernels.gather_output,
+                    layout.output_values.len,
+                    THREADS,
+                    &mut params,
+                )?;
+            }
+            if layout.context_indices.len != 0 {
+                let mut keys = b.context_keys.pointer;
+                let mut observations = b.context_observations.pointer;
+                let mut embeddings = b.context_embeddings.pointer;
+                let mut embedding_dim = as_u32("context embedding dim", context_dim)?;
+                let mut indices = b.changed_context_list.pointer;
+                let mut count = b.changed_context_count.pointer;
+                let key_buffer = device_sub_buffer::<u64>(
+                    self.batch_snapshot_device_u64,
+                    layout.context_keys.offset,
+                    layout.context_keys.len,
+                )?;
+                let obs_buffer = device_sub_buffer::<u32>(
+                    self.batch_snapshot_device_u32,
+                    layout.context_observations.offset,
+                    layout.context_observations.len,
+                )?;
+                let embedding_buffer = device_sub_buffer::<f32>(
+                    self.batch_snapshot_device_f32,
+                    layout.context_embeddings.offset,
+                    layout.context_embeddings.len,
+                )?;
+                let mut out_keys = key_buffer.pointer;
+                let mut out_obs = obs_buffer.pointer;
+                let mut out_embeddings = embedding_buffer.pointer;
+                let mut params = [
+                    param(&mut keys),
+                    param(&mut observations),
+                    param(&mut embeddings),
+                    param(&mut embedding_dim),
+                    param(&mut indices),
+                    param(&mut count),
+                    param(&mut out_keys),
+                    param(&mut out_obs),
+                    param(&mut out_embeddings),
+                ];
+                self.launch(
+                    self.shared.kernels.gather_context,
+                    layout
+                        .context_embeddings
+                        .len
+                        .max(layout.context_indices.len),
+                    THREADS,
+                    &mut params,
+                )?;
+            }
+        }
+
+        self.record_event(
+            self.events.compute_done,
+            self.compute_stream,
+            "cuEventRecord(batch sparse gathers ready)",
         )?;
-        scatter_f32(
-            b.recurrent_weight,
-            b.changed_recurrent_list,
-            b.gather_recurrent,
-            &recurrent_indices,
-            &recurrent_values,
-            "recurrent count",
-        )?;
-        scatter_f32(
-            b.input_weight,
-            b.changed_input_list,
-            b.gather_input,
-            &input_indices,
-            &input_values,
-            "input count",
+        self.stream_wait_event(
+            self.transfer_stream,
+            self.events.compute_done,
+            "cuStreamWaitEvent(batch sparse gathers ready)",
         )?;
 
-        if !output_indices.is_empty() {
-            self.copy_to_device(b.changed_output_list, &output_indices)?;
-            self.copy_to_device(b.gather_output, &output_values)?;
-            let mut target = b.output_weight.pointer;
-            let mut indices = b.changed_output_list.pointer;
-            let mut count = as_u32("output neuron count", output_indices.len())?;
-            let mut packed = b.gather_output.pointer;
-            let mut params = [
-                param(&mut target),
-                param(&mut indices),
-                param(&mut count),
-                param(&mut packed),
-            ];
-            self.launch(
-                self.shared.kernels.scatter_output,
-                output_values.len(),
-                THREADS,
-                &mut params,
+        // Bias/context-output rows are already contiguous, so stage them into
+        // their reserved aggregate f32 spans with device-local copies. Then the
+        // entire variable payload crosses PCIe in at most three D2H operations:
+        // one f32 buffer, one u32 buffer, and one u64 buffer.
+        for (lane, layout) in lanes.iter().zip(&layouts) {
+            let b = lane.buffers;
+            if let Some(span) = layout.output_bias {
+                self.copy_device_to_device_async_on(
+                    device_sub_buffer::<f32>(
+                        self.batch_snapshot_device_f32,
+                        span.offset,
+                        span.len,
+                    )?,
+                    b.output_bias,
+                    self.transfer_stream,
+                )?;
+            }
+            if let Some(span) = layout.context_output {
+                self.copy_device_to_device_async_on(
+                    device_sub_buffer::<f32>(
+                        self.batch_snapshot_device_f32,
+                        span.offset,
+                        span.len,
+                    )?,
+                    b.context_output_weight,
+                    self.transfer_stream,
+                )?;
+            }
+        }
+        if f32_cursor != 0 {
+            self.copy_device_to_pinned_async_on::<f32>(
+                self.batch_snapshot_host_f32,
+                self.batch_snapshot_device_f32,
+                f32_cursor,
+                self.transfer_stream,
             )?;
         }
-
-        if !context_indices.is_empty() {
-            self.copy_to_device(b.changed_context_list, &context_indices)?;
-            self.copy_to_device(b.gather_context_keys, &context_keys)?;
-            self.copy_to_device(b.gather_context_observations, &context_observations)?;
-            self.copy_to_device(b.gather_context_embeddings, &context_embeddings)?;
-            let mut target_keys = b.context_keys.pointer;
-            let mut target_observations = b.context_observations.pointer;
-            let mut target_embeddings = b.context_embeddings.pointer;
-            let mut embedding_dim = as_u32("context embedding dim", dim)?;
-            let mut slots = b.changed_context_list.pointer;
-            let mut count = as_u32("context slot count", context_indices.len())?;
-            let mut source_keys = b.gather_context_keys.pointer;
-            let mut source_observations = b.gather_context_observations.pointer;
-            let mut source_embeddings = b.gather_context_embeddings.pointer;
-            let mut params = [
-                param(&mut target_keys),
-                param(&mut target_observations),
-                param(&mut target_embeddings),
-                param(&mut embedding_dim),
-                param(&mut slots),
-                param(&mut count),
-                param(&mut source_keys),
-                param(&mut source_observations),
-                param(&mut source_embeddings),
-            ];
-            self.launch(
-                self.shared.kernels.scatter_context,
-                context_embeddings.len().max(context_indices.len()),
-                THREADS,
-                &mut params,
+        if u32_cursor != 0 {
+            self.copy_device_to_pinned_async_on::<u32>(
+                self.batch_snapshot_host_u32,
+                self.batch_snapshot_device_u32,
+                u32_cursor,
+                self.transfer_stream,
             )?;
         }
-        if let Some(values) = output_bias {
-            self.copy_to_device(b.output_bias, &values)?;
+        if u64_cursor != 0 {
+            self.copy_device_to_pinned_async_on::<u64>(
+                self.batch_snapshot_host_u64,
+                self.batch_snapshot_device_u64,
+                u64_cursor,
+                self.transfer_stream,
+            )?;
         }
-        if let Some(values) = context_output {
-            self.copy_to_device(b.context_output_weight, &values)?;
+        self.shared.driver.check(
+            unsafe { (self.shared.driver.stream_synchronize)(self.transfer_stream) },
+            "cuStreamSynchronize(batched sparse snapshot)",
+        )?;
+
+        let host_u32 = pinned_read_vec::<u32>(self.batch_snapshot_host_u32, u32_cursor)?;
+        let host_u64 = pinned_read_vec::<u64>(self.batch_snapshot_host_u64, u64_cursor)?;
+        let host_f32 = pinned_read_vec::<f32>(self.batch_snapshot_host_f32, f32_cursor)?;
+        let usize_values = |span: SnapshotSpan| {
+            host_u32[span.offset..span.offset + span.len]
+                .iter()
+                .map(|&value| value as usize)
+                .collect::<Vec<_>>()
+        };
+        let mut snapshots = Vec::with_capacity(lane_count);
+        for lane_index in 0..lane_count {
+            let layout = &layouts[lane_index];
+            let changes = ParameterChanges {
+                threshold: usize_values(layout.threshold_indices),
+                recurrent_weight: usize_values(layout.recurrent_indices),
+                input_weight: usize_values(layout.input_indices),
+                output_neurons: usize_values(layout.output_indices),
+                context_slots: usize_values(layout.context_indices),
+                output_bias_dirty: output_bias_dirty[lane_index],
+                context_output_dirty: context_output_dirty[lane_index],
+            };
+            let f32_values =
+                |span: SnapshotSpan| host_f32[span.offset..span.offset + span.len].to_vec();
+            let values = TrackedModelValues {
+                threshold: f32_values(layout.threshold_values),
+                recurrent_weight: f32_values(layout.recurrent_values),
+                input_weight: f32_values(layout.input_values),
+                output_weight_by_neuron: f32_values(layout.output_values),
+                output_bias: layout.output_bias.map(f32_values),
+                context_keys: host_u64[layout.context_keys.offset
+                    ..layout.context_keys.offset + layout.context_keys.len]
+                    .to_vec(),
+                context_observations: host_u32[layout.context_observations.offset
+                    ..layout.context_observations.offset + layout.context_observations.len]
+                    .to_vec(),
+                context_embeddings: f32_values(layout.context_embeddings),
+                context_output_weight: layout.context_output.map(f32_values),
+                revision_increment: revision_increment[lane_index],
+                statistics: statistics[lane_index].clone(),
+            };
+            snapshots.push((changes, values));
+        }
+
+        for (lane, layout) in lanes.iter().zip(&layouts) {
+            let b = lane.buffers;
+            for (marks, list, count, changed_count) in [
+                (
+                    b.changed_threshold_marks,
+                    b.changed_threshold_list,
+                    b.changed_threshold_count,
+                    layout.threshold_indices.len,
+                ),
+                (
+                    b.changed_recurrent_marks,
+                    b.changed_recurrent_list,
+                    b.changed_recurrent_count,
+                    layout.recurrent_indices.len,
+                ),
+                (
+                    b.changed_input_marks,
+                    b.changed_input_list,
+                    b.changed_input_count,
+                    layout.input_indices.len,
+                ),
+                (
+                    b.changed_output_marks,
+                    b.changed_output_list,
+                    b.changed_output_count,
+                    layout.output_indices.len,
+                ),
+                (
+                    b.changed_context_marks,
+                    b.changed_context_list,
+                    b.changed_context_count,
+                    layout.context_indices.len,
+                ),
+            ] {
+                self.clear_change_list(marks, list, count, changed_count)?;
+            }
         }
         self.synchronize()?;
-        self.model_dirty = false;
-        self.output_bias_dirty_since_sync = false;
-        self.context_output_dirty_since_sync = false;
-        Ok(())
+        Ok(snapshots)
     }
 
     fn read_change_list(&self, list: DeviceBuffer, count: DeviceBuffer) -> LeoResult<Vec<usize>> {
@@ -5624,6 +5679,80 @@ impl CudaRuntime {
             "cuMemAllocHost",
         )?;
         Ok(PinnedHostBuffer { pointer, bytes })
+    }
+
+    fn ensure_batch_snapshot_capacity(
+        &mut self,
+        f32_elements: usize,
+        u32_elements: usize,
+        u64_elements: usize,
+    ) -> LeoResult<()> {
+        let f32_bytes = f32_elements.saturating_mul(mem::size_of::<f32>());
+        if f32_bytes > self.batch_snapshot_device_f32.bytes {
+            let replacement = self.allocate_f32(f32_elements.max(1))?;
+            let old = std::mem::replace(&mut self.batch_snapshot_device_f32, replacement);
+            if old.pointer != 0 {
+                self.shared.driver.check(
+                    unsafe { (self.shared.driver.mem_free)(old.pointer) },
+                    "cuMemFree(batch snapshot f32)",
+                )?;
+            }
+        }
+        if f32_bytes > self.batch_snapshot_host_f32.bytes {
+            let replacement = self.allocate_pinned_host(f32_bytes.max(1))?;
+            let old = std::mem::replace(&mut self.batch_snapshot_host_f32, replacement);
+            if !old.pointer.is_null() {
+                self.shared.driver.check(
+                    unsafe { (self.shared.driver.mem_free_host)(old.pointer) },
+                    "cuMemFreeHost(batch snapshot f32)",
+                )?;
+            }
+        }
+
+        let u32_bytes = u32_elements.saturating_mul(mem::size_of::<u32>());
+        if u32_bytes > self.batch_snapshot_device_u32.bytes {
+            let replacement = self.allocate_u32(u32_elements.max(1))?;
+            let old = std::mem::replace(&mut self.batch_snapshot_device_u32, replacement);
+            if old.pointer != 0 {
+                self.shared.driver.check(
+                    unsafe { (self.shared.driver.mem_free)(old.pointer) },
+                    "cuMemFree(batch snapshot u32)",
+                )?;
+            }
+        }
+        if u32_bytes > self.batch_snapshot_host_u32.bytes {
+            let replacement = self.allocate_pinned_host(u32_bytes.max(1))?;
+            let old = std::mem::replace(&mut self.batch_snapshot_host_u32, replacement);
+            if !old.pointer.is_null() {
+                self.shared.driver.check(
+                    unsafe { (self.shared.driver.mem_free_host)(old.pointer) },
+                    "cuMemFreeHost(batch snapshot u32)",
+                )?;
+            }
+        }
+
+        let u64_bytes = u64_elements.saturating_mul(mem::size_of::<u64>());
+        if u64_bytes > self.batch_snapshot_device_u64.bytes {
+            let replacement = self.allocate_u64(u64_elements.max(1))?;
+            let old = std::mem::replace(&mut self.batch_snapshot_device_u64, replacement);
+            if old.pointer != 0 {
+                self.shared.driver.check(
+                    unsafe { (self.shared.driver.mem_free)(old.pointer) },
+                    "cuMemFree(batch snapshot u64)",
+                )?;
+            }
+        }
+        if u64_bytes > self.batch_snapshot_host_u64.bytes {
+            let replacement = self.allocate_pinned_host(u64_bytes.max(1))?;
+            let old = std::mem::replace(&mut self.batch_snapshot_host_u64, replacement);
+            if !old.pointer.is_null() {
+                self.shared.driver.check(
+                    unsafe { (self.shared.driver.mem_free_host)(old.pointer) },
+                    "cuMemFreeHost(batch snapshot u64)",
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn copy_pinned_to_device_async_on<T>(
@@ -6339,10 +6468,25 @@ impl Drop for CudaRuntime {
             }
         }
         for buffer in [
+            self.batch_snapshot_device_f32,
+            self.batch_snapshot_device_u32,
+            self.batch_snapshot_device_u64,
+        ] {
+            if buffer.pointer != 0 {
+                unsafe {
+                    (self.shared.driver.mem_free)(buffer.pointer);
+                }
+            }
+        }
+        for buffer in [
             self.host_batch_pointer_tables,
             self.host_batch_step_buffers,
             self.host_batch_step_counts,
             self.host_batch_base_ticks,
+            self.host_batch_change_counts,
+            self.batch_snapshot_host_f32,
+            self.batch_snapshot_host_u32,
+            self.batch_snapshot_host_u64,
         ] {
             if !buffer.pointer.is_null() {
                 unsafe {
@@ -7285,14 +7429,18 @@ pub(crate) fn train_story_batch_shared_device(
     // never visible to another lane during a story.
     let mut deltas = Vec::with_capacity(lanes.len());
     let mut raw_changes = Vec::with_capacity(lanes.len());
-    for lane_index in 0..lanes.len() {
-        let (changes, values) = coordinator.snapshot_batch_lane_values(
-            &lanes[lane_index],
-            lane_learned_steps[lane_index] > 0,
-            lane_context_learning[lane_index],
-            lane_learned_steps[lane_index],
-            lane_statistics[lane_index].clone(),
-        )?;
+    let output_bias_dirty = lane_learned_steps
+        .iter()
+        .map(|&steps| steps > 0)
+        .collect::<Vec<_>>();
+    let snapshots = coordinator.snapshot_batch_lane_values_batched(
+        lanes,
+        &output_bias_dirty,
+        &lane_context_learning,
+        &lane_learned_steps,
+        &lane_statistics,
+    )?;
+    for (changes, values) in snapshots {
         let delta = SparseModelDelta::from_tracked_values(&coordinator.model, &changes, values)?;
         raw_changes.push(changes);
         deltas.push(delta);
@@ -7301,10 +7449,10 @@ pub(crate) fn train_story_batch_shared_device(
     // Multi-device data parallelism needs the original per-story deltas so the
     // outer canonical reducer can perform one flat 1/workers mean. In that mode
     // do NOT first build a device-local mean: it would be thrown away after the
-    // cross-device canonical reduction and would also force an unnecessary full
-    // canonical-to-lane copy on every device. The outer trainer sparse-syncs the
-    // globally merged canonical model into this coordinator, and the deliberately
-    // stale lane revisions are repaired from that image at the next batch start.
+    // cross-device canonical reduction. Lanes stay deliberately invalid until
+    // the outer trainer commits the globally merged PackedSparseModelUpdate; that
+    // sparse commit updates the canonical runtime and every resident lane before
+    // the next batch, avoiding a full canonical-to-lane model restoration.
     let (merge, retained_deltas, retained_changes) = if retain_story_deltas {
         (
             MergeMetrics {
@@ -7318,7 +7466,8 @@ pub(crate) fn train_story_batch_shared_device(
     } else {
         let merge = apply_mean_deltas(&mut coordinator.model, &deltas)?;
         let sync_changes = merged_parameter_changes(&mut coordinator.model, &deltas, &raw_changes)?;
-        coordinator.upload_current_sparse_model(&sync_changes)?;
+        let sync_update = PackedSparseModelUpdate::from_model(&coordinator.model, &sync_changes)?;
+        coordinator.commit_packed_host_model(&sync_update, lanes)?;
 
         if coordinator.track_parameter_changes {
             accumulate_indices(
@@ -7349,22 +7498,6 @@ pub(crate) fn train_story_batch_shared_device(
             coordinator.accumulated_changes.output_bias_dirty |= sync_changes.output_bias_dirty;
             coordinator.accumulated_changes.context_output_dirty |=
                 sync_changes.context_output_dirty;
-        }
-
-        // Single-device execution keeps lanes hot from the newly merged
-        // canonical device image. Multi-device execution intentionally skips
-        // this copy because the device-local merge is deferred to the outer
-        // flat reducer.
-        for lane in lanes.iter() {
-            coordinator.copy_canonical_parameters_to_batch_lane_async(lane)?;
-        }
-        coordinator.shared.driver.check(
-            unsafe { (coordinator.shared.driver.stream_synchronize)(coordinator.transfer_stream) },
-            "cuStreamSynchronize(batch lane canonical restore)",
-        )?;
-        let merged_revision = coordinator.model.parameter_revision;
-        for lane in lanes.iter_mut() {
-            lane.model_revision = merged_revision;
         }
 
         (merge, Vec::new(), Vec::new())
@@ -7570,6 +7703,24 @@ fn pinned_read_vec<T: Copy + Default>(
         }
     }
     Ok(values)
+}
+
+fn device_sub_buffer<T>(
+    buffer: DeviceBuffer,
+    element_offset: usize,
+    elements: usize,
+) -> LeoResult<DeviceBuffer> {
+    let byte_offset = element_offset.saturating_mul(mem::size_of::<T>());
+    let bytes = elements.saturating_mul(mem::size_of::<T>());
+    if byte_offset > buffer.bytes || bytes > buffer.bytes.saturating_sub(byte_offset) {
+        return Err(LeoError::cuda(
+            "CUDA snapshot device sub-buffer exceeds allocated capacity",
+        ));
+    }
+    Ok(DeviceBuffer {
+        pointer: device_pointer_offset(buffer.pointer, byte_offset)?,
+        bytes,
+    })
 }
 
 fn as_u32(name: &str, value: usize) -> LeoResult<u32> {

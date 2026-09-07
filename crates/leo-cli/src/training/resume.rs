@@ -399,6 +399,29 @@ pub(super) fn load_training_resume_for_model(
     Ok(None)
 }
 
+fn synchronization_modes_equivalent(
+    saved: &str,
+    current: &str,
+    backend: BackendKind,
+    workers: usize,
+) -> bool {
+    if saved == current {
+        return true;
+    }
+    if backend != BackendKind::Gpu || workers <= 1 {
+        return false;
+    }
+    let exact_gpu_story_mean = |value: &str| {
+        matches!(
+            value,
+            "gpu_story_mean_exact_v1"
+                | "gpu_shared_wavefront_mean"
+                | "gpu_multi_device_story_mean_exact"
+        )
+    };
+    exact_gpu_story_mean(saved) && exact_gpu_story_mean(current)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn validate_training_resume_identity(
     state: &TrainingResumeState,
@@ -432,7 +455,8 @@ pub(super) fn validate_training_resume_identity(
     if state.backend != backend {
         mismatches.push("resolved backend");
     }
-    if state.synchronization != synchronization {
+    if !synchronization_modes_equivalent(&state.synchronization, synchronization, backend, workers)
+    {
         mismatches.push("training synchronization mode");
     }
     if state.max_training_bytes != max_training_bytes {
@@ -619,4 +643,42 @@ pub(crate) fn advance_checkpoint_deadline(
         deadline += interval;
     }
     deadline
+}
+
+#[cfg(test)]
+mod synchronization_mode_tests {
+    use super::synchronization_modes_equivalent;
+    use leo_core::BackendKind;
+
+    #[test]
+    fn exact_gpu_story_mean_resume_aliases_ignore_physical_gpu_count() {
+        for saved in [
+            "gpu_story_mean_exact_v1",
+            "gpu_shared_wavefront_mean",
+            "gpu_multi_device_story_mean_exact",
+        ] {
+            assert!(synchronization_modes_equivalent(
+                saved,
+                "gpu_story_mean_exact_v1",
+                BackendKind::Gpu,
+                16,
+            ));
+        }
+    }
+
+    #[test]
+    fn experimental_device_mean_modes_are_not_treated_as_exact_aliases() {
+        assert!(!synchronization_modes_equivalent(
+            "gpu_experimental_device_mean",
+            "gpu_story_mean_exact_v1",
+            BackendKind::Gpu,
+            16,
+        ));
+        assert!(!synchronization_modes_equivalent(
+            "gpu_shared_wavefront_mean",
+            "gpu_story_mean_exact_v1",
+            BackendKind::Cpu,
+            16,
+        ));
+    }
 }
