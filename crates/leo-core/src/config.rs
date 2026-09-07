@@ -449,11 +449,11 @@ impl Config {
             .checked_mul(crate::symbols::OUTPUT_CLASSES)
             .ok_or_else(|| LeoError::configuration("context output projection size overflow"))?;
         if !self.replay.fraction.is_finite()
-            || self.replay.fraction <= 0.0
+            || self.replay.fraction < 0.0
             || self.replay.fraction > 1.0
         {
             return Err(LeoError::configuration(
-                "replay.fraction must be finite and in the interval (0, 1]",
+                "replay.fraction must be finite and in the interval [0, 1]",
             ));
         }
         if self.replay.segment_bytes == 0
@@ -515,6 +515,15 @@ mod tests {
         assert_eq!(decoded.context.dropout_rate, 0.25);
         assert_eq!(decoded.learning.end_document_weight, 6.0);
         assert_eq!(decoded.replay.segment_bytes, 32);
+    }
+
+    #[test]
+    fn replay_fraction_zero_disables_replay() {
+        let mut config = Config::default();
+        config.replay.fraction = 0.0;
+        let decoded = Config::from_toml(&config.to_toml())
+            .expect("zero replay fraction should be a valid disabled-replay policy");
+        assert_eq!(decoded.replay.fraction, 0.0);
     }
 
     #[test]

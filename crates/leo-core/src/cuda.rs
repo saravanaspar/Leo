@@ -39,6 +39,18 @@ const PERSISTENT_THREADS: c_uint = 256;
 const SHARED_BATCH_THREADS: c_uint = 256;
 const TRAINING_STEP_BATCH_CAPACITY: usize = 4096;
 pub(crate) const GPU_STORY_BATCH_MAX_LANES: usize = 128;
+const CUDA_PHASE_PROFILE_COUNTER_COUNT: usize = 10;
+const CUDA_PHASE_PROFILE_SAMPLES: usize = 0;
+const CUDA_PHASE_PROFILE_PRE: usize = 1;
+const CUDA_PHASE_PROFILE_SELECT: usize = 2;
+const CUDA_PHASE_PROFILE_POST_SELECT: usize = 3;
+const CUDA_PHASE_PROFILE_CACHE_SURROGATE: usize = 4;
+const CUDA_PHASE_PROFILE_POST_CORE: usize = 5;
+const CUDA_PHASE_PROFILE_LEARNING_SIGNALS: usize = 6;
+const CUDA_PHASE_PROFILE_POST_DELTAS: usize = 7;
+const CUDA_PHASE_PROFILE_HOMEOSTASIS: usize = 8;
+const CUDA_PHASE_PROFILE_CAPTURE: usize = 9;
+const CUDA_PHASE_PROFILE_DEFAULT_SAMPLE_STRIDE: u64 = 64;
 const RING_BUCKETS: usize = 9;
 const MAX_BLOCK_WINNERS: usize = 64;
 const MAX_GLOBAL_BLOCK_WINNERS: usize = 1024;
@@ -58,6 +70,27 @@ fn cuda_kernel_source() -> String {
     source.push('\n');
     source.push_str(CUDA_KERNEL_BODY);
     source
+}
+
+fn cuda_phase_profile_sample_stride() -> Option<u64> {
+    let enabled = env::var("LEO_CUDA_PHASE_PROFILE")
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+
+    Some(
+        env::var("LEO_CUDA_PHASE_PROFILE_STRIDE")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(CUDA_PHASE_PROFILE_DEFAULT_SAMPLE_STRIDE),
+    )
 }
 
 impl CudaConfig {
@@ -661,6 +694,7 @@ struct KernelFunctions {
     advance_frozen_cooperative: CuFunction,
     shared_wavefront_pre: CuFunction,
     shared_wavefront_fused: CuFunction,
+    shared_wavefront_fused_profiled: CuFunction,
     shared_select_blocks: CuFunction,
     shared_post_select: CuFunction,
     shared_cache_surrogate_worklist: CuFunction,
@@ -813,6 +847,7 @@ struct SharedCuda {
     fused_blocks_128: u32,
     fused_blocks_256: u32,
     fused_blocks_512: u32,
+    fused_profile_blocks_256: u32,
     hardware: CudaHardwareIdentity,
 }
 
@@ -1015,6 +1050,7 @@ struct Buffers {
     batch_step_counts: DeviceBuffer,
     batch_base_ticks: DeviceBuffer,
     batch_delta_pointer_table: DeviceBuffer,
+    phase_profile_counters: DeviceBuffer,
 
     // Stage 3 shared-model synchronous mini-batch accumulators. These are
     // canonical-runtime buffers, not per-story state. Story blocks accumulate
@@ -1169,6 +1205,7 @@ impl Buffers {
             self.batch_step_counts,
             self.batch_base_ticks,
             self.batch_delta_pointer_table,
+            self.phase_profile_counters,
             self.batch_delta_threshold,
             self.batch_delta_threshold_marks,
             self.batch_delta_threshold_list,
@@ -1249,6 +1286,7 @@ pub(crate) struct CudaRuntime {
     sparse_apply_graph: Option<CuGraphExec>,
     sparse_apply_graph_plan: Option<(u32, u32)>,
     sparse_apply_graph_disabled: bool,
+    phase_profile_sample_stride: Option<u64>,
 }
 
 unsafe impl Send for CudaRuntime {}
@@ -1518,6 +1556,14 @@ impl CudaRuntime {
             512,
             "fused wavefront 512",
         )?;
+        let fused_profile_blocks_256 = cooperative_grid_capacity(
+            &driver,
+            kernels.shared_wavefront_fused_profiled,
+            cooperative_launch != 0,
+            multiprocessor_count,
+            256,
+            "profiled fused wavefront 256",
+        )?;
         let frozen_grid_blocks = cooperative_grid_capacity(
             &driver,
             kernels.advance_frozen_cooperative,
@@ -1562,6 +1608,7 @@ impl CudaRuntime {
             fused_blocks_128,
             fused_blocks_256,
             fused_blocks_512,
+            fused_profile_blocks_256,
             hardware,
         });
         let mut runtime = Self::with_shared(model, shared)?;
@@ -1617,6 +1664,7 @@ impl CudaRuntime {
                 fused_blocks_512: shared.fused_blocks_512,
             },
         );
+        let phase_profile_sample_stride = cuda_phase_profile_sample_stride();
         let mut runtime = Self {
             model,
             shared,
@@ -1648,6 +1696,7 @@ impl CudaRuntime {
             sparse_apply_graph: None,
             sparse_apply_graph_plan: None,
             sparse_apply_graph_disabled: false,
+            phase_profile_sample_stride,
         };
         runtime.make_current()?;
         runtime.allocate_buffers()?;
@@ -4056,6 +4105,7 @@ impl CudaRuntime {
         b.batch_step_counts = self.allocate_u32(GPU_STORY_BATCH_MAX_LANES)?;
         b.batch_base_ticks = self.allocate_u64(GPU_STORY_BATCH_MAX_LANES)?;
         b.batch_delta_pointer_table = self.allocate_u64(BATCH_DELTA_POINTER_COUNT)?;
+        b.phase_profile_counters = self.allocate_u64(CUDA_PHASE_PROFILE_COUNTER_COUNT)?;
 
         b.batch_delta_threshold = self.allocate_f32(n)?;
         b.batch_delta_threshold_marks = self.allocate_u32(n)?;
@@ -4771,6 +4821,87 @@ impl CudaRuntime {
         self.copy_from_device(buffer, values)
     }
 
+    fn clear_phase_profile_counters_async(&self) -> LeoResult<()> {
+        self.memset_zero_async(self.buffers.phase_profile_counters)
+    }
+
+    fn emit_phase_profile(
+        &self,
+        logical_lanes: usize,
+        fused_launches_total: u64,
+        sample_stride: u64,
+        planned_fused_blocks: u32,
+    ) -> LeoResult<()> {
+        let mut counters = [0u64; CUDA_PHASE_PROFILE_COUNTER_COUNT];
+        self.copy_from_device(self.buffers.phase_profile_counters, &mut counters)?;
+        let samples = counters[CUDA_PHASE_PROFILE_SAMPLES];
+        let total_cycles = counters[1..]
+            .iter()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        let percent = |index: usize| -> f64 {
+            if total_cycles == 0 {
+                0.0
+            } else {
+                counters[index] as f64 * 100.0 / total_cycles as f64
+            }
+        };
+        let cycles_per_sample = if samples == 0 {
+            0.0
+        } else {
+            total_cycles as f64 / samples as f64
+        };
+
+        eprintln!(
+            concat!(
+                "{{\"event\":\"cuda_phase_profile\",",
+                "\"scope\":\"fused_wavefront_only\",",
+                "\"logical_lanes\":{},\"sample_stride\":{},",
+                "\"planned_fused_blocks\":{},",
+                "\"normal_capacity_blocks\":{},\"profiled_capacity_blocks\":{},",
+                "\"sampled_fused_launches\":{},\"fused_launches_total\":{},",
+                "\"total_profiled_cycles\":{},\"cycles_per_sample\":{},",
+                "\"pre_cycles\":{},\"pre_pct\":{},",
+                "\"select_cycles\":{},\"select_pct\":{},",
+                "\"post_select_cycles\":{},\"post_select_pct\":{},",
+                "\"cache_surrogate_cycles\":{},\"cache_surrogate_pct\":{},",
+                "\"post_core_cycles\":{},\"post_core_pct\":{},",
+                "\"learning_signals_cycles\":{},\"learning_signals_pct\":{},",
+                "\"post_deltas_cycles\":{},\"post_deltas_pct\":{},",
+                "\"homeostasis_cycles\":{},\"homeostasis_pct\":{},",
+                "\"capture_cycles\":{},\"capture_pct\":{}}}"
+            ),
+            logical_lanes,
+            sample_stride,
+            planned_fused_blocks,
+            self.shared.fused_blocks_256,
+            self.shared.fused_profile_blocks_256,
+            samples,
+            fused_launches_total,
+            total_cycles,
+            cycles_per_sample,
+            counters[CUDA_PHASE_PROFILE_PRE],
+            percent(CUDA_PHASE_PROFILE_PRE),
+            counters[CUDA_PHASE_PROFILE_SELECT],
+            percent(CUDA_PHASE_PROFILE_SELECT),
+            counters[CUDA_PHASE_PROFILE_POST_SELECT],
+            percent(CUDA_PHASE_PROFILE_POST_SELECT),
+            counters[CUDA_PHASE_PROFILE_CACHE_SURROGATE],
+            percent(CUDA_PHASE_PROFILE_CACHE_SURROGATE),
+            counters[CUDA_PHASE_PROFILE_POST_CORE],
+            percent(CUDA_PHASE_PROFILE_POST_CORE),
+            counters[CUDA_PHASE_PROFILE_LEARNING_SIGNALS],
+            percent(CUDA_PHASE_PROFILE_LEARNING_SIGNALS),
+            counters[CUDA_PHASE_PROFILE_POST_DELTAS],
+            percent(CUDA_PHASE_PROFILE_POST_DELTAS),
+            counters[CUDA_PHASE_PROFILE_HOMEOSTASIS],
+            percent(CUDA_PHASE_PROFILE_HOMEOSTASIS),
+            counters[CUDA_PHASE_PROFILE_CAPTURE],
+            percent(CUDA_PHASE_PROFILE_CAPTURE),
+        );
+        Ok(())
+    }
+
     fn launch_sparse_apply_and_reset(&mut self, blocks: u32, threads: u32) -> LeoResult<bool> {
         let plan = (blocks.max(1), threads.max(32));
         if self.sparse_apply_graph_plan != Some(plan) {
@@ -5093,6 +5224,7 @@ struct WavefrontChunkLaunch {
     strength: f32,
     batch_scale: f32,
     execution_plan: CudaExecutionPlan,
+    phase_profile: bool,
 }
 
 fn launch_shared_wavefront_chunk(
@@ -5108,6 +5240,7 @@ fn launch_shared_wavefront_chunk(
         strength,
         batch_scale,
         execution_plan,
+        phase_profile,
     } = launch;
     let lane_count = as_u32("GPU physical lane chunk", physical_lane_count)?;
     let pointer_offset = lane_start.saturating_mul(mem::size_of::<CuDevicePtr>());
@@ -5157,25 +5290,50 @@ fn launch_shared_wavefront_chunk(
         let mut raw_strength = strength;
         let mut scale = batch_scale;
         let mut delta_pointers = coordinator.buffers.batch_delta_pointer_table.pointer;
-        let mut parameters = [
-            param(&mut pointer_tables_ptr),
-            param(&mut step_buffers_ptr),
-            param(&mut step_counts_ptr),
-            param(&mut base_ticks_ptr),
-            param(&mut lane_count_value),
-            param(&mut step_index_value),
-            param(&mut block_count_value),
-            param(&mut learning_value),
-            param(&mut raw_strength),
-            param(&mut scale),
-            param(&mut delta_pointers),
-        ];
-        coordinator.launch_cooperative_exact(
-            coordinator.shared.kernels.shared_wavefront_fused,
-            grid_blocks,
-            SHARED_BATCH_THREADS,
-            &mut parameters,
-        )?;
+
+        if phase_profile && coordinator.shared.fused_profile_blocks_256 > 0 {
+            let mut phase_profile_counters = coordinator.buffers.phase_profile_counters.pointer;
+            let mut parameters = [
+                param(&mut pointer_tables_ptr),
+                param(&mut step_buffers_ptr),
+                param(&mut step_counts_ptr),
+                param(&mut base_ticks_ptr),
+                param(&mut lane_count_value),
+                param(&mut step_index_value),
+                param(&mut block_count_value),
+                param(&mut learning_value),
+                param(&mut raw_strength),
+                param(&mut scale),
+                param(&mut delta_pointers),
+                param(&mut phase_profile_counters),
+            ];
+            coordinator.launch_cooperative_exact(
+                coordinator.shared.kernels.shared_wavefront_fused_profiled,
+                grid_blocks.min(coordinator.shared.fused_profile_blocks_256),
+                SHARED_BATCH_THREADS,
+                &mut parameters,
+            )?;
+        } else {
+            let mut parameters = [
+                param(&mut pointer_tables_ptr),
+                param(&mut step_buffers_ptr),
+                param(&mut step_counts_ptr),
+                param(&mut base_ticks_ptr),
+                param(&mut lane_count_value),
+                param(&mut step_index_value),
+                param(&mut block_count_value),
+                param(&mut learning_value),
+                param(&mut raw_strength),
+                param(&mut scale),
+                param(&mut delta_pointers),
+            ];
+            coordinator.launch_cooperative_exact(
+                coordinator.shared.kernels.shared_wavefront_fused,
+                grid_blocks,
+                SHARED_BATCH_THREADS,
+                &mut parameters,
+            )?;
+        }
         return Ok(WavefrontLaunchKind::Fused);
     }
 
@@ -5461,6 +5619,11 @@ pub(crate) fn train_story_batch_shared_device(
         theoretical_occupancy: coordinator.estimated_fused_occupancy(execution_plan),
         ..CudaBatchTelemetry::default()
     };
+    let phase_profile_sample_stride = coordinator.phase_profile_sample_stride;
+    let mut phase_profile_launch_sequence = 0u64;
+    if phase_profile_sample_stride.is_some() {
+        coordinator.clear_phase_profile_counters_async()?;
+    }
 
     while offsets
         .iter()
@@ -5632,6 +5795,9 @@ pub(crate) fn train_story_batch_shared_device(
                 compute_timing_started = true;
             }
             if max_chunk_steps != 0 {
+                let phase_profile = phase_profile_sample_stride
+                    .is_some_and(|stride| phase_profile_launch_sequence % stride == 0);
+                phase_profile_launch_sequence = phase_profile_launch_sequence.saturating_add(1);
                 match launch_shared_wavefront_chunk(
                     coordinator,
                     WavefrontChunkLaunch {
@@ -5643,6 +5809,7 @@ pub(crate) fn train_story_batch_shared_device(
                         strength,
                         batch_scale,
                         execution_plan,
+                        phase_profile,
                     },
                 )? {
                     WavefrontLaunchKind::Fused => telemetry.fused_launches += 1,
@@ -5676,6 +5843,9 @@ pub(crate) fn train_story_batch_shared_device(
         for step_index in 1..max_chunk_steps {
             for lane_start in (0..lanes.len()).step_by(physical_lane_chunk) {
                 let physical_lane_count = physical_lane_chunk.min(lanes.len() - lane_start);
+                let phase_profile = phase_profile_sample_stride
+                    .is_some_and(|stride| phase_profile_launch_sequence % stride == 0);
+                phase_profile_launch_sequence = phase_profile_launch_sequence.saturating_add(1);
                 match launch_shared_wavefront_chunk(
                     coordinator,
                     WavefrontChunkLaunch {
@@ -5687,6 +5857,7 @@ pub(crate) fn train_story_batch_shared_device(
                         strength,
                         batch_scale,
                         execution_plan,
+                        phase_profile,
                     },
                 )? {
                     WavefrontLaunchKind::Fused => telemetry.fused_launches += 1,
@@ -5870,6 +6041,14 @@ pub(crate) fn train_story_batch_shared_device(
         tuning_started.elapsed(),
         profile_batch.then_some(telemetry),
     );
+    if let Some(sample_stride) = phase_profile_sample_stride {
+        coordinator.emit_phase_profile(
+            lanes.len(),
+            telemetry.fused_launches,
+            sample_stride,
+            execution_plan.fused_wavefront_blocks,
+        )?;
+    }
     coordinator.reset_transient_state()?;
 
     Ok((
@@ -6091,6 +6270,11 @@ fn load_kernels(driver: &DriverFunctions, module: CuModule) -> LeoResult<KernelF
         advance_frozen_cooperative: get_kernel(driver, module, "leo_advance_frozen_cooperative")?,
         shared_wavefront_pre: get_kernel(driver, module, "leo_shared_wavefront_pre")?,
         shared_wavefront_fused: get_kernel(driver, module, "leo_shared_wavefront_fused")?,
+        shared_wavefront_fused_profiled: get_kernel(
+            driver,
+            module,
+            "leo_shared_wavefront_fused_profiled",
+        )?,
         shared_select_blocks: get_kernel(driver, module, "leo_shared_select_blocks")?,
         shared_post_select: get_kernel(driver, module, "leo_shared_post_select")?,
         shared_cache_surrogate_worklist: get_kernel(
@@ -6347,6 +6531,7 @@ mod tests {
             "leo_train_persistent",
             "leo_train_story_batch",
             "leo_shared_wavefront_pre",
+            "leo_shared_wavefront_fused_profiled",
             "leo_shared_select_blocks",
             "leo_shared_post_select",
             "leo_shared_cache_surrogate_worklist",
