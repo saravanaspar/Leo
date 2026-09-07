@@ -283,6 +283,89 @@ for event in phase_events:
 print("CUDA phase-profiler geometry gate OK")
 PY
 
+# Exercise replay-specific diagnostics on a short real GPU path. Profiling is
+# sampled only in this diagnostic process and must either use production-width
+# geometry or emit an explicit skip. The benchmark itself must expose hidden
+# frozen-prefix work even when diagnostics are disabled elsewhere.
+REPLAY_DEBUG_LOG="$TMP/gpu-replay-debug.log"
+LEO_REPLAY_DEBUG=1 \
+LEO_REPLAY_DEBUG_SELECTION=1 \
+LEO_REPLAY_DEBUG_SEGMENTS=1 \
+LEO_REPLAY_DEBUG_SEGMENT_STRIDE=8 \
+LEO_CUDA_DEBUG=1 \
+LEO_CUDA_DEBUG_CHUNKS=1 \
+LEO_CUDA_DEBUG_LAUNCHES=1 \
+LEO_CUDA_REPLAY_PROFILE=1 \
+LEO_CUDA_REPLAY_PROFILE_STRIDE=1 \
+LEO_MULTI_GPU=0 "$LEO" benchmark \
+  --train \
+  --model "$TMP/model.pscls" \
+  --bytes "$TMP/data/tinystories.train.bytes" \
+  --index "$TMP/data/tinystories.train.idx" \
+  --stories 16 \
+  --workers 16 \
+  --backend gpu 2>&1 | tee "$REPLAY_DEBUG_LOG"
+
+python3 - "$REPLAY_DEBUG_LOG" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+events = []
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    raw = raw.strip()
+    if not raw.startswith("{"):
+        continue
+    try:
+        events.append(json.loads(raw))
+    except json.JSONDecodeError:
+        continue
+
+names = [event.get("event") for event in events]
+for required in (
+    "replay_selection_debug",
+    "replay_batch_debug",
+    "cuda_debug_runtime",
+    "cuda_debug_launch",
+    "cuda_debug_chunk",
+):
+    if required not in names:
+        raise SystemExit(f"replay GPU diagnostic run did not emit {required}")
+
+benchmarks = [event for event in events if event.get("event") == "training_benchmark"]
+if not benchmarks:
+    raise SystemExit("replay GPU diagnostic run did not emit training_benchmark")
+benchmark = benchmarks[-1]
+for field in ("replay_prefix_steps", "replay_execution_steps"):
+    if field not in benchmark:
+        raise SystemExit(f"training_benchmark missing replay accounting field {field}")
+if int(benchmark.get("replay_steps", 0)) <= 0:
+    raise SystemExit("replay GPU diagnostic run did not execute replay targets")
+if int(benchmark.get("replay_execution_steps", 0)) < int(benchmark["replay_steps"]):
+    raise SystemExit("replay execution accounting is smaller than supervised replay work")
+
+target_profile = {
+    "cuda_replay_kernel_profile",
+    "cuda_replay_kernel_profile_skipped",
+}
+if not target_profile.intersection(names):
+    raise SystemExit("replay target profiler emitted neither a sample nor an explicit skip")
+
+if int(benchmark.get("replay_prefix_steps", 0)) > 0:
+    prefix_profile = {
+        "cuda_frozen_kernel_profile",
+        "cuda_frozen_kernel_profile_skipped",
+    }
+    if not prefix_profile.intersection(names):
+        raise SystemExit("replay prefix work existed but prefix profiler emitted neither a sample nor a skip")
+
+print(
+    "CUDA replay diagnostics OK:",
+    f"replay_steps={benchmark['replay_steps']}",
+    f"prefix_steps={benchmark['replay_prefix_steps']}",
+)
+PY
+
 # A final short fresh process validates complete cache reuse rather than only
 # the in-memory state of the process that completed tuning.
 LEO_MULTI_GPU=0 "$LEO" benchmark \

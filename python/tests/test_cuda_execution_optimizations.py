@@ -191,10 +191,12 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertNotIn("leo_p_capture_training_step", frozen_kernel)
         self.assertNotIn("leo_p_cache_surrogate", frozen_kernel)
         cooperative = kernels.split(
+            "leo_advance_frozen_cooperative_body", 1
+        )[1].split(
             'extern "C" __global__ void leo_advance_frozen_cooperative', 1
-        )[1].split('extern "C" __global__ void leo_train_persistent', 1)[0]
+        )[0]
         self.assertIn("cooperative_groups::this_grid()", cooperative)
-        self.assertGreaterEqual(cooperative.count("grid.sync()"), 3)
+        self.assertIn("leo_profile_phase_end", cooperative)
         self.assertIn("leo_p_select_model_block", cooperative)
         self.assertIn("leo_p_context_advance_history", cooperative)
         self.assertIn("leo_p_select_global", cooperative)
@@ -266,6 +268,110 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
             "grid_blocks.min(coordinator.shared.fused_profile_blocks_256)",
             cuda,
         )
+
+
+    def test_replay_supervised_path_uses_cooperative_grid_with_legacy_ab_control(self):
+        cuda = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+
+        cooperative = kernels.split("leo_train_cooperative_body", 1)[1].split(
+            'extern "C" __global__ void leo_train_cooperative', 1
+        )[0]
+        self.assertIn("cooperative_groups::this_grid()", cooperative)
+        self.assertIn("grid_thread", cooperative)
+        self.assertIn("grid_stride", cooperative)
+        for helper in (
+            "leo_p_cache_surrogate_work",
+            "leo_p_update_recurrent_eligibility_work",
+            "leo_p_update_input_eligibility_work",
+            "leo_p_post_and_emit_work",
+            "leo_p_learning_signals_work",
+            "leo_p_update_output_work",
+            "leo_p_update_context_work",
+            "leo_p_update_recurrent_weights_work",
+            "leo_p_update_input_weights_work",
+            "leo_p_inhibitory_homeostasis_work",
+            "leo_p_homeostasis_work",
+        ):
+            self.assertIn(helper, cooperative)
+
+        # Order-sensitive atomics/reductions remain block-0 phases.
+        self.assertIn("if (blockIdx.x == 0U)", cooperative)
+        self.assertIn("leo_p_deliver_events", cooperative)
+        self.assertIn("leo_p_inject_symbol", cooperative)
+        self.assertIn("leo_p_context_resolve", cooperative)
+        self.assertIn("leo_p_select_global", cooperative)
+        self.assertIn("leo_p_forward", cooperative)
+        self.assertIn("leo_p_capture_training_step", cooperative)
+
+        legacy = kernels.split(
+            'extern "C" __global__ void leo_train_persistent', 1
+        )[1]
+        self.assertIn("if (blockIdx.x != 0U) return;", legacy)
+        self.assertIn("LEO_CUDA_REPLAY_COOPERATIVE", cuda)
+        self.assertIn("LEO_CUDA_REPLAY_BLOCKS", cuda)
+        self.assertIn("LEO_CUDA_FROZEN_BLOCKS", cuda)
+        self.assertIn("replay_grid_blocks", cuda)
+        self.assertIn("replay_profile_grid_blocks", cuda)
+        self.assertIn("profiled_kernel_cannot_match_production_grid", cuda)
+
+    def test_replay_debugging_exposes_hidden_prefix_and_sampled_cuda_phases(self):
+        training = (ROOT / "crates/leo-cli/src/training.rs").read_text()
+        lifecycle = (ROOT / "crates/leo-cli/src/training/lifecycle.rs").read_text()
+        main = (ROOT / "crates/leo-cli/src/main.rs").read_text()
+        cuda = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+        docs = (ROOT / "docs/DEBUGGING.md").read_text()
+        script = (ROOT / "scripts/debug_replay.sh").read_text()
+        gpu_gate = (ROOT / "scripts/check_gpu.sh").read_text()
+
+        for marker in (
+            "replay_selection_debug",
+            "replay_range_debug",
+            "replay_segment_debug",
+            "replay_story_debug",
+            "replay_batch_debug",
+            "LEO_REPLAY_DEBUG_SEGMENT_STRIDE",
+        ):
+            self.assertIn(marker, training)
+        for marker in (
+            "replay_prefix_steps",
+            "replay_execution_steps",
+            "replay_prefix_step_fraction",
+            "execution_steps_with_prefix",
+            "execution_steps_per_second",
+        ):
+            self.assertIn(marker, main)
+        for marker in (
+            "training_progress",
+            "replay_prefix_steps",
+            "replay_execution_steps",
+            "execution_steps_per_second",
+        ):
+            self.assertIn(marker, lifecycle)
+        for marker in (
+            "cuda_debug_runtime",
+            "driver_version",
+            "pci_bus_id",
+            "replay_profile_target_stride",
+            "replay_profile_prefix_stride",
+            "cuda_debug_memory",
+            "cuda_debug_launch",
+            "cuda_debug_chunk",
+            "cuda_replay_kernel_profile",
+            "cuda_frozen_kernel_profile",
+            "LEO_CUDA_REPLAY_PROFILE_TARGET",
+            "LEO_CUDA_REPLAY_PROFILE_PREFIX",
+        ):
+            self.assertIn(marker, cuda)
+        self.assertIn("leo_train_cooperative_profiled", kernels)
+        self.assertIn("leo_advance_frozen_cooperative_profiled", kernels)
+        self.assertIn("LEO_CUDA_REPLAY_PROFILE", docs)
+        self.assertIn("LEO_CUDA_REPLAY_COOPERATIVE", docs)
+        self.assertIn("LEO_CUDA_REPLAY_PROFILE", script)
+        self.assertIn("CUDA replay diagnostics OK", gpu_gate)
+        self.assertIn("replay_prefix_steps", gpu_gate)
+        self.assertIn("cuda_replay_kernel_profile", gpu_gate)
 
     def test_repository_gate_and_package_entrypoints_cover_all_reference_tests(self):
         check = (ROOT / "scripts/check.sh").read_text()

@@ -262,7 +262,7 @@ pub(crate) fn run_training(request: TrainRequest<'_>) -> LeoResult<()> {
                 previous_presentations / log_every != presentations / log_every;
             if crossed_log_boundary || position == story_limit {
                 println!(
-                    "{{\"event\":\"training_progress\",\"pass\":{},\"story\":{},\"stories\":{},\"presentations\":{},\"workers\":{},\"loss\":{},\"bits_per_byte\":{},\"active_fraction\":{},\"recurrent_events_per_step\":{},\"context_cells_per_step\":{},\"context_probes_per_step\":{},\"context_use_fraction\":{},\"output_madds_per_step\":{},\"context_gain_bits_per_step\":{},\"steps_per_second\":{},\"replay_segments\":{},\"replay_steps\":{},\"merged_fixed_updates\":{},\"merged_context_keys\":{},\"elapsed_seconds\":{}}}",
+                    "{{\"event\":\"training_progress\",\"pass\":{},\"story\":{},\"stories\":{},\"presentations\":{},\"workers\":{},\"loss\":{},\"bits_per_byte\":{},\"active_fraction\":{},\"recurrent_events_per_step\":{},\"context_cells_per_step\":{},\"context_probes_per_step\":{},\"context_use_fraction\":{},\"output_madds_per_step\":{},\"context_gain_bits_per_step\":{},\"steps_per_second\":{},\"execution_steps_per_second\":{},\"replay_segments\":{},\"replay_steps\":{},\"replay_prefix_steps\":{},\"replay_execution_steps\":{},\"merged_fixed_updates\":{},\"merged_context_keys\":{},\"elapsed_seconds\":{}}}",
                     pass + 1,
                     position,
                     story_limit,
@@ -278,8 +278,12 @@ pub(crate) fn run_training(request: TrainRequest<'_>) -> LeoResult<()> {
                     report.activity.output_madds_per_step(),
                     report.activity.context_gain_bits_per_step(),
                     report.activity.steps as f64 / batch_seconds.max(1.0e-9),
+                    report.activity.steps.saturating_add(report.replay_prefix_steps) as f64
+                        / batch_seconds.max(1.0e-9),
                     report.replay_segments,
                     report.replay_steps,
+                    report.replay_prefix_steps,
+                    report.replay_steps.saturating_add(report.replay_prefix_steps),
                     report.merge.fixed_parameter_updates,
                     report.merge.context_keys,
                     started.elapsed().as_secs_f64(),
