@@ -126,3 +126,7 @@ Experimental multi-GPU training is different: it uses batch-end device averaging
 ## 8. Regression-test rule
 
 A bug fix should normally include a test that fails before the fix and passes after it. Prefer behavioral tests over source-string assertions when the behavior is testable without hardware-specific dependencies.
+
+## Replay performance diagnostics
+
+For replay-specific performance regressions, use `scripts/debug_replay.sh` and the opt-in controls documented in [DEBUGGING.md](DEBUGGING.md). Normal benchmark JSON always includes `replay_prefix_steps`/`replay_execution_steps`; heavy CUDA `clock64()` phase profiling remains opt-in and must be disabled for final throughput measurements.

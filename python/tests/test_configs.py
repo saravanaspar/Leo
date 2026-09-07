@@ -226,6 +226,7 @@ class IntegratedConfigTests(unittest.TestCase):
                 "train.sh",
                 "evaluate.sh",
                 "profile_cuda.sh",
+                "debug_replay.sh",
             },
         )
 

@@ -322,6 +322,7 @@ struct BatchConformanceResult {
     mean_loss_delta: f64,
     replay_segments: usize,
     replay_steps: u64,
+    replay_prefix_steps: u64,
 }
 
 fn max_f32_slice_delta(left: &[f32], right: &[f32]) -> LeoResult<f32> {
@@ -360,13 +361,16 @@ fn run_story_batch_conformance(
 
     if cpu_report.replay_segments != gpu_report.replay_segments
         || cpu_report.replay_steps != gpu_report.replay_steps
+        || cpu_report.replay_prefix_steps != gpu_report.replay_prefix_steps
     {
         return Err(LeoError::internal(format!(
-            "CUDA logical-batch replay parity failed at fraction {replay_fraction}: CPU segments/steps={}/{}, GPU={}/{}",
+            "CUDA logical-batch replay parity failed at fraction {replay_fraction}: CPU segments/steps/prefix={}/{}/{}, GPU={}/{}/{}",
             cpu_report.replay_segments,
             cpu_report.replay_steps,
+            cpu_report.replay_prefix_steps,
             gpu_report.replay_segments,
             gpu_report.replay_steps,
+            gpu_report.replay_prefix_steps,
         )));
     }
 
@@ -443,6 +447,7 @@ fn run_story_batch_conformance(
         mean_loss_delta,
         replay_segments: gpu_report.replay_segments,
         replay_steps: gpu_report.replay_steps,
+        replay_prefix_steps: gpu_report.replay_prefix_steps,
     })
 }
 
@@ -576,12 +581,13 @@ fn command_backend(arguments: &Arguments) -> LeoResult<()> {
             if arguments.flag("json") {
                 for result in [&batch_without_replay, &batch_with_replay] {
                     println!(
-                        "{{\"event\":\"cuda_story_batch_conformance\",\"replay_fraction\":{},\"workers\":4,\"max_parameter_delta\":{},\"mean_loss_delta\":{},\"replay_segments\":{},\"replay_steps\":{},\"ready\":true}}",
+                        "{{\"event\":\"cuda_story_batch_conformance\",\"replay_fraction\":{},\"workers\":4,\"max_parameter_delta\":{},\"mean_loss_delta\":{},\"replay_segments\":{},\"replay_steps\":{},\"replay_prefix_steps\":{},\"ready\":true}}",
                         result.replay_fraction,
                         result.max_parameter_delta,
                         result.mean_loss_delta,
                         result.replay_segments,
                         result.replay_steps,
+                        result.replay_prefix_steps,
                     );
                 }
                 println!(
@@ -682,6 +688,7 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
         let mut targets = 0u64;
         let mut replay_segments = 0usize;
         let mut replay_steps = 0u64;
+        let mut replay_prefix_steps = 0u64;
         let story_order: Vec<usize> = (0..story_limit).collect();
         let prefetcher = StoryBatchPrefetcher::spawn(&dataset, story_order, "training benchmark")?;
         if position < story_limit {
@@ -705,6 +712,7 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
             targets = targets.saturating_add(report.targets as u64);
             replay_segments = replay_segments.saturating_add(report.replay_segments);
             replay_steps = replay_steps.saturating_add(report.replay_steps);
+            replay_prefix_steps = replay_prefix_steps.saturating_add(report.replay_prefix_steps);
             activity.add(report.activity);
             position = next_position;
             if max_input_bytes.is_some_and(|limit| input_bytes >= limit) {
@@ -720,7 +728,7 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
         let projected_input_bytes = 2_000_000_000f64;
         let projected_seconds = elapsed / input_bytes.max(1) as f64 * projected_input_bytes;
         println!(
-            "{{\"event\":\"training_benchmark\",\"model\":\"{}\",\"neurons\":{},\"fixed_synapses\":{},\"context_slots\":{},\"context_embedding_dim\":{},\"workers\":{},\"stories\":{},\"input_bytes\":{},\"training_steps\":{},\"base_training_targets\":{},\"replay_fraction\":{},\"replay_segments\":{},\"replay_steps\":{},\"replay_step_fraction\":{},\"seconds\":{},\"input_bytes_per_second\":{},\"steps_per_second\":{},\"mean_loss\":{},\"bits_per_byte\":{},\"active_fraction\":{},\"recurrent_events_per_step\":{},\"context_cells_per_step\":{},\"context_probes_per_step\":{},\"output_madds_per_step\":{},\"projected_seconds_1gb_2_epochs\":{},\"projected_days_1gb_2_epochs\":{}}}",
+            "{{\"event\":\"training_benchmark\",\"model\":\"{}\",\"neurons\":{},\"fixed_synapses\":{},\"context_slots\":{},\"context_embedding_dim\":{},\"workers\":{},\"stories\":{},\"input_bytes\":{},\"training_steps\":{},\"base_training_targets\":{},\"replay_fraction\":{},\"replay_segments\":{},\"replay_steps\":{},\"replay_prefix_steps\":{},\"replay_execution_steps\":{},\"replay_step_fraction\":{},\"replay_prefix_step_fraction\":{},\"execution_steps_with_prefix\":{},\"seconds\":{},\"input_bytes_per_second\":{},\"steps_per_second\":{},\"execution_steps_per_second\":{},\"mean_loss\":{},\"bits_per_byte\":{},\"active_fraction\":{},\"recurrent_events_per_step\":{},\"context_cells_per_step\":{},\"context_probes_per_step\":{},\"output_madds_per_step\":{},\"projected_seconds_1gb_2_epochs\":{},\"projected_days_1gb_2_epochs\":{}}}",
             json_escape(&runtime.model().config.model.name),
             runtime.model().neuron_count(),
             runtime.model().recurrent.weight.len(),
@@ -734,10 +742,15 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
             runtime.model().config.replay.fraction,
             replay_segments,
             replay_steps,
+            replay_prefix_steps,
+            replay_steps.saturating_add(replay_prefix_steps),
             replay_steps as f64 / activity.steps.max(1) as f64,
+            replay_prefix_steps as f64 / targets.max(1) as f64,
+            activity.steps.saturating_add(replay_prefix_steps),
             elapsed,
             input_bytes as f64 / elapsed.max(1.0e-9),
             activity.steps as f64 / elapsed.max(1.0e-9),
+            activity.steps.saturating_add(replay_prefix_steps) as f64 / elapsed.max(1.0e-9),
             weighted_loss / targets.max(1) as f64,
             weighted_loss / targets.max(1) as f64 / std::f64::consts::LN_2,
             activity.mean_active(runtime.model().neuron_count()),

@@ -225,6 +225,7 @@ Leo/
 - [Backend ADR](docs/ADR-0001-EXECUTION-BACKENDS.md)
 - [Testing strategy](docs/TESTING.md)
 - [Reproducibility](docs/REPRODUCIBILITY.md)
+- [Training/CUDA debugging](docs/DEBUGGING.md)
 
 Historical GPU stage documents remain in `docs/` as implementation history; the current v1 contract is defined by the files above and the code.
 

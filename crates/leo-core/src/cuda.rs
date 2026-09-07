@@ -54,6 +54,31 @@ const CUDA_PHASE_PROFILE_POST_DELTAS: usize = 7;
 const CUDA_PHASE_PROFILE_HOMEOSTASIS: usize = 8;
 const CUDA_PHASE_PROFILE_CAPTURE: usize = 9;
 const CUDA_PHASE_PROFILE_DEFAULT_SAMPLE_STRIDE: u64 = 64;
+const CUDA_REPLAY_PROFILE_COUNTER_COUNT: usize = 17;
+const CUDA_FROZEN_PROFILE_COUNTER_COUNT: usize = 5;
+const CUDA_REPLAY_PROFILE_DEFAULT_SAMPLE_STRIDE: u64 = 1;
+const CUDA_REPLAY_PROFILE_SAMPLES: usize = 0;
+const CUDA_REPLAY_PROFILE_PRE: usize = 1;
+const CUDA_REPLAY_PROFILE_SELECT_BLOCKS: usize = 2;
+const CUDA_REPLAY_PROFILE_SELECT_GLOBAL: usize = 3;
+const CUDA_REPLAY_PROFILE_CACHE_SURROGATE: usize = 4;
+const CUDA_REPLAY_PROFILE_RECURRENT_ELIGIBILITY: usize = 5;
+const CUDA_REPLAY_PROFILE_INPUT_ELIGIBILITY: usize = 6;
+const CUDA_REPLAY_PROFILE_POST_EMIT: usize = 7;
+const CUDA_REPLAY_PROFILE_FORWARD: usize = 8;
+const CUDA_REPLAY_PROFILE_LEARNING_SIGNALS: usize = 9;
+const CUDA_REPLAY_PROFILE_OUTPUT_UPDATE: usize = 10;
+const CUDA_REPLAY_PROFILE_CONTEXT_UPDATE: usize = 11;
+const CUDA_REPLAY_PROFILE_RECURRENT_UPDATE: usize = 12;
+const CUDA_REPLAY_PROFILE_INPUT_UPDATE: usize = 13;
+const CUDA_REPLAY_PROFILE_INHIBITORY: usize = 14;
+const CUDA_REPLAY_PROFILE_HOMEOSTASIS: usize = 15;
+const CUDA_REPLAY_PROFILE_CAPTURE: usize = 16;
+const CUDA_FROZEN_PROFILE_SAMPLES: usize = 0;
+const CUDA_FROZEN_PROFILE_PRE: usize = 1;
+const CUDA_FROZEN_PROFILE_SELECT_BLOCKS: usize = 2;
+const CUDA_FROZEN_PROFILE_SELECT_GLOBAL: usize = 3;
+const CUDA_FROZEN_PROFILE_POST_EMIT: usize = 4;
 const RING_BUCKETS: usize = 9;
 const MAX_BLOCK_WINNERS: usize = 64;
 const MAX_GLOBAL_BLOCK_WINNERS: usize = 1024;
@@ -75,6 +100,87 @@ fn cuda_kernel_source() -> String {
     source
 }
 
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
+}
+
+fn env_positive_u32_opt(name: &str) -> Option<u32> {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|&value| value > 0)
+}
+
+fn env_positive_u64(name: &str, fallback: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(fallback)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CudaDebugOptions {
+    summary: bool,
+    memory: bool,
+    chunks: bool,
+    launches: bool,
+    sync: bool,
+    transfers: bool,
+    state: bool,
+}
+
+impl CudaDebugOptions {
+    fn from_env() -> Self {
+        let summary = env_flag("LEO_CUDA_DEBUG");
+        Self {
+            summary,
+            memory: summary || env_flag("LEO_CUDA_DEBUG_MEMORY"),
+            chunks: env_flag("LEO_CUDA_DEBUG_CHUNKS"),
+            launches: env_flag("LEO_CUDA_DEBUG_LAUNCHES"),
+            sync: env_flag("LEO_CUDA_DEBUG_SYNC"),
+            transfers: env_flag("LEO_CUDA_DEBUG_TRANSFERS"),
+            state: env_flag("LEO_CUDA_DEBUG_STATE"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CudaReplayProfileOptions {
+    target_stride: Option<u64>,
+    prefix_stride: Option<u64>,
+}
+
+impl CudaReplayProfileOptions {
+    fn from_env() -> Self {
+        let both = env_flag("LEO_CUDA_REPLAY_PROFILE");
+        let stride = env_positive_u64(
+            "LEO_CUDA_REPLAY_PROFILE_STRIDE",
+            CUDA_REPLAY_PROFILE_DEFAULT_SAMPLE_STRIDE,
+        );
+        Self {
+            target_stride: (both || env_flag("LEO_CUDA_REPLAY_PROFILE_TARGET")).then_some(stride),
+            prefix_stride: (both || env_flag("LEO_CUDA_REPLAY_PROFILE_PREFIX")).then_some(stride),
+        }
+    }
+}
+
+fn cuda_replay_cooperative_enabled() -> bool {
+    !env::var("LEO_CUDA_REPLAY_COOPERATIVE")
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CudaPhaseProfileReport {
     logical_lanes: usize,
@@ -87,24 +193,12 @@ struct CudaPhaseProfileReport {
 }
 
 fn cuda_phase_profile_sample_stride() -> Option<u64> {
-    let enabled = env::var("LEO_CUDA_PHASE_PROFILE")
-        .ok()
-        .map(|value| {
-            let value = value.trim().to_ascii_lowercase();
-            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
-        })
-        .unwrap_or(false);
-    if !enabled {
-        return None;
-    }
-
-    Some(
-        env::var("LEO_CUDA_PHASE_PROFILE_STRIDE")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or(CUDA_PHASE_PROFILE_DEFAULT_SAMPLE_STRIDE),
-    )
+    env_flag("LEO_CUDA_PHASE_PROFILE").then(|| {
+        env_positive_u64(
+            "LEO_CUDA_PHASE_PROFILE_STRIDE",
+            CUDA_PHASE_PROFILE_DEFAULT_SAMPLE_STRIDE,
+        )
+    })
 }
 
 impl CudaConfig {
@@ -711,8 +805,11 @@ struct KernelFunctions {
     forward: CuFunction,
     capture_training_step: CuFunction,
     train_persistent: CuFunction,
+    train_cooperative: CuFunction,
+    train_cooperative_profiled: CuFunction,
     advance_frozen_persistent: CuFunction,
     advance_frozen_cooperative: CuFunction,
+    advance_frozen_cooperative_profiled: CuFunction,
     shared_wavefront_pre: CuFunction,
     shared_wavefront_fused: CuFunction,
     shared_wavefront_fused_profiled: CuFunction,
@@ -859,7 +956,10 @@ struct SharedCuda {
     module: CuModule,
     kernels: KernelFunctions,
     persistent_grid_blocks: c_uint,
+    replay_grid_blocks: c_uint,
+    replay_profile_grid_blocks: c_uint,
     frozen_grid_blocks: c_uint,
+    frozen_profile_grid_blocks: c_uint,
     compute_major: c_int,
     compute_minor: c_int,
     multiprocessor_count: u32,
@@ -1072,6 +1172,7 @@ struct Buffers {
     batch_base_ticks: DeviceBuffer,
     batch_delta_pointer_table: DeviceBuffer,
     phase_profile_counters: DeviceBuffer,
+    replay_profile_counters: DeviceBuffer,
 
     // Stage 3 shared-model synchronous mini-batch accumulators. These are
     // canonical-runtime buffers, not per-story state. Story blocks accumulate
@@ -1227,6 +1328,7 @@ impl Buffers {
             self.batch_base_ticks,
             self.batch_delta_pointer_table,
             self.phase_profile_counters,
+            self.replay_profile_counters,
             self.batch_delta_threshold,
             self.batch_delta_threshold_marks,
             self.batch_delta_threshold_list,
@@ -1308,6 +1410,13 @@ pub(crate) struct CudaRuntime {
     sparse_apply_graph_plan: Option<(u32, u32)>,
     sparse_apply_graph_disabled: bool,
     phase_profile_sample_stride: Option<u64>,
+    replay_profile: CudaReplayProfileOptions,
+    replay_profile_target_sequence: u64,
+    replay_profile_prefix_sequence: u64,
+    replay_cooperative_enabled: bool,
+    replay_grid_override: Option<u32>,
+    frozen_grid_override: Option<u32>,
+    debug: CudaDebugOptions,
 }
 
 unsafe impl Send for CudaRuntime {}
@@ -1624,6 +1733,30 @@ impl CudaRuntime {
             PERSISTENT_THREADS as c_int,
             "cooperative frozen replay prefix",
         )?;
+        let frozen_profile_grid_blocks = cooperative_grid_capacity(
+            &driver,
+            kernels.advance_frozen_cooperative_profiled,
+            cooperative_launch != 0,
+            multiprocessor_count,
+            PERSISTENT_THREADS as c_int,
+            "profiled cooperative frozen replay prefix",
+        )?;
+        let replay_grid_blocks = cooperative_grid_capacity(
+            &driver,
+            kernels.train_cooperative,
+            cooperative_launch != 0,
+            multiprocessor_count,
+            PERSISTENT_THREADS as c_int,
+            "cooperative replay trainer",
+        )?;
+        let replay_profile_grid_blocks = cooperative_grid_capacity(
+            &driver,
+            kernels.train_cooperative_profiled,
+            cooperative_launch != 0,
+            multiprocessor_count,
+            PERSISTENT_THREADS as c_int,
+            "profiled cooperative replay trainer",
+        )?;
         let persistent_grid_blocks = if cooperative_launch != 0 && multiprocessor_count > 0 {
             let mut active_blocks_per_sm = 0;
             driver.check(
@@ -1651,7 +1784,10 @@ impl CudaRuntime {
             module,
             kernels,
             persistent_grid_blocks,
+            replay_grid_blocks,
+            replay_profile_grid_blocks,
             frozen_grid_blocks,
+            frozen_profile_grid_blocks,
             compute_major,
             compute_minor,
             multiprocessor_count: multiprocessor_count.max(1) as u32,
@@ -1717,6 +1853,11 @@ impl CudaRuntime {
             },
         );
         let phase_profile_sample_stride = cuda_phase_profile_sample_stride();
+        let replay_profile = CudaReplayProfileOptions::from_env();
+        let replay_cooperative_enabled = cuda_replay_cooperative_enabled();
+        let replay_grid_override = env_positive_u32_opt("LEO_CUDA_REPLAY_BLOCKS");
+        let frozen_grid_override = env_positive_u32_opt("LEO_CUDA_FROZEN_BLOCKS");
+        let debug = CudaDebugOptions::from_env();
         let mut runtime = Self {
             model,
             shared,
@@ -1749,10 +1890,56 @@ impl CudaRuntime {
             sparse_apply_graph_plan: None,
             sparse_apply_graph_disabled: false,
             phase_profile_sample_stride,
+            replay_profile,
+            replay_profile_target_sequence: 0,
+            replay_profile_prefix_sequence: 0,
+            replay_cooperative_enabled,
+            replay_grid_override,
+            frozen_grid_override,
+            debug,
         };
         runtime.make_current()?;
         runtime.allocate_buffers()?;
         runtime.initialize_static_pointer_tables()?;
+        if runtime.debug.summary {
+            eprintln!(
+                "{{\"event\":\"cuda_debug_runtime\",\"device\":{},\"name\":\"{}\",\"uuid\":\"{}\",\"pci_bus_id\":\"{}\",\"driver_version\":{},\"cc\":\"{}.{}\",\"sm_count\":{},\"total_memory_bytes\":{},\"cooperative_launch\":{},\"replay_cooperative_enabled\":{},\"legacy_replay_grid\":{},\"replay_grid_capacity\":{},\"replay_profile_grid_capacity\":{},\"frozen_grid_capacity\":{},\"frozen_profile_grid_capacity\":{},\"replay_profile_target_stride\":{},\"replay_profile_prefix_stride\":{},\"replay_grid_override\":{},\"frozen_grid_override\":{},\"separate_transfer_stream\":true}}",
+                runtime.shared.hardware.device_ordinal,
+                runtime.shared.hardware.name.replace('\\', "\\\\").replace('\"', "\\\""),
+                runtime.shared.hardware.uuid,
+                runtime.shared.hardware.pci_bus_id,
+                runtime.shared.hardware.driver_version,
+                runtime.shared.compute_major,
+                runtime.shared.compute_minor,
+                runtime.shared.multiprocessor_count,
+                runtime.shared.hardware.total_memory_bytes,
+                runtime.shared.cooperative_launch,
+                runtime.replay_cooperative_enabled,
+                runtime.shared.persistent_grid_blocks,
+                runtime.shared.replay_grid_blocks,
+                runtime.shared.replay_profile_grid_blocks,
+                runtime.shared.frozen_grid_blocks,
+                runtime.shared.frozen_profile_grid_blocks,
+                runtime.replay_profile.target_stride.unwrap_or(0),
+                runtime.replay_profile.prefix_stride.unwrap_or(0),
+                runtime.replay_grid_override.unwrap_or(0),
+                runtime.frozen_grid_override.unwrap_or(0),
+            );
+        }
+        if runtime.debug.memory {
+            let allocated_bytes = runtime
+                .buffers
+                .all()
+                .iter()
+                .map(|buffer| buffer.bytes as u64)
+                .sum::<u64>();
+            eprintln!(
+                "{{\"event\":\"cuda_debug_memory\",\"scope\":\"runtime\",\"allocated_device_bytes\":{},\"device_total_bytes\":{},\"allocation_fraction\":{}}}",
+                allocated_bytes,
+                runtime.shared.hardware.total_memory_bytes,
+                allocated_bytes as f64 / runtime.shared.hardware.total_memory_bytes.max(1) as f64,
+            );
+        }
         Ok(runtime)
     }
 
@@ -1927,6 +2114,23 @@ impl CudaRuntime {
         self.reset_shared_batch_lane(&mut lane)?;
         self.refresh_shared_batch_pointer_table_async(&lane)?;
         self.synchronize()?;
+        if self.debug.memory {
+            let device_bytes = lane
+                .buffers
+                .all()
+                .iter()
+                .map(|buffer| buffer.bytes as u64)
+                .sum::<u64>();
+            let pinned_host_bytes = lane.host_pointer_table.bytes as u64
+                + lane.host_steps.bytes as u64
+                + lane.host_records.bytes as u64;
+            eprintln!(
+                "{{\"event\":\"cuda_debug_memory\",\"scope\":\"story_lane\",\"device_bytes\":{},\"pinned_host_bytes\":{},\"model_revision\":{}}}",
+                device_bytes,
+                pinned_host_bytes,
+                lane.model_revision,
+            );
+        }
         Ok(lane)
     }
 
@@ -2769,14 +2973,23 @@ impl CudaRuntime {
             self.upload_full_model()?;
         }
 
+        let debug_chunks =
+            self.debug.chunks || self.debug.sync || self.debug.transfers || self.debug.state;
+        let pointer_upload_started = debug_chunks.then(Instant::now);
+
         // Frozen replay does not mutate the pointer topology (no learning or
         // eligibility-list swapping), so upload the invariant pointer table
         // once for the whole prefix instead of once per 4096-step chunk.
         let pointer_table = self.persistent_pointer_table();
         self.copy_to_device(self.buffers.persistent_pointer_table, &pointer_table)?;
+        let pointer_upload_ms = pointer_upload_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
 
-        for chunk in steps.chunks(TRAINING_STEP_BATCH_CAPACITY) {
+        for (chunk_index, chunk) in steps.chunks(TRAINING_STEP_BATCH_CAPACITY).enumerate() {
+            let chunk_started = debug_chunks.then(Instant::now);
             let base_tick = self.current_tick;
+            let build_started = debug_chunks.then(Instant::now);
             let mut device_steps = Vec::with_capacity(chunk.len());
             for &(symbol, _) in chunk {
                 if !is_input_symbol(symbol) {
@@ -2791,46 +3004,142 @@ impl CudaRuntime {
                     supervised_strength: 0.0,
                 });
             }
+            let build_ms = build_started
+                .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
 
+            let upload_started = debug_chunks.then(Instant::now);
             self.copy_to_device(self.buffers.persistent_steps, &device_steps)?;
+            let upload_ms = upload_started
+                .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
 
             let mut pointers = self.buffers.persistent_pointer_table.pointer;
             let mut persistent_steps = self.buffers.persistent_steps.pointer;
             let mut step_count = as_u32("frozen state advance step count", chunk.len())?;
             let mut tick = base_tick;
-            let mut parameters = [
-                param(&mut pointers),
-                param(&mut persistent_steps),
-                param(&mut step_count),
-                param(&mut tick),
-            ];
 
-            // Frozen replay prefixes are sequential in time. On cooperative
-            // devices, spread independent model-block selection across the
-            // grid while preserving the exact v1 phase/reduction order. Older
-            // devices retain the original one-block persistent fallback.
             let model_blocks = as_u32(
                 "frozen replay model block count",
                 self.model.config.model.block_count,
             )?;
-            let frozen_blocks = self.shared.frozen_grid_blocks.min(model_blocks).max(1);
-            if self.shared.cooperative_launch && frozen_blocks > 1 {
+            let frozen_blocks = self
+                .frozen_grid_override
+                .unwrap_or(self.shared.frozen_grid_blocks)
+                .min(self.shared.frozen_grid_blocks.max(1))
+                .min(model_blocks)
+                .max(1);
+            let profile_stride = self.replay_profile.prefix_stride;
+            let profile_requested = profile_stride
+                .is_some_and(|stride| self.replay_profile_prefix_sequence % stride == 0);
+            self.replay_profile_prefix_sequence =
+                self.replay_profile_prefix_sequence.saturating_add(1);
+            let profile_sampled = profile_requested
+                && self.shared.cooperative_launch
+                && frozen_blocks > 1
+                && self.shared.frozen_profile_grid_blocks >= frozen_blocks;
+
+            if profile_requested && !profile_sampled {
+                eprintln!(
+                    "{{\"event\":\"cuda_frozen_kernel_profile_skipped\",\"reason\":\"profiled_kernel_cannot_match_production_grid\",\"requested_grid_blocks\":{},\"normal_capacity_blocks\":{},\"profiled_capacity_blocks\":{},\"step_count\":{}}}",
+                    frozen_blocks,
+                    self.shared.frozen_grid_blocks,
+                    self.shared.frozen_profile_grid_blocks,
+                    chunk.len(),
+                );
+            }
+
+            if profile_sampled {
+                self.clear_replay_profile_counters()?;
+            }
+
+            if self.debug.launches {
+                let kernel = if profile_sampled {
+                    "leo_advance_frozen_cooperative_profiled"
+                } else if self.shared.cooperative_launch && frozen_blocks > 1 {
+                    "leo_advance_frozen_cooperative"
+                } else {
+                    "leo_advance_frozen_persistent"
+                };
+                eprintln!(
+                    "{{\"event\":\"cuda_debug_launch\",\"scope\":\"replay_prefix\",\"kernel\":\"{}\",\"grid_blocks\":{},\"threads\":{},\"step_count\":{},\"base_tick\":{},\"profiled\":{}}}",
+                    kernel,
+                    if self.shared.cooperative_launch && frozen_blocks > 1 { frozen_blocks } else { 1 },
+                    PERSISTENT_THREADS,
+                    chunk.len(),
+                    base_tick,
+                    profile_sampled,
+                );
+            }
+
+            let kernel_started = debug_chunks.then(Instant::now);
+            if profile_sampled {
+                let mut profile_counters = self.buffers.replay_profile_counters.pointer;
+                let mut parameters = [
+                    param(&mut pointers),
+                    param(&mut persistent_steps),
+                    param(&mut step_count),
+                    param(&mut tick),
+                    param(&mut profile_counters),
+                ];
                 self.launch_cooperative_exact(
-                    self.shared.kernels.advance_frozen_cooperative,
+                    self.shared.kernels.advance_frozen_cooperative_profiled,
                     frozen_blocks,
                     PERSISTENT_THREADS,
                     &mut parameters,
                 )?;
             } else {
-                self.launch_exact(
-                    self.shared.kernels.advance_frozen_persistent,
-                    1,
-                    PERSISTENT_THREADS,
-                    &mut parameters,
-                )?;
+                let mut parameters = [
+                    param(&mut pointers),
+                    param(&mut persistent_steps),
+                    param(&mut step_count),
+                    param(&mut tick),
+                ];
+                if self.shared.cooperative_launch && frozen_blocks > 1 {
+                    self.launch_cooperative_exact(
+                        self.shared.kernels.advance_frozen_cooperative,
+                        frozen_blocks,
+                        PERSISTENT_THREADS,
+                        &mut parameters,
+                    )?;
+                } else {
+                    self.launch_exact(
+                        self.shared.kernels.advance_frozen_persistent,
+                        1,
+                        PERSISTENT_THREADS,
+                        &mut parameters,
+                    )?;
+                }
             }
             self.synchronize()?;
+            let kernel_sync_ms = kernel_started
+                .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+
+            if profile_sampled {
+                self.emit_frozen_prefix_profile(frozen_blocks, profile_stride.unwrap_or(1))?;
+            }
+
             self.current_tick = self.current_tick.saturating_add(chunk.len() as u64);
+            if debug_chunks {
+                let total_ms = chunk_started
+                    .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                    .unwrap_or(0.0);
+                eprintln!(
+                    "{{\"event\":\"cuda_debug_chunk\",\"scope\":\"replay_prefix\",\"chunk_index\":{},\"steps\":{},\"base_tick\":{},\"end_tick\":{},\"grid_blocks\":{},\"pointer_upload_ms\":{},\"build_ms\":{},\"step_upload_ms\":{},\"kernel_sync_ms\":{},\"total_ms\":{},\"parameter_revision\":{}}}",
+                    chunk_index,
+                    chunk.len(),
+                    base_tick,
+                    self.current_tick,
+                    if self.shared.cooperative_launch && frozen_blocks > 1 { frozen_blocks } else { 1 },
+                    if chunk_index == 0 { pointer_upload_ms } else { 0.0 },
+                    build_ms,
+                    upload_ms,
+                    kernel_sync_ms,
+                    total_ms,
+                    self.model.parameter_revision,
+                );
+            }
         }
 
         Ok(())
@@ -2968,9 +3277,13 @@ impl CudaRuntime {
         let learning_trace = !matches!(permission, Permission::Frozen);
         let strength = permission.strength(&self.model.config);
         let mut all_metrics = Vec::with_capacity(steps.len());
+        let debug_chunks =
+            self.debug.chunks || self.debug.sync || self.debug.transfers || self.debug.state;
 
-        for chunk in steps.chunks(TRAINING_STEP_BATCH_CAPACITY) {
+        for (chunk_index, chunk) in steps.chunks(TRAINING_STEP_BATCH_CAPACITY).enumerate() {
+            let chunk_started = debug_chunks.then(Instant::now);
             let base_tick = self.current_tick;
+            let build_started = debug_chunks.then(Instant::now);
             let mut device_steps = Vec::with_capacity(chunk.len());
             let mut metadata = Vec::with_capacity(chunk.len());
             let mut learned_steps = 0u64;
@@ -3016,10 +3329,17 @@ impl CudaRuntime {
                 });
                 metadata.push((symbol, target_index, context_enabled, learned));
             }
+            let build_ms = build_started
+                .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
 
+            let upload_started = debug_chunks.then(Instant::now);
             let pointer_table = self.persistent_pointer_table();
             self.copy_to_device(self.buffers.persistent_pointer_table, &pointer_table)?;
             self.copy_to_device(self.buffers.persistent_steps, &device_steps)?;
+            let upload_ms = upload_started
+                .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
 
             let mut pointers = self.buffers.persistent_pointer_table.pointer;
             let mut persistent_steps = self.buffers.persistent_steps.pointer;
@@ -3027,24 +3347,120 @@ impl CudaRuntime {
             let mut tick = base_tick;
             let mut learning = u32::from(learning_trace);
             let mut raw_strength = strength;
-            let mut parameters = [
-                param(&mut pointers),
-                param(&mut persistent_steps),
-                param(&mut step_count),
-                param(&mut tick),
-                param(&mut learning),
-                param(&mut raw_strength),
-            ];
-            self.launch_cooperative_exact(
-                self.shared.kernels.train_persistent,
-                self.shared.persistent_grid_blocks,
-                PERSISTENT_THREADS,
-                &mut parameters,
+            let model_blocks = as_u32(
+                "replay training model block count",
+                self.model.config.model.block_count,
             )?;
-            self.synchronize()?;
+            let replay_blocks = self
+                .replay_grid_override
+                .unwrap_or(self.shared.replay_grid_blocks)
+                .min(self.shared.replay_grid_blocks.max(1))
+                .min(model_blocks)
+                .max(1);
+            let cooperative_replay = self.replay_cooperative_enabled
+                && self.shared.cooperative_launch
+                && self.shared.replay_grid_blocks > 0;
+            let profile_stride = self.replay_profile.target_stride;
+            let profile_requested = profile_stride
+                .is_some_and(|stride| self.replay_profile_target_sequence % stride == 0);
+            self.replay_profile_target_sequence =
+                self.replay_profile_target_sequence.saturating_add(1);
+            let profile_sampled = profile_requested
+                && cooperative_replay
+                && self.shared.replay_profile_grid_blocks >= replay_blocks;
 
+            if profile_requested && !profile_sampled {
+                eprintln!(
+                    "{{\"event\":\"cuda_replay_kernel_profile_skipped\",\"reason\":\"profiled_kernel_cannot_match_production_grid\",\"requested_grid_blocks\":{},\"normal_capacity_blocks\":{},\"profiled_capacity_blocks\":{},\"step_count\":{}}}",
+                    replay_blocks,
+                    self.shared.replay_grid_blocks,
+                    self.shared.replay_profile_grid_blocks,
+                    chunk.len(),
+                );
+            }
+            if profile_sampled {
+                self.clear_replay_profile_counters()?;
+            }
+
+            if self.debug.launches {
+                let kernel = if profile_sampled {
+                    "leo_train_cooperative_profiled"
+                } else if cooperative_replay {
+                    "leo_train_cooperative"
+                } else {
+                    "leo_train_persistent"
+                };
+                eprintln!(
+                    "{{\"event\":\"cuda_debug_launch\",\"scope\":\"replay_targets\",\"kernel\":\"{}\",\"grid_blocks\":{},\"threads\":{},\"step_count\":{},\"learned_steps\":{},\"base_tick\":{},\"profiled\":{},\"cooperative_replay\":{}}}",
+                    kernel,
+                    if cooperative_replay { replay_blocks } else { self.shared.persistent_grid_blocks.max(1) },
+                    PERSISTENT_THREADS,
+                    chunk.len(),
+                    learned_steps,
+                    base_tick,
+                    profile_sampled,
+                    cooperative_replay,
+                );
+            }
+
+            let kernel_started = debug_chunks.then(Instant::now);
+            if profile_sampled {
+                let mut profile_counters = self.buffers.replay_profile_counters.pointer;
+                let mut parameters = [
+                    param(&mut pointers),
+                    param(&mut persistent_steps),
+                    param(&mut step_count),
+                    param(&mut tick),
+                    param(&mut learning),
+                    param(&mut raw_strength),
+                    param(&mut profile_counters),
+                ];
+                self.launch_cooperative_exact(
+                    self.shared.kernels.train_cooperative_profiled,
+                    replay_blocks,
+                    PERSISTENT_THREADS,
+                    &mut parameters,
+                )?;
+            } else {
+                let mut parameters = [
+                    param(&mut pointers),
+                    param(&mut persistent_steps),
+                    param(&mut step_count),
+                    param(&mut tick),
+                    param(&mut learning),
+                    param(&mut raw_strength),
+                ];
+                if cooperative_replay {
+                    self.launch_cooperative_exact(
+                        self.shared.kernels.train_cooperative,
+                        replay_blocks,
+                        PERSISTENT_THREADS,
+                        &mut parameters,
+                    )?;
+                } else {
+                    self.launch_cooperative_exact(
+                        self.shared.kernels.train_persistent,
+                        self.shared.persistent_grid_blocks.max(1),
+                        PERSISTENT_THREADS,
+                        &mut parameters,
+                    )?;
+                }
+            }
+            self.synchronize()?;
+            let kernel_sync_ms = kernel_started
+                .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+
+            if profile_sampled {
+                self.emit_replay_target_profile(replay_blocks, profile_stride.unwrap_or(1))?;
+            }
+
+            let download_started = debug_chunks.then(Instant::now);
             let mut records = vec![CudaTrainingStepRecord::default(); chunk.len()];
             self.copy_from_device_prefix(self.buffers.training_step_records, &mut records)?;
+            let download_ms = download_started
+                .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
 
             if learning_trace && chunk.len() % 2 == 1 {
                 std::mem::swap(
@@ -3097,6 +3513,28 @@ impl CudaRuntime {
                     );
                 }
                 all_metrics.push(metrics);
+            }
+
+            if debug_chunks {
+                let total_ms = chunk_started
+                    .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                    .unwrap_or(0.0);
+                eprintln!(
+                    "{{\"event\":\"cuda_debug_chunk\",\"scope\":\"replay_targets\",\"chunk_index\":{},\"steps\":{},\"learned_steps\":{},\"base_tick\":{},\"end_tick\":{},\"grid_blocks\":{},\"cooperative_replay\":{},\"build_ms\":{},\"upload_ms\":{},\"kernel_sync_ms\":{},\"download_ms\":{},\"total_ms\":{},\"parameter_revision\":{}}}",
+                    chunk_index,
+                    chunk.len(),
+                    learned_steps,
+                    base_tick,
+                    self.current_tick,
+                    if cooperative_replay { replay_blocks } else { self.shared.persistent_grid_blocks.max(1) },
+                    cooperative_replay,
+                    build_ms,
+                    upload_ms,
+                    kernel_sync_ms,
+                    download_ms,
+                    total_ms,
+                    self.model.parameter_revision,
+                );
             }
         }
 
@@ -4264,6 +4702,7 @@ impl CudaRuntime {
         b.batch_base_ticks = self.allocate_u64(GPU_STORY_BATCH_MAX_LANES)?;
         b.batch_delta_pointer_table = self.allocate_u64(BATCH_DELTA_POINTER_COUNT)?;
         b.phase_profile_counters = self.allocate_u64(CUDA_PHASE_PROFILE_COUNTER_COUNT)?;
+        b.replay_profile_counters = self.allocate_u64(CUDA_REPLAY_PROFILE_COUNTER_COUNT)?;
 
         b.batch_delta_threshold = self.allocate_f32(n)?;
         b.batch_delta_threshold_marks = self.allocate_u32(n)?;
@@ -5496,6 +5935,150 @@ impl CudaRuntime {
             percent(CUDA_PHASE_PROFILE_HOMEOSTASIS),
             counters[CUDA_PHASE_PROFILE_CAPTURE],
             percent(CUDA_PHASE_PROFILE_CAPTURE),
+        );
+        Ok(())
+    }
+
+    fn clear_replay_profile_counters(&self) -> LeoResult<()> {
+        self.memset_zero(self.buffers.replay_profile_counters)
+    }
+
+    fn read_replay_profile_counters(&self) -> LeoResult<[u64; CUDA_REPLAY_PROFILE_COUNTER_COUNT]> {
+        let mut counters = [0u64; CUDA_REPLAY_PROFILE_COUNTER_COUNT];
+        self.copy_from_device(self.buffers.replay_profile_counters, &mut counters)?;
+        Ok(counters)
+    }
+
+    fn emit_replay_target_profile(&self, grid_blocks: u32, sample_stride: u64) -> LeoResult<()> {
+        let counters = self.read_replay_profile_counters()?;
+        let samples = counters[CUDA_REPLAY_PROFILE_SAMPLES];
+        let total_cycles = counters[1..CUDA_REPLAY_PROFILE_COUNTER_COUNT]
+            .iter()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        let percent = |index: usize| -> f64 {
+            if total_cycles == 0 {
+                0.0
+            } else {
+                counters[index] as f64 * 100.0 / total_cycles as f64
+            }
+        };
+        eprintln!(
+            concat!(
+                "{{\"event\":\"cuda_replay_kernel_profile\",",
+                "\"scope\":\"supervised_replay_targets\",",
+                "\"sample_stride\":{},\"samples\":{},\"grid_blocks\":{},",
+                "\"normal_capacity_blocks\":{},\"profiled_capacity_blocks\":{},",
+                "\"total_profiled_cycles\":{},\"cycles_per_step\":{},",
+                "\"pre_cycles\":{},\"pre_pct\":{},",
+                "\"select_blocks_cycles\":{},\"select_blocks_pct\":{},",
+                "\"select_global_cycles\":{},\"select_global_pct\":{},",
+                "\"cache_surrogate_cycles\":{},\"cache_surrogate_pct\":{},",
+                "\"recurrent_eligibility_cycles\":{},\"recurrent_eligibility_pct\":{},",
+                "\"input_eligibility_cycles\":{},\"input_eligibility_pct\":{},",
+                "\"post_emit_cycles\":{},\"post_emit_pct\":{},",
+                "\"forward_cycles\":{},\"forward_pct\":{},",
+                "\"learning_signals_cycles\":{},\"learning_signals_pct\":{},",
+                "\"output_update_cycles\":{},\"output_update_pct\":{},",
+                "\"context_update_cycles\":{},\"context_update_pct\":{},",
+                "\"recurrent_update_cycles\":{},\"recurrent_update_pct\":{},",
+                "\"input_update_cycles\":{},\"input_update_pct\":{},",
+                "\"inhibitory_cycles\":{},\"inhibitory_pct\":{},",
+                "\"homeostasis_cycles\":{},\"homeostasis_pct\":{},",
+                "\"capture_cycles\":{},\"capture_pct\":{}}}"
+            ),
+            sample_stride,
+            samples,
+            grid_blocks,
+            self.shared.replay_grid_blocks,
+            self.shared.replay_profile_grid_blocks,
+            total_cycles,
+            if samples == 0 {
+                0.0
+            } else {
+                total_cycles as f64 / samples as f64
+            },
+            counters[CUDA_REPLAY_PROFILE_PRE],
+            percent(CUDA_REPLAY_PROFILE_PRE),
+            counters[CUDA_REPLAY_PROFILE_SELECT_BLOCKS],
+            percent(CUDA_REPLAY_PROFILE_SELECT_BLOCKS),
+            counters[CUDA_REPLAY_PROFILE_SELECT_GLOBAL],
+            percent(CUDA_REPLAY_PROFILE_SELECT_GLOBAL),
+            counters[CUDA_REPLAY_PROFILE_CACHE_SURROGATE],
+            percent(CUDA_REPLAY_PROFILE_CACHE_SURROGATE),
+            counters[CUDA_REPLAY_PROFILE_RECURRENT_ELIGIBILITY],
+            percent(CUDA_REPLAY_PROFILE_RECURRENT_ELIGIBILITY),
+            counters[CUDA_REPLAY_PROFILE_INPUT_ELIGIBILITY],
+            percent(CUDA_REPLAY_PROFILE_INPUT_ELIGIBILITY),
+            counters[CUDA_REPLAY_PROFILE_POST_EMIT],
+            percent(CUDA_REPLAY_PROFILE_POST_EMIT),
+            counters[CUDA_REPLAY_PROFILE_FORWARD],
+            percent(CUDA_REPLAY_PROFILE_FORWARD),
+            counters[CUDA_REPLAY_PROFILE_LEARNING_SIGNALS],
+            percent(CUDA_REPLAY_PROFILE_LEARNING_SIGNALS),
+            counters[CUDA_REPLAY_PROFILE_OUTPUT_UPDATE],
+            percent(CUDA_REPLAY_PROFILE_OUTPUT_UPDATE),
+            counters[CUDA_REPLAY_PROFILE_CONTEXT_UPDATE],
+            percent(CUDA_REPLAY_PROFILE_CONTEXT_UPDATE),
+            counters[CUDA_REPLAY_PROFILE_RECURRENT_UPDATE],
+            percent(CUDA_REPLAY_PROFILE_RECURRENT_UPDATE),
+            counters[CUDA_REPLAY_PROFILE_INPUT_UPDATE],
+            percent(CUDA_REPLAY_PROFILE_INPUT_UPDATE),
+            counters[CUDA_REPLAY_PROFILE_INHIBITORY],
+            percent(CUDA_REPLAY_PROFILE_INHIBITORY),
+            counters[CUDA_REPLAY_PROFILE_HOMEOSTASIS],
+            percent(CUDA_REPLAY_PROFILE_HOMEOSTASIS),
+            counters[CUDA_REPLAY_PROFILE_CAPTURE],
+            percent(CUDA_REPLAY_PROFILE_CAPTURE),
+        );
+        Ok(())
+    }
+
+    fn emit_frozen_prefix_profile(&self, grid_blocks: u32, sample_stride: u64) -> LeoResult<()> {
+        let counters = self.read_replay_profile_counters()?;
+        let samples = counters[CUDA_FROZEN_PROFILE_SAMPLES];
+        let total_cycles = counters[1..CUDA_FROZEN_PROFILE_COUNTER_COUNT]
+            .iter()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        let percent = |index: usize| -> f64 {
+            if total_cycles == 0 {
+                0.0
+            } else {
+                counters[index] as f64 * 100.0 / total_cycles as f64
+            }
+        };
+        eprintln!(
+            concat!(
+                "{{\"event\":\"cuda_frozen_kernel_profile\",",
+                "\"scope\":\"replay_prefix_reconstruction\",",
+                "\"sample_stride\":{},\"samples\":{},\"grid_blocks\":{},",
+                "\"normal_capacity_blocks\":{},\"profiled_capacity_blocks\":{},",
+                "\"total_profiled_cycles\":{},\"cycles_per_step\":{},",
+                "\"pre_cycles\":{},\"pre_pct\":{},",
+                "\"select_blocks_cycles\":{},\"select_blocks_pct\":{},",
+                "\"select_global_cycles\":{},\"select_global_pct\":{},",
+                "\"post_emit_cycles\":{},\"post_emit_pct\":{}}}"
+            ),
+            sample_stride,
+            samples,
+            grid_blocks,
+            self.shared.frozen_grid_blocks,
+            self.shared.frozen_profile_grid_blocks,
+            total_cycles,
+            if samples == 0 {
+                0.0
+            } else {
+                total_cycles as f64 / samples as f64
+            },
+            counters[CUDA_FROZEN_PROFILE_PRE],
+            percent(CUDA_FROZEN_PROFILE_PRE),
+            counters[CUDA_FROZEN_PROFILE_SELECT_BLOCKS],
+            percent(CUDA_FROZEN_PROFILE_SELECT_BLOCKS),
+            counters[CUDA_FROZEN_PROFILE_SELECT_GLOBAL],
+            percent(CUDA_FROZEN_PROFILE_SELECT_GLOBAL),
+            counters[CUDA_FROZEN_PROFILE_POST_EMIT],
+            percent(CUDA_FROZEN_PROFILE_POST_EMIT),
         );
         Ok(())
     }
@@ -6978,8 +7561,15 @@ fn load_kernels(driver: &DriverFunctions, module: CuModule) -> LeoResult<KernelF
         forward: get_kernel(driver, module, "leo_forward")?,
         capture_training_step: get_kernel(driver, module, "leo_capture_training_step")?,
         train_persistent: get_kernel(driver, module, "leo_train_persistent")?,
+        train_cooperative: get_kernel(driver, module, "leo_train_cooperative")?,
+        train_cooperative_profiled: get_kernel(driver, module, "leo_train_cooperative_profiled")?,
         advance_frozen_persistent: get_kernel(driver, module, "leo_advance_frozen_persistent")?,
         advance_frozen_cooperative: get_kernel(driver, module, "leo_advance_frozen_cooperative")?,
+        advance_frozen_cooperative_profiled: get_kernel(
+            driver,
+            module,
+            "leo_advance_frozen_cooperative_profiled",
+        )?,
         shared_wavefront_pre: get_kernel(driver, module, "leo_shared_wavefront_pre")?,
         shared_wavefront_fused: get_kernel(driver, module, "leo_shared_wavefront_fused")?,
         shared_wavefront_fused_profiled: get_kernel(

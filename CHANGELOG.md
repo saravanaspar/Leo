@@ -4,7 +4,9 @@ All notable project changes should be recorded here.
 
 ## Unreleased
 
-No changes yet.
+- Accelerate the single-story supervised replay path with a cooperative whole-grid CUDA executor while preserving the legacy one-block kernel as an execution-only A/B fallback.
+- Expose hidden frozen-prefix replay work in benchmark/training progress accounting and add opt-in replay/CUDA timing, launch, memory, hardware-identity, segment, and sampled phase diagnostics.
+- Keep replay selection/order, logical worker semantics, FP32 equations, artifact formats, and v1 semantic/schema identifiers unchanged.
 
 ## v1.0.1 - 2026-09-07
 
