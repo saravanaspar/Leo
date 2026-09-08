@@ -35,6 +35,12 @@ def parse_args():
         default=None,
         help="comma-separated GPU counts to test (for example 1,2); defaults to powers of two plus all visible devices",
     )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="number of clean measured runs per GPU count; report min/median/max",
+    )
     return parser.parse_args()
 
 
@@ -251,7 +257,7 @@ def main():
             raise FileNotFoundError(path)
     if args.workers <= 0 or args.stories <= 0:
         raise ValueError("--workers and --stories must be positive")
-    if args.max_attempts <= 0:
+    if args.max_attempts <= 0 or args.repeats <= 0:
         raise ValueError("--max-attempts must be positive")
 
     devices = discover_devices(args.devices)
@@ -267,7 +273,15 @@ def main():
 
     results = []
     for count in counts:
-        results.append((count, run_clean_case(args, devices, count)))
+        cases = [run_clean_case(args, devices, count) for _ in range(args.repeats)]
+        cases.sort(key=lambda item: float(item["steps_per_second"]))
+        hashes = {case.get("training_state_sha256") for case in cases}
+        if len(hashes) != 1:
+            raise RuntimeError(f"{count}-GPU repeated runs produced different final state hashes")
+        median = cases[len(cases) // 2]
+        median["steps_per_second_min"] = float(cases[0]["steps_per_second"])
+        median["steps_per_second_max"] = float(cases[-1]["steps_per_second"])
+        results.append((count, median))
 
     base_count, base = results[0]
     assert base_count == 1
