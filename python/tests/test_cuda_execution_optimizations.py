@@ -354,6 +354,7 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
 
         for marker in (
             "replay_selection_debug",
+            "replay_device_selection_debug",
             "replay_range_debug",
             "replay_segment_debug",
             "replay_story_debug",
@@ -395,8 +396,10 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("leo_advance_frozen_cooperative_profiled", kernels)
         self.assertIn("LEO_CUDA_REPLAY_PROFILE", docs)
         self.assertIn("LEO_CUDA_REPLAY_COOPERATIVE", docs)
+        self.assertIn("replay_device_selection_debug", docs)
         self.assertIn("LEO_CUDA_REPLAY_PROFILE", script)
         self.assertIn("CUDA replay diagnostics OK", gpu_gate)
+        self.assertIn("replay_device_selection_debug", gpu_gate)
         self.assertIn("replay_prefix_steps", gpu_gate)
         self.assertIn("cuda_replay_kernel_profile", gpu_gate)
 
@@ -961,6 +964,12 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("DeviceStorySummary", backend)
         self.assertIn("device_postprocessed", training)
         self.assertIn("apply_batch_replay_ranges", training)
+        device_ranges = training.split("fn apply_batch_replay_ranges", 1)[1].split(
+            "fn device_story_report_is_postprocessed", 1
+        )[0]
+        self.assertIn("emit_device_replay_selection_debug", device_ranges)
+        self.assertIn("emit_replay_batch_debug", device_ranges)
+        self.assertIn("losses_resident_on_device", training)
         # The CPU selector remains the exact fallback for debug, long stories,
         # multi-GPU retained deltas, and explicit execution A/B.
         self.assertIn("select_replay_ranges(losses, fraction, segment_targets)", training)
