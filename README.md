@@ -225,6 +225,7 @@ Leo/
 - [Backend ADR](docs/ADR-0001-EXECUTION-BACKENDS.md)
 - [Testing strategy](docs/TESTING.md)
 - [Reproducibility](docs/REPRODUCIBILITY.md)
+- [Optimized training guide](docs/TRAINING-GUIDE.md)
 - [Training/CUDA debugging](docs/DEBUGGING.md)
 
 Historical GPU stage documents remain in `docs/` as implementation history; the current v1 contract is defined by the files above and the code.
@@ -443,13 +444,17 @@ Merged sparse rows are packed once and synchronized into canonical replicas and
 resident story lanes so lanes remain hot across logical batches. Secondary CUDA
 runtimes are owned by persistent worker threads.
 
-Replay remains on the canonical backend in story/range order. Consequently,
-base-pass data parallelism can scale well while full replay-on throughput is
-still limited by the serial replay fraction. See [docs/SCALING.md](docs/SCALING.md)
-for the scaling model and benchmark procedure. The GPU gate now requires an exact complete-training-state digest match for
-1-GPU vs 2-GPU runs on homogeneous devices, in addition to the existing CPU/CUDA
-conformance checks. The logical denominator, update barrier, replay policy, and
-FP32 learning equations are unchanged.
+In the default/exact mode, replay remains on the canonical backend in
+story/range order. Consequently, base-pass data parallelism can scale well while
+full replay-on throughput is still limited by the serial replay fraction.
+Experimental `LEO_MULTI_GPU_PARALLEL_REPLAY=1` and `LEO_REPLAY_STREAMING=1` modes
+exist for quality-gated replay scaling experiments; they retain FP32 and the
+configured replay fraction but intentionally do not claim exact replay-state
+semantics. See [docs/SCALING.md](docs/SCALING.md) and
+[docs/TRAINING-GUIDE.md](docs/TRAINING-GUIDE.md) for the scaling model, acceptance
+procedure, and commands. The GPU gate requires an exact complete-training-state
+digest match for the default 1-GPU vs 2-GPU path on homogeneous devices, in
+addition to the existing CPU/CUDA conformance checks.
 
 </details>
 

@@ -121,7 +121,7 @@ For a model-quality comparison, record at minimum:
 
 The CPU runtime is the reference implementation. The single-GPU CUDA path is expected to preserve the v1 learning contract within the explicit conformance thresholds used by GPU tests.
 
-Multi-GPU data parallelism preserves the logical story-batch reduction: one sparse delta per original story is flattened in canonical story order and one `1 / workers` mean is applied. Multi-GPU hardware tests should compare 1-GPU and N-GPU semantic counters/loss within the existing CPU/CUDA numerical thresholds and report scaling efficiency separately. Replay remains canonical/serial, so replay-on scaling is expected to be lower than base-pass scaling until model-parallel replay is implemented.
+Multi-GPU data parallelism preserves the logical story-batch reduction: one sparse delta per original story is flattened in canonical story order and one `1 / workers` mean is applied. Multi-GPU hardware tests should compare 1-GPU and N-GPU semantic counters/loss within the existing CPU/CUDA numerical thresholds and report scaling efficiency separately. The default/exact replay path remains canonical/serial, so its replay-on scaling is lower than base-pass scaling. `LEO_MULTI_GPU_PARALLEL_REPLAY=1` and `LEO_REPLAY_STREAMING=1` are separate semantic experiments: they retain FP32 and the configured replay fraction, but require held-out quality A/B validation and are not covered by the exact-state acceptance claim.
 
 ## 8. Regression-test rule
 

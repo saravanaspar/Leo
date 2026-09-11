@@ -37,8 +37,14 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         )[0]
         self.assertIn("physical_lane_chunk", batch)
         self.assertIn("snapshot_batch_lane_values", batch)
+        self.assertIn("snapshot_batch_lane_context_values_batched", batch)
         self.assertIn("SparseModelDelta::from_tracked_values", batch)
-        self.assertEqual(batch.count("apply_mean_deltas("), 1)
+        self.assertIn("launch_device_batch_fixed_merge", batch)
+        self.assertIn("cuda_device_batch_merge_enabled()", batch)
+        # The default reducer performs fixed numeric rows on-device and keeps
+        # only the keyed context merge on the host. The complete historical
+        # host mean remains behind LEO_CUDA_DEVICE_BATCH_MERGE=0.
+        self.assertEqual(batch.count("apply_mean_deltas("), 2)
         self.assertNotIn("launch_sparse_apply_and_reset(", batch)
         self.assertIn("copy_canonical_parameters_to_batch_lane_async", batch)
         self.assertIn("model_revision", batch)
@@ -423,7 +429,8 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
 
         self.assertIn("DeviceStoryBatchDeltaReport", backend)
         self.assertIn("retain_story_deltas", cuda)
-        self.assertIn("do NOT first build a device-local mean", cuda)
+        self.assertIn("if retain_story_deltas", cuda)
+        self.assertIn("snapshot_batch_lane_values_batched", cuda)
         self.assertIn("gpu_story_mean_exact_v1", lifecycle)
         self.assertIn("flat_story_delta_mean", lifecycle)
 
@@ -500,11 +507,15 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("canonical.enable_parameter_tracking()", training)
         self.assertIn("self.synchronize_replicas(update)?", training)
         self.assertIn("multi_gpu_serial_replay", training)
-        self.assertIn("runtime.synchronize_packed_model(&replay_update)?", training)
+        self.assertIn("LEO_MULTI_GPU_PARALLEL_REPLAY", training)
+        self.assertIn("run_parallel_replay", training)
+        self.assertIn("apply_sum_deltas", training)
+        self.assertIn("canonical.synchronize_packed_model(&replay_update)?", training)
         self.assertIn("runtime.synchronize_packed_model(&update)?", training)
 
         self.assertIn("struct PackedSparseModelUpdate", parallel)
-        self.assertIn("fn apply_sparse_mean", parallel)
+        self.assertIn("fn apply_sparse_scaled", parallel)
+        self.assertIn("pub fn apply_sum_deltas", parallel)
         self.assertNotIn("BTreeMap::<usize, f64>", parallel)
         self.assertNotIn("project_parameter_constraints(master);", parallel)
         self.assertIn("project_parameter_constraints_sparse(master, deltas)?", parallel)
@@ -512,7 +523,8 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
 
         self.assertIn("snapshot_batch_lane_values_batched", cuda)
         self.assertIn("batch snapshot counts", cuda)
-        self.assertIn("let count_elements = lane_count.saturating_mul(5);", cuda)
+        self.assertIn("fn read_batch_lane_change_counts", cuda)
+        self.assertIn("let count_elements = lanes.len().saturating_mul(5);", cuda)
         self.assertIn("entire variable payload crosses PCIe in at most three D2H operations", cuda)
         self.assertIn("self.batch_snapshot_device_f32", cuda)
         self.assertIn("self.batch_snapshot_device_u32", cuda)
@@ -567,6 +579,211 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         )[1].split("__device__ void leo_p_select_blocks", 1)[0]
         self.assertIn("if (block_cutoff[model_block] == 0.0f) return", select_block)
         self.assertIn("block_cutoff[model_block] = cutoff", select_block)
+
+
+    def test_persistent_shared_fast_path_keeps_full_debug_fallback(self):
+        rust = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+
+        persistent = kernels.split(
+            'extern "C" __global__ void leo_shared_wavefront_persistent', 1
+        )[1].split("enum LeoCudaPhaseProfileCounter", 1)[0]
+        self.assertIn(
+            "for (unsigned int step_index = 0U; step_index < max_step_count; ++step_index)",
+            persistent,
+        )
+        self.assertGreaterEqual(persistent.count("grid.sync();"), 9)
+        for helper in (
+            "leo_shared_phase_select_block_fast",
+            "leo_shared_phase_post_core_lane_fast",
+            "leo_shared_phase_post_deltas_lane_fast",
+            "leo_shared_phase_capture_lane_fast",
+        ):
+            self.assertIn(helper, persistent)
+
+        self.assertIn("struct CudaFastTrainingStepRecord", rust)
+        self.assertIn("LEO_CUDA_SHARED_PERSISTENT", rust)
+        self.assertIn("LEO_CUDA_FULL_STEP_METRICS", rust)
+        self.assertIn("shared_persistent_enabled", rust)
+        self.assertIn("leo_train_cooperative_fast", rust)
+        self.assertIn("leo_shared_wavefront_persistent", rust)
+        self.assertIn("LeoFastTrainingStepRecord", kernels)
+        self.assertIn("leo_train_cooperative_fast", kernels)
+
+        fast_capture = kernels.split(
+            "leo_p_capture_training_step_fast", 1
+        )[1].split("__device__ void leo_p_capture_training_step", 1)[0]
+        self.assertIn("record.loss", fast_capture)
+        self.assertIn("record.active_count", fast_capture)
+        self.assertIn("record.error_code", fast_capture)
+        self.assertIn("records[record_index] = record", fast_capture)
+        self.assertNotIn("neural_only_loss", fast_capture)
+        self.assertNotIn("predicted_index", fast_capture)
+
+    def test_fast_training_path_skips_diagnostic_only_global_atomics(self):
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+
+        select_impl = kernels.split("leo_p_select_model_block_impl", 1)[1].split(
+            "__device__ __forceinline__ void leo_p_select_model_block(", 1
+        )[0]
+        self.assertIn("if (DETAILED_METRICS &&", select_impl)
+        self.assertIn("atomicAdd(&counters->suprathreshold", select_impl)
+        self.assertIn("atomicAdd(&counters->block_selected", select_impl)
+
+        recurrent_impl = kernels.split(
+            "leo_p_update_recurrent_eligibility_work_impl", 1
+        )[1].split("__device__ void leo_p_update_recurrent_eligibility_work(", 1)[0]
+        input_impl = kernels.split(
+            "leo_p_update_input_eligibility_work_impl", 1
+        )[1].split("__device__ void leo_p_update_input_eligibility_work(", 1)[0]
+        recurrent_weights = kernels.split(
+            "leo_p_update_recurrent_weights_work_impl", 1
+        )[1].split("__device__ void leo_p_update_recurrent_weights_work(", 1)[0]
+        input_weights = kernels.split(
+            "leo_p_update_input_weights_work_impl", 1
+        )[1].split("__device__ void leo_p_update_input_weights_work(", 1)[0]
+
+        for body, counter in (
+            (recurrent_impl, "eligible_recurrent"),
+            (input_impl, "eligible_input"),
+            (recurrent_weights, "learning_eligibility_abs_sum"),
+            (input_weights, "learning_eligibility_abs_sum"),
+        ):
+            self.assertIn("DETAILED_METRICS", body)
+            self.assertIn(counter, body)
+
+        cooperative = kernels.split("leo_train_cooperative_body", 1)[1].split(
+            'extern "C" __global__ void leo_train_cooperative', 1
+        )[0]
+        self.assertIn("if (FAST_METRICS)", cooperative)
+        self.assertIn("leo_p_select_model_block_fast", cooperative)
+        self.assertIn("leo_p_update_recurrent_eligibility_work_fast", cooperative)
+        self.assertIn("leo_p_update_input_eligibility_work_fast", cooperative)
+        self.assertIn("leo_p_update_recurrent_weights_work_fast", cooperative)
+        self.assertIn("leo_p_update_input_weights_work_fast", cooperative)
+
+    def test_legacy_eligibility_kernels_do_not_reference_template_metric_flag(self):
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+
+        recurrent = kernels.split(
+            'extern "C" __global__ void leo_update_recurrent_eligibility(', 1
+        )[1].split('extern "C" __global__ void leo_update_input_eligibility(', 1)[0]
+        input_body = kernels.split(
+            'extern "C" __global__ void leo_update_input_eligibility(', 1
+        )[1].split('extern "C" __global__ void leo_update_recurrent_weights(', 1)[0]
+
+        self.assertNotIn("DETAILED_METRICS", recurrent)
+        self.assertNotIn("DETAILED_METRICS", input_body)
+        self.assertIn("atomicAdd(&counters->eligible_recurrent, 1U);", recurrent)
+        self.assertIn("atomicAdd(&counters->eligible_input, 1U);", input_body)
+
+    def test_streaming_replay_is_opt_in_and_classic_replay_remains_default(self):
+        training = (ROOT / "crates/leo-cli/src/training.rs").read_text()
+        backend = (ROOT / "crates/leo-core/src/backend.rs").read_text()
+        rust = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+
+        flag = training.split("fn replay_streaming_enabled", 1)[1].split(
+            "#[derive(Debug, Clone, Copy, Default)]", 1
+        )[0]
+        self.assertIn("LEO_REPLAY_STREAMING", flag)
+        self.assertIn(".unwrap_or(false)", flag)
+
+        streaming = training.split("fn replay_ranges_streaming", 1)[1].split(
+            "fn apply_replay_policy", 1
+        )[0]
+        self.assertIn("runtime.begin_document()?", streaming)
+        self.assertIn("runtime.replay_streaming_batch(&schedule, permission)?", streaming)
+        self.assertIn("schedule.push(step)", streaming)
+        self.assertIn("runtime.reset_transient_state()?", streaming)
+
+        self.assertIn("fn replay_streaming_batch", backend)
+        self.assertIn("pub(crate) fn replay_streaming_batch", rust)
+        self.assertIn("target_index: -2", rust)
+        self.assertIn("const bool frozen_advance = step.target_index == -2", kernels)
+        self.assertIn("leo_p_context_advance_history", kernels)
+
+        policy = training.split("fn apply_replay_policy", 1)[1].split(
+            "fn apply_batch_replay_policy", 1
+        )[0]
+        self.assertIn("replay_streaming_enabled()", policy)
+        self.assertIn("replay_ranges_streaming", policy)
+        self.assertIn("replay_target_range_impl", policy)
+        self.assertIn("runtime.model().config.replay.fraction", policy)
+        self.assertIn("runtime.model().config.replay.segment_bytes", policy)
+
+        gpu_gate = (ROOT / "scripts/check_gpu.sh").read_text()
+        self.assertIn("LEO_CUDA_SHARED_PERSISTENT=0", gpu_gate)
+        self.assertIn("LEO_CUDA_SHARED_GROUPED=0", gpu_gate)
+        self.assertIn("LEO_CUDA_DEVICE_BATCH_MERGE=0", gpu_gate)
+        self.assertIn("Persistent/grouped/device-merge CUDA exact-state gate OK", gpu_gate)
+        self.assertIn("training_state_sha256", gpu_gate)
+
+    def test_grouped_shared_wavefront_parallelizes_each_logical_lane(self):
+        rust = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+
+        grouped = kernels.split(
+            'extern "C" __global__ void leo_shared_wavefront_persistent_grouped', 1
+        )[1].split("enum LeoCudaPhaseProfileCounter", 1)[0]
+        self.assertIn("blocks_per_lane", grouped)
+        self.assertIn("lane = blockIdx.x / blocks_per_lane", grouped)
+        self.assertIn("lane_thread", grouped)
+        self.assertIn("lane_stride", grouped)
+        self.assertIn("leo_p_forward_context_latent_work", grouped)
+        self.assertIn("leo_p_forward_logits_work", grouped)
+        self.assertIn("leo_p_update_recurrent_weights_work_fast", grouped)
+        self.assertIn("leo_p_update_input_weights_work_fast", grouped)
+        self.assertIn("leo_p_homeostasis_work", grouped)
+        self.assertIn("LEO_CUDA_SHARED_GROUPED", rust)
+        self.assertIn("shared_grouped_blocks_256", rust)
+
+    def test_device_batch_merge_marks_touched_rows_even_when_mean_cancels(self):
+        rust = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+
+        merge = kernels.split(
+            'extern "C" __global__ void leo_merge_shared_lane_fixed_parameters', 1
+        )[1].split('extern "C" __global__ void leo_apply_shared_wavefront_deltas', 1)[0]
+        self.assertIn("bool lane_changed = false", merge)
+        self.assertIn("lane_changed |= delta != 0.0f", merge)
+        self.assertIn("if (lane_changed)", merge)
+        self.assertIn("leo_mark_changed", merge)
+        self.assertIn("LEO_CUDA_DEVICE_BATCH_MERGE", rust)
+        self.assertIn("snapshot_batch_lane_context_values_batched", rust)
+        # Device merge must include every input symbol: 256 bytes plus the
+        # BEGIN_DOCUMENT and END_DOCUMENT control symbols.
+        self.assertIn("#define LEO_SYMBOLS 258", kernels)
+        self.assertIn(
+            "const unsigned int input_len = LEO_SYMBOLS * cfg->input_fanout;",
+            merge,
+        )
+
+    def test_power_of_two_indexing_and_short_decay_have_exact_fast_paths(self):
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+        self.assertIn("leo_fast_mod_u32", kernels)
+        self.assertIn("leo_fast_mod_u64_u32", kernels)
+        self.assertIn("value & (modulus - 1U)", kernels)
+        decay = kernels.split("float leo_decay", 1)[1].split(
+            "__device__ __forceinline__ unsigned int leo_rotated_key", 1
+        )[0]
+        self.assertIn("if (elapsed <= 7ULL)", decay)
+        self.assertIn("const float base2 = base * base", decay)
+        self.assertIn("const float base4 = base2 * base2", decay)
+        self.assertIn("while (exponent != 0ULL)", decay)
+
+    def test_parallel_multi_gpu_replay_is_opt_in_and_keeps_budget_fp32(self):
+        training = (ROOT / "crates/leo-cli/src/training.rs").read_text()
+        flag = training.split("fn multi_gpu_parallel_replay_enabled", 1)[1].split(
+            "#[derive(Debug, Clone, Copy, Default)]", 1
+        )[0]
+        self.assertIn("LEO_MULTI_GPU_PARALLEL_REPLAY", flag)
+        self.assertIn(".unwrap_or(false)", flag)
+        self.assertIn("run_parallel_replay", training)
+        self.assertIn("apply_sum_deltas", training)
+        self.assertIn("sum_local_trajectories", training)
+        self.assertIn('"fp32\\\":true', training)
+        self.assertIn("runtime.model().config.replay.fraction", training)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ pub(crate) use validation::{evaluate_model, print_learning_quality, print_predic
 
 use leo_core::symbols::{BEGIN_DOCUMENT, END_DOCUMENT};
 use leo_core::{
-    apply_mean_deltas, available_gpu_devices, merged_parameter_changes,
+    apply_mean_deltas, apply_sum_deltas, available_gpu_devices, merged_parameter_changes,
     visible_gpu_device_compatibility, BackendKind, BackendRuntime, LeoError, LeoResult,
     MergeMetrics, Model, PackedSparseModelUpdate, ParameterChanges, Permission, SparseModelDelta,
     StepMetrics,
@@ -71,6 +71,36 @@ fn replay_debug_options() -> ReplayDebugOptions {
     *OPTIONS.get_or_init(ReplayDebugOptions::from_env)
 }
 
+/// Experimental replay executor that preserves the configured replay target
+/// budget (30% in the reference configuration) but carries recurrent state
+/// forward between selected ranges instead of rebuilding every range from byte
+/// zero. This is intentionally opt-in until full TinyStories quality parity is
+/// established because it changes replay-state semantics while keeping FP32 and
+/// the supervised replay fraction unchanged.
+fn replay_streaming_enabled() -> bool {
+    std::env::var("LEO_REPLAY_STREAMING")
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
+}
+
+/// Multi-GPU replay may change cross-story parameter visibility while never
+/// changing the configured replay budget or FP32 arithmetic. Keep it opt-in
+/// until a real training-quality A/B establishes equivalence or improvement;
+/// LEO_MULTI_GPU_PARALLEL_REPLAY=1 enables the local-trajectory strategy.
+fn multi_gpu_parallel_replay_enabled() -> bool {
+    std::env::var("LEO_MULTI_GPU_PARALLEL_REPLAY")
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct ReplayTiming {
     begin_ms: f64,
@@ -100,6 +130,118 @@ struct ReplayRangeExecution {
     prefix_steps: u64,
     target_steps: u64,
     timing: ReplayTiming,
+}
+
+fn replay_step_at_position(
+    story: &[u8],
+    position: usize,
+    supervised: bool,
+) -> Option<(u32, Option<u32>)> {
+    if story.is_empty() || position > story.len() {
+        return None;
+    }
+    let input = if position == 0 {
+        BEGIN_DOCUMENT
+    } else {
+        story[position - 1] as u32
+    };
+    let target = if supervised {
+        Some(if position < story.len() {
+            story[position] as u32
+        } else {
+            END_DOCUMENT
+        })
+    } else {
+        None
+    };
+    Some((input, target))
+}
+
+fn replay_ranges_streaming(
+    runtime: &mut BackendRuntime,
+    story: &[u8],
+    ranges: &[std::ops::Range<usize>],
+    permission: Permission,
+    collect_timing: bool,
+) -> LeoResult<ReplayRangeExecution> {
+    let total_started = collect_timing.then(Instant::now);
+    let mut activity = ActivityDiagnostics::default();
+    let mut timing = ReplayTiming::default();
+    if story.is_empty() || ranges.is_empty() {
+        return Ok(ReplayRangeExecution {
+            activity,
+            prefix_steps: 0,
+            target_steps: 0,
+            timing,
+        });
+    }
+
+    let begin_started = collect_timing.then(Instant::now);
+    runtime.begin_document()?;
+    timing.begin_ms = begin_started
+        .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+
+    // Build the complete streaming replay timeline once. Frozen positions keep
+    // recurrent/context state moving between selected ranges; selected
+    // positions remain supervised. CUDA consumes this mixed schedule in one
+    // cooperative launch per 4096 timeline positions instead of bouncing
+    // through the host at every range boundary.
+    let build_started = collect_timing.then(Instant::now);
+    let terminal = story.len() + 1;
+    let mut cursor = 0usize;
+    let mut schedule = Vec::new();
+    let mut prefix_steps = 0u64;
+    let mut target_steps = 0u64;
+
+    for range in ranges {
+        let start = range.start.min(terminal).max(cursor);
+        let end = range.end.min(terminal).max(start);
+        for position in cursor..start {
+            if let Some(step) = replay_step_at_position(story, position, false) {
+                schedule.push(step);
+                prefix_steps = prefix_steps.saturating_add(1);
+            }
+        }
+        for position in start..end {
+            if let Some(step) = replay_step_at_position(story, position, true) {
+                schedule.push(step);
+                target_steps = target_steps.saturating_add(1);
+            }
+        }
+        cursor = end;
+    }
+    timing.target_build_ms = build_started
+        .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+
+    let execute_started = collect_timing.then(Instant::now);
+    for metrics in runtime.replay_streaming_batch(&schedule, permission)? {
+        activity.record(metrics);
+    }
+    // The device-resident schedule deliberately measures frozen + supervised
+    // execution together; attribute it to target_execute_ms so the reported
+    // replay target rate is an honest end-to-end rate rather than inventing a
+    // split that no longer exists at the kernel level.
+    timing.target_execute_ms = execute_started
+        .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+
+    let reset_started = collect_timing.then(Instant::now);
+    runtime.reset_transient_state()?;
+    timing.reset_ms = reset_started
+        .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+    timing.total_ms = total_started
+        .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+
+    Ok(ReplayRangeExecution {
+        activity,
+        prefix_steps,
+        target_steps,
+        timing,
+    })
 }
 
 fn apply_replay_policy(
@@ -202,40 +344,58 @@ fn apply_replay_policy(
     let mut replay_steps = 0u64;
     let mut prefix_steps = 0u64;
     let mut timing = ReplayTiming::default();
-    for (index, range) in ranges.iter().enumerate() {
-        let cleanup_after = index + 1 == ranges.len();
-        let execution = replay_target_range_impl(
-            runtime,
-            story,
-            range.clone(),
-            permission,
-            cleanup_after,
-            debug.timing,
-        )?;
-        replay_steps = replay_steps.saturating_add(execution.target_steps);
-        prefix_steps = prefix_steps.saturating_add(execution.prefix_steps);
+    if replay_streaming_enabled() && !ranges.is_empty() {
+        let execution = replay_ranges_streaming(runtime, story, &ranges, permission, debug.timing)?;
+        replay_steps = execution.target_steps;
+        prefix_steps = execution.prefix_steps;
         timing.add(execution.timing);
         activity.add(execution.activity);
-
-        if debug.segments && index % debug.segment_stride == 0 {
+        if debug.segments {
             eprintln!(
-                "{{\"event\":\"replay_segment_debug\",\"story_index\":{},\"segment_index\":{},\"segment_count\":{},\"start\":{},\"end\":{},\"target_steps\":{},\"prefix_steps\":{},\"cleanup_after\":{},\"begin_ms\":{},\"prefix_build_ms\":{},\"prefix_execute_ms\":{},\"target_build_ms\":{},\"target_execute_ms\":{},\"reset_ms\":{},\"total_ms\":{}}}",
+                "{{\"event\":\"replay_streaming_debug\",\"story_index\":{},\"segments\":{},\"target_steps\":{},\"prefix_steps\":{},\"classic_estimated_prefix_steps\":{}}}",
                 story_index,
-                index,
                 ranges.len(),
-                range.start,
-                range.end,
-                execution.target_steps,
-                execution.prefix_steps,
-                cleanup_after,
-                execution.timing.begin_ms,
-                execution.timing.prefix_build_ms,
-                execution.timing.prefix_execute_ms,
-                execution.timing.target_build_ms,
-                execution.timing.target_execute_ms,
-                execution.timing.reset_ms,
-                execution.timing.total_ms,
+                replay_steps,
+                prefix_steps,
+                estimated_prefix_steps,
             );
+        }
+    } else {
+        for (index, range) in ranges.iter().enumerate() {
+            let cleanup_after = index + 1 == ranges.len();
+            let execution = replay_target_range_impl(
+                runtime,
+                story,
+                range.clone(),
+                permission,
+                cleanup_after,
+                debug.timing,
+            )?;
+            replay_steps = replay_steps.saturating_add(execution.target_steps);
+            prefix_steps = prefix_steps.saturating_add(execution.prefix_steps);
+            timing.add(execution.timing);
+            activity.add(execution.activity);
+
+            if debug.segments && index % debug.segment_stride == 0 {
+                eprintln!(
+                    "{{\"event\":\"replay_segment_debug\",\"story_index\":{},\"segment_index\":{},\"segment_count\":{},\"start\":{},\"end\":{},\"target_steps\":{},\"prefix_steps\":{},\"cleanup_after\":{},\"begin_ms\":{},\"prefix_build_ms\":{},\"prefix_execute_ms\":{},\"target_build_ms\":{},\"target_execute_ms\":{},\"reset_ms\":{},\"total_ms\":{}}}",
+                    story_index,
+                    index,
+                    ranges.len(),
+                    range.start,
+                    range.end,
+                    execution.target_steps,
+                    execution.prefix_steps,
+                    cleanup_after,
+                    execution.timing.begin_ms,
+                    execution.timing.prefix_build_ms,
+                    execution.timing.prefix_execute_ms,
+                    execution.timing.target_build_ms,
+                    execution.timing.target_execute_ms,
+                    execution.timing.reset_ms,
+                    execution.timing.total_ms,
+                );
+            }
         }
     }
     if let Some(started) = story_started {
@@ -280,6 +440,28 @@ struct ReplayTrainingReport {
     pub(crate) prefix_steps: u64,
     timing: ReplayTiming,
     selection_ms: f64,
+}
+
+impl ReplayTrainingReport {
+    fn empty() -> Self {
+        Self {
+            activity: ActivityDiagnostics::default(),
+            replay_segments: 0,
+            replay_steps: 0,
+            prefix_steps: 0,
+            timing: ReplayTiming::default(),
+            selection_ms: 0.0,
+        }
+    }
+
+    fn add(&mut self, other: Self) {
+        self.activity.add(other.activity);
+        self.replay_segments = self.replay_segments.saturating_add(other.replay_segments);
+        self.replay_steps = self.replay_steps.saturating_add(other.replay_steps);
+        self.prefix_steps = self.prefix_steps.saturating_add(other.prefix_steps);
+        self.timing.add(other.timing);
+        self.selection_ms += other.selection_ms;
+    }
 }
 
 #[derive(Debug)]
@@ -420,6 +602,15 @@ enum ReplicaCommand {
         repair_model: Option<Arc<Model>>,
         response: mpsc::Sender<LeoResult<MultiGpuShardResult>>,
     },
+    Replay {
+        stories: Arc<Vec<Vec<u8>>>,
+        losses: Arc<Vec<Vec<f32>>>,
+        range: std::ops::Range<usize>,
+        permission: Permission,
+        expected_revision: u64,
+        base_model: Arc<Model>,
+        response: mpsc::Sender<LeoResult<MultiGpuReplayShardResult>>,
+    },
     Synchronize {
         update: Arc<PackedSparseModelUpdate>,
         response: mpsc::Sender<LeoResult<u64>>,
@@ -479,6 +670,34 @@ impl MultiGpuReplicaWorker {
                                     &stories[range.clone()],
                                     range.start,
                                     permission,
+                                )
+                            })();
+                            let _ = response.send(result);
+                        }
+                        ReplicaCommand::Replay {
+                            stories,
+                            losses,
+                            range,
+                            permission,
+                            expected_revision,
+                            base_model,
+                            response,
+                        } => {
+                            let result = (|| {
+                                if runtime.model().parameter_revision != expected_revision {
+                                    return Err(LeoError::internal(format!(
+                                        "multi-GPU replay replica {device_index} revision {} does not match canonical revision {expected_revision}",
+                                        runtime.model().parameter_revision
+                                    )));
+                                }
+                                runtime.reset_transient_state()?;
+                                run_multi_gpu_replay_shard(
+                                    &mut runtime,
+                                    &stories[range.clone()],
+                                    &losses[range.clone()],
+                                    range.start,
+                                    permission,
+                                    &base_model,
                                 )
                             })();
                             let _ = response.send(result);
@@ -546,6 +765,35 @@ impl MultiGpuReplicaWorker {
         Ok(receiver)
     }
 
+    fn dispatch_replay(
+        &self,
+        stories: Arc<Vec<Vec<u8>>>,
+        losses: Arc<Vec<Vec<f32>>>,
+        range: std::ops::Range<usize>,
+        permission: Permission,
+        expected_revision: u64,
+        base_model: Arc<Model>,
+    ) -> LeoResult<mpsc::Receiver<LeoResult<MultiGpuReplayShardResult>>> {
+        let (response, receiver) = mpsc::channel();
+        self.sender
+            .send(ReplicaCommand::Replay {
+                stories,
+                losses,
+                range,
+                permission,
+                expected_revision,
+                base_model,
+                response,
+            })
+            .map_err(|_| {
+                LeoError::internal(format!(
+                    "persistent multi-GPU replay worker for device {} is unavailable",
+                    self.device_index
+                ))
+            })?;
+        Ok(receiver)
+    }
+
     fn dispatch_sync(
         &self,
         update: Arc<PackedSparseModelUpdate>,
@@ -580,6 +828,20 @@ struct MultiGpuShardResult {
     activity: ActivityDiagnostics,
     story_deltas: Vec<SparseModelDelta>,
     story_changes: Vec<ParameterChanges>,
+}
+
+struct MultiGpuReplayShardResult {
+    story_start: usize,
+    elapsed_seconds: f64,
+    report: ReplayTrainingReport,
+    delta: SparseModelDelta,
+    changes: ParameterChanges,
+}
+
+struct MultiGpuReplayOutcome {
+    report: ReplayTrainingReport,
+    replay_seconds: f64,
+    replay_sync_seconds: f64,
 }
 
 #[cfg(test)]
@@ -694,6 +956,38 @@ fn run_multi_gpu_shard(
     })
 }
 
+fn run_multi_gpu_replay_shard(
+    worker: &mut BackendRuntime,
+    stories: &[Vec<u8>],
+    losses_by_story: &[Vec<f32>],
+    story_start: usize,
+    permission: Permission,
+    base_model: &Model,
+) -> LeoResult<MultiGpuReplayShardResult> {
+    if stories.len() != losses_by_story.len() {
+        return Err(LeoError::internal(
+            "multi-GPU replay shard story/loss length mismatch",
+        ));
+    }
+    if worker.model().parameter_revision != base_model.parameter_revision {
+        return Err(LeoError::internal(
+            "multi-GPU replay shard did not start from the canonical revision",
+        ));
+    }
+    let started = Instant::now();
+    worker.enable_parameter_tracking();
+    let report = apply_batch_replay_policy(worker, stories, losses_by_story, permission)?;
+    let changes = worker.parameter_changes()?;
+    let delta = SparseModelDelta::between_tracked(base_model, worker.model(), &changes)?;
+    Ok(MultiGpuReplayShardResult {
+        story_start,
+        elapsed_seconds: started.elapsed().as_secs_f64(),
+        report,
+        delta,
+        changes,
+    })
+}
+
 impl MultiGpuBatchTrainer {
     fn new(model: Model, device_count: usize) -> LeoResult<Self> {
         if device_count < 2 {
@@ -735,6 +1029,122 @@ impl MultiGpuBatchTrainer {
             worker.parameter_revision = revision;
         }
         Ok(())
+    }
+
+    fn run_parallel_replay(
+        &mut self,
+        canonical: &mut BackendRuntime,
+        stories: Arc<Vec<Vec<u8>>>,
+        losses_by_story: Vec<Vec<f32>>,
+        ranges: &[std::ops::Range<usize>],
+        device_count: usize,
+        permission: Permission,
+    ) -> LeoResult<MultiGpuReplayOutcome> {
+        if stories.len() != losses_by_story.len() || ranges.len() < device_count {
+            return Err(LeoError::internal(
+                "multi-GPU parallel replay inputs do not match device partition",
+            ));
+        }
+        let active_replica_count = device_count.saturating_sub(1);
+        let base_revision = canonical.model().parameter_revision;
+        // One immutable host snapshot is shared by every owner thread when
+        // constructing sparse local-replay deltas. This replaces N full model
+        // clones and gives every replay shard exactly the same starting point.
+        let base_model = Arc::new(canonical.model().clone());
+        let losses = Arc::new(losses_by_story);
+        let replay_started = Instant::now();
+
+        let mut replica_receivers = Vec::with_capacity(active_replica_count);
+        for (replica_index, worker) in self.replicas[..active_replica_count].iter().enumerate() {
+            let device_index = replica_index + 1;
+            replica_receivers.push(worker.dispatch_replay(
+                Arc::clone(&stories),
+                Arc::clone(&losses),
+                ranges[device_index].clone(),
+                permission,
+                base_revision,
+                Arc::clone(&base_model),
+            )?);
+        }
+
+        let canonical_range = ranges[0].clone();
+        let canonical_result = run_multi_gpu_replay_shard(
+            canonical,
+            &stories[canonical_range.clone()],
+            &losses[canonical_range.clone()],
+            canonical_range.start,
+            permission,
+            &base_model,
+        )?;
+
+        let mut results = Vec::with_capacity(device_count);
+        results.push(canonical_result);
+        for (replica_index, receiver) in replica_receivers.into_iter().enumerate() {
+            let device_index = replica_index + 1;
+            results.push(receiver.recv().map_err(|_| {
+                LeoError::internal(format!(
+                    "persistent multi-GPU replay worker {device_index} exited"
+                ))
+            })??);
+        }
+        let replay_seconds = replay_started.elapsed().as_secs_f64();
+        results.sort_by_key(|result| result.story_start);
+
+        let mut report = ReplayTrainingReport::empty();
+        let mut deltas = Vec::with_capacity(results.len());
+        let mut raw_changes = Vec::with_capacity(results.len());
+        let mut min_device_seconds = f64::INFINITY;
+        let mut max_device_seconds = 0.0f64;
+        for result in results {
+            min_device_seconds = min_device_seconds.min(result.elapsed_seconds);
+            max_device_seconds = max_device_seconds.max(result.elapsed_seconds);
+            report.add(result.report);
+            deltas.push(result.delta);
+            raw_changes.push(result.changes);
+        }
+
+        let sync_started = Instant::now();
+        if report.replay_steps > 0 {
+            // Device-local replay trajectories all started from base_model.
+            // Restore device0's host image to that base, then add the local
+            // sparse trajectories. A sum (not device-count mean) retains the
+            // first-order update magnitude of executing every selected 30%
+            // replay target while allowing cross-story replay concurrency.
+            *canonical.model_mut()? = (*base_model).clone();
+            let (replay_merge, replay_changes) = {
+                let model = canonical.model_mut()?;
+                let replay_merge = apply_sum_deltas(model, &deltas)?;
+                let replay_changes = merged_parameter_changes(model, &deltas, &raw_changes)?;
+                (replay_merge, replay_changes)
+            };
+            let replay_update = Arc::new(PackedSparseModelUpdate::from_model(
+                canonical.model(),
+                &replay_changes,
+            )?);
+            canonical.commit_packed_host_model(&replay_update)?;
+            canonical.reset_transient_state()?;
+            self.synchronize_replicas(Arc::clone(&replay_update))?;
+            eprintln!(
+                "{{\"event\":\"multi_gpu_parallel_replay\",\"devices\":{},\"replay_steps\":{},\"prefix_steps\":{},\"replay_seconds\":{:.6},\"device_seconds_min\":{:.6},\"device_seconds_max\":{:.6},\"reduction\":\"sum_local_trajectories\",\"fixed_parameter_updates\":{},\"context_keys\":{},\"fp32\":true}}",
+                device_count,
+                report.replay_steps,
+                report.prefix_steps,
+                replay_seconds,
+                min_device_seconds,
+                max_device_seconds,
+                replay_merge.fixed_parameter_updates,
+                replay_merge.context_keys,
+            );
+        } else {
+            canonical.reset_transient_state()?;
+        }
+        let replay_sync_seconds = sync_started.elapsed().as_secs_f64();
+
+        Ok(MultiGpuReplayOutcome {
+            report,
+            replay_seconds,
+            replay_sync_seconds,
+        })
     }
 
     fn train_story_batch(
@@ -910,38 +1320,56 @@ impl MultiGpuBatchTrainer {
             sync_seconds * 1000.0,
         );
 
-        // Replay remains serial in canonical story/range/time order in v1.0.1.
-        // Time it explicitly so the scaling benchmark exposes the Amdahl wall;
-        // true neuron-sharded replay is the next architecture phase.
-        canonical.enable_parameter_tracking();
-        let replay_started = Instant::now();
-        let replay =
-            apply_batch_replay_policy(canonical, stories.as_slice(), &losses_by_story, permission)?;
-        let replay_seconds = replay_started.elapsed().as_secs_f64();
-        activity.add(replay.activity);
-
-        let replay_sync_started = Instant::now();
-        if replay.replay_steps > 0 {
-            let replay_changes = canonical.parameter_changes()?;
-            let replay_update = Arc::new(PackedSparseModelUpdate::from_model(
-                canonical.model(),
-                &replay_changes,
-            )?);
-            canonical.synchronize_packed_model(&replay_update)?;
-            self.synchronize_replicas(replay_update)?;
-        }
-        let replay_sync_seconds = replay_sync_started.elapsed().as_secs_f64();
-
-        if replay.replay_steps > 0 {
-            eprintln!(
-                "{{\"event\":\"multi_gpu_serial_replay\",\"devices\":{},\"replay_steps\":{},\"prefix_steps\":{},\"replay_seconds\":{:.6},\"replay_sync_seconds\":{:.6},\"model_parallel_replay\":false}}",
+        let (replay, replay_seconds, replay_sync_seconds) = if multi_gpu_parallel_replay_enabled() {
+            let outcome = self.run_parallel_replay(
+                canonical,
+                Arc::clone(&stories),
+                losses_by_story,
+                &ranges,
                 device_count,
-                replay.replay_steps,
-                replay.prefix_steps,
-                replay_seconds,
-                replay_sync_seconds,
-            );
-        }
+                permission,
+            )?;
+            (
+                outcome.report,
+                outcome.replay_seconds,
+                outcome.replay_sync_seconds,
+            )
+        } else {
+            // Historical fallback: replay every story/range serially on
+            // canonical device0 and synchronize the resulting sparse image.
+            canonical.enable_parameter_tracking();
+            let replay_started = Instant::now();
+            let replay = apply_batch_replay_policy(
+                canonical,
+                stories.as_slice(),
+                &losses_by_story,
+                permission,
+            )?;
+            let replay_seconds = replay_started.elapsed().as_secs_f64();
+            let replay_sync_started = Instant::now();
+            if replay.replay_steps > 0 {
+                let replay_changes = canonical.parameter_changes()?;
+                let replay_update = Arc::new(PackedSparseModelUpdate::from_model(
+                    canonical.model(),
+                    &replay_changes,
+                )?);
+                canonical.synchronize_packed_model(&replay_update)?;
+                self.synchronize_replicas(replay_update)?;
+            }
+            let replay_sync_seconds = replay_sync_started.elapsed().as_secs_f64();
+            if replay.replay_steps > 0 {
+                eprintln!(
+                    "{{\"event\":\"multi_gpu_serial_replay\",\"devices\":{},\"replay_steps\":{},\"prefix_steps\":{},\"replay_seconds\":{:.6},\"replay_sync_seconds\":{:.6},\"parallel_replay\":false}}",
+                    device_count,
+                    replay.replay_steps,
+                    replay.prefix_steps,
+                    replay_seconds,
+                    replay_sync_seconds,
+                );
+            }
+            (replay, replay_seconds, replay_sync_seconds)
+        };
+        activity.add(replay.activity);
 
         Ok(BatchTrainingReport {
             mean_loss: loss_sum / targets.max(1) as f64,
@@ -975,24 +1403,10 @@ fn apply_batch_replay_policy(
     }
     let debug = replay_debug_options();
     let batch_started = debug.timing.then(Instant::now);
-    let mut combined = ReplayTrainingReport {
-        activity: ActivityDiagnostics::default(),
-        replay_segments: 0,
-        replay_steps: 0,
-        prefix_steps: 0,
-        timing: ReplayTiming::default(),
-        selection_ms: 0.0,
-    };
+    let mut combined = ReplayTrainingReport::empty();
     for (story_index, (story, losses)) in stories.iter().zip(losses_by_story).enumerate() {
         let replay = apply_replay_policy(runtime, story, losses, permission, story_index)?;
-        combined.activity.add(replay.activity);
-        combined.replay_segments = combined
-            .replay_segments
-            .saturating_add(replay.replay_segments);
-        combined.replay_steps = combined.replay_steps.saturating_add(replay.replay_steps);
-        combined.prefix_steps = combined.prefix_steps.saturating_add(replay.prefix_steps);
-        combined.timing.add(replay.timing);
-        combined.selection_ms += replay.selection_ms;
+        combined.add(replay);
     }
     if let Some(started) = batch_started {
         combined.timing.total_ms = started.elapsed().as_secs_f64() * 1000.0;

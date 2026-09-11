@@ -30,8 +30,8 @@ pub use config::Config;
 pub use metrics::{StepMetrics, TrainingStatistics};
 pub use model::Model;
 pub use parallel::{
-    apply_mean_deltas, merged_parameter_changes, MergeMetrics, PackedSparseModelUpdate,
-    SparseModelDelta,
+    apply_mean_deltas, apply_sum_deltas, merged_parameter_changes, MergeMetrics,
+    PackedSparseModelUpdate, SparseModelDelta,
 };
 pub use permission::Permission;
 pub use runtime::{ParameterChanges, Runtime};

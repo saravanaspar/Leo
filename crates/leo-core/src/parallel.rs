@@ -695,8 +695,33 @@ pub fn apply_mean_deltas(
     master: &mut Model,
     deltas: &[SparseModelDelta],
 ) -> LeoResult<MergeMetrics> {
+    let divisor = deltas.len();
+    apply_deltas_with_divisor(master, deltas, divisor)
+}
+
+/// Apply independent worker trajectories as an additive local-SGD merge.
+/// This is used by the optional parallel replay strategy: every selected replay
+/// target is still executed, but device-local replay trajectories are summed
+/// instead of averaged so increasing GPU count does not silently reduce replay
+/// update magnitude. The legacy serial replay path remains available for A/B
+/// quality comparison.
+pub fn apply_sum_deltas(
+    master: &mut Model,
+    deltas: &[SparseModelDelta],
+) -> LeoResult<MergeMetrics> {
+    apply_deltas_with_divisor(master, deltas, 1)
+}
+
+fn apply_deltas_with_divisor(
+    master: &mut Model,
+    deltas: &[SparseModelDelta],
+    divisor: usize,
+) -> LeoResult<MergeMetrics> {
     if deltas.is_empty() {
         return Err(LeoError::internal("cannot merge an empty worker batch"));
+    }
+    if divisor == 0 {
+        return Err(LeoError::internal("worker merge divisor cannot be zero"));
     }
     let fingerprint = config_fingerprint(master);
     if deltas
@@ -718,45 +743,45 @@ pub fn apply_mean_deltas(
     let worker_count = deltas.len();
     let mut fixed_parameter_updates = 0usize;
 
-    fixed_parameter_updates += apply_sparse_mean(
+    fixed_parameter_updates += apply_sparse_scaled(
         &mut master.neurons.threshold,
         deltas.iter().map(|delta| delta.threshold.as_slice()),
-        worker_count,
+        divisor,
     )?;
-    fixed_parameter_updates += apply_sparse_mean(
+    fixed_parameter_updates += apply_sparse_scaled(
         &mut master.neurons.excitability,
         deltas.iter().map(|delta| delta.excitability.as_slice()),
-        worker_count,
+        divisor,
     )?;
-    fixed_parameter_updates += apply_sparse_mean(
+    fixed_parameter_updates += apply_sparse_scaled(
         &mut master.recurrent.weight,
         deltas.iter().map(|delta| delta.recurrent_weight.as_slice()),
-        worker_count,
+        divisor,
     )?;
-    fixed_parameter_updates += apply_sparse_mean(
+    fixed_parameter_updates += apply_sparse_scaled(
         &mut master.input.weights,
         deltas.iter().map(|delta| delta.input_weight.as_slice()),
-        worker_count,
+        divisor,
     )?;
-    fixed_parameter_updates += apply_sparse_mean(
+    fixed_parameter_updates += apply_sparse_scaled(
         &mut master.output.weights,
         deltas.iter().map(|delta| delta.output_weight.as_slice()),
-        worker_count,
+        divisor,
     )?;
-    fixed_parameter_updates += apply_sparse_mean(
+    fixed_parameter_updates += apply_sparse_scaled(
         &mut master.output.bias,
         deltas.iter().map(|delta| delta.output_bias.as_slice()),
-        worker_count,
+        divisor,
     )?;
-    fixed_parameter_updates += apply_sparse_mean(
+    fixed_parameter_updates += apply_sparse_scaled(
         &mut master.context.output_weights,
         deltas
             .iter()
             .map(|delta| delta.context_output_weight.as_slice()),
-        worker_count,
+        divisor,
     )?;
 
-    let context_keys = apply_context_deltas(master, deltas, worker_count)?;
+    let context_keys = apply_context_deltas(master, deltas, divisor)?;
     apply_statistics_deltas(&mut master.statistics, deltas);
     let revision_increment = deltas.iter().fold(0u64, |total, delta| {
         total.saturating_add(delta.revision_increment)
@@ -947,10 +972,10 @@ fn context_deltas_for_slots(
     Ok(result)
 }
 
-fn apply_sparse_mean<'a>(
+fn apply_sparse_scaled<'a>(
     target: &mut [f32],
     groups: impl Iterator<Item = &'a [SparseF32Delta]>,
-    worker_count: usize,
+    divisor: usize,
 ) -> LeoResult<usize> {
     let groups = groups.collect::<Vec<_>>();
     let mut positions = vec![0usize; groups.len()];
@@ -986,7 +1011,7 @@ fn apply_sparse_mean<'a>(
             }
         }
 
-        target[index] += (sum / worker_count as f64) as f32;
+        target[index] += (sum / divisor as f64) as f32;
         if !target[index].is_finite() {
             return Err(LeoError::internal("merged parameter became non-finite"));
         }
@@ -999,7 +1024,7 @@ fn apply_sparse_mean<'a>(
 fn apply_context_deltas(
     master: &mut Model,
     deltas: &[SparseModelDelta],
-    worker_count: usize,
+    divisor: usize,
 ) -> LeoResult<usize> {
     #[derive(Debug)]
     struct MergedContextDelta {
@@ -1079,7 +1104,7 @@ fn apply_context_deltas(
             .iter_mut()
             .zip(&update.embedding_sum)
         {
-            *value += (*sum / worker_count as f64) as f32;
+            *value += (*sum / divisor as f64) as f32;
         }
         master.context.observations[slot] = master.context.observations[slot]
             .saturating_add(update.observations.min(u64::from(u32::MAX)) as u32);
@@ -1326,8 +1351,8 @@ fn config_fingerprint(model: &Model) -> ArtifactDigest {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_mean_deltas, statistics_delta, PackedSparseModelUpdate, SparseModelDelta,
-        TrackedModelValues,
+        apply_mean_deltas, apply_sum_deltas, statistics_delta, PackedSparseModelUpdate,
+        SparseModelDelta, TrackedModelValues,
     };
     use crate::symbols::{BEGIN_DOCUMENT, END_DOCUMENT, OUTPUT_CLASSES};
     use crate::{Config, Model, ParameterChanges, Permission, Runtime};
@@ -1476,6 +1501,26 @@ mod tests {
         apply_mean_deltas(&mut master, &deltas).unwrap();
         let expected = base.output.weights[index] + 0.05;
         assert!((master.output.weights[index] - expected).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn additive_delta_merge_preserves_local_trajectory_magnitude() {
+        let base = model();
+        let mut first = base.clone();
+        let mut second = base.clone();
+        first.output.bias[0] += 0.2;
+        second.output.bias[0] -= 0.05;
+        first.parameter_revision = first.parameter_revision.saturating_add(2);
+        second.parameter_revision = second.parameter_revision.saturating_add(3);
+        let deltas = [
+            SparseModelDelta::between(&base, &first).unwrap(),
+            SparseModelDelta::between(&base, &second).unwrap(),
+        ];
+
+        let mut master = base.clone();
+        apply_sum_deltas(&mut master, &deltas).unwrap();
+        assert!((master.output.bias[0] - (base.output.bias[0] + 0.15)).abs() < 1.0e-6);
+        assert_eq!(master.parameter_revision, base.parameter_revision + 5);
     }
 
     #[test]

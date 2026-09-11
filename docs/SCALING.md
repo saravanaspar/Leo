@@ -92,25 +92,32 @@ Current sparse execution optimizations include:
 
 These change work placement, not the learning equations.
 
-## What does not scale across GPUs yet
+## Replay scaling modes
 
-Bounded-surprise replay remains canonical and sequential in the established
-story/range order. A replay range changes the canonical parameters seen by the
-next range, so simply sending ranges to separate data-parallel replicas would
-change the learning policy.
+The **default/exact** multi-GPU path keeps bounded-surprise replay canonical and
+sequential in the established story/range order. A replay range changes the
+canonical parameters seen by the next range, so sending ranges to separate
+data-parallel replicas changes the learning policy. The default therefore keeps
+serial replay and its Amdahl-law scaling limit.
 
-This means full replay-on scaling follows Amdahl's law. If half of wall time is
-serial replay, even an infinitely fast data-parallel initial pass can approach
-only 2x end-to-end speedup. Near-linear 2/4/8-GPU *full training* scaling needs a
-future device-side model-parallel replay executor.
+An **opt-in experimental** path is available with
+`LEO_MULTI_GPU_PARALLEL_REPLAY=1`. It executes local replay trajectories on the
+participating replicas and merges their parameter deltas. FP32 and the configured
+30% replay budget remain unchanged, but cross-story replay update visibility is
+different from canonical serial replay. This mode is not exact-mode semantics and
+must pass held-out quality A/B validation before being used for a quality claim.
 
-The required future design is neuron/synapse sharding with device peer
-collectives: each replay timestep computes local block winners/event work,
-performs a small exact global winner/logit reduction, and continues on-device.
-A host round-trip per byte is deliberately not implemented because it would
-usually make scaling worse. NVLink/NVSwitch is preferred for this fine-grained
-model-parallel stage; ordinary PCIe is much less restrictive for story data
-parallelism.
+`LEO_REPLAY_STREAMING=1` is a separate opt-in replay experiment that reduces
+repeated prefix reconstruction by carrying the replay timeline forward on-device.
+It also changes replay-state semantics and requires the same quality gate.
+
+For an exact future solution with better replay scaling, the intended design is
+model-parallel replay using neuron/synapse sharding and device peer collectives:
+each replay timestep computes local block winners/event work, performs a small
+exact global winner/logit reduction, and continues on-device. A host round-trip
+per byte is deliberately undesirable. NVLink/NVSwitch is preferred for this
+fine-grained model-parallel stage; ordinary PCIe is much less restrictive for
+story data parallelism.
 
 ## Scaling targets
 
