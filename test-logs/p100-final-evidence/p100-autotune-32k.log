@@ -1,0 +1,18 @@
+{"event":"initialized","name":"Leo-TinyStories","parameter_revision":0,"neurons":32768,"fixed_synapses":1572864,"context_slots":524288,"context_embedding_dim":32,"model":"runs/p100-autotune-32k/leo.pscls"}
+{"event":"cuda_autotune_resumed","logical_lanes":16,"candidate_index":4,"candidate_count":5,"restored_scores":4}
+{"event":"cuda_profile","logical_lanes":16,"lane_chunk":8,"sparse_blocks":112,"sparse_threads":256,"fused_blocks":56,"fused_threads":256,"work_units":11143,"wall_ms":5635.979615,"h2d_ms":0.213504,"compute_ms":5524.511,"d2h_ms":0.060544,"host_wait_ms":5525.0674,"h2d_gib_s":0.7796616013206578,"d2h_gib_s":2.0568963280933312,"theoretical_occupancy":0.125,"fused_launches":2,"direct_phase_launches":0,"graph_launches":0,"host_visible_bottleneck":"host_wait"}
+
+[HEARTBEAT] elapsed=10.9s | GPU0: util=100% mem=4023/16384 MiB temp=41C
+{"event":"cuda_profile","logical_lanes":16,"lane_chunk":8,"sparse_blocks":112,"sparse_threads":256,"fused_blocks":56,"fused_threads":256,"work_units":10188,"wall_ms":5092.815715000001,"h2d_ms":0.113664,"compute_ms":4997.5293,"d2h_ms":0.058304,"host_wait_ms":4999.499,"h2d_gib_s":1.3393005799003705,"d2h_gib_s":1.9528638073010807,"theoretical_occupancy":0.125,"fused_launches":2,"direct_phase_launches":0,"graph_launches":0,"host_visible_bottleneck":"host_wait"}
+{"event":"cuda_autotune_complete","logical_lanes":16,"candidate_count":5,"work_units_per_second":2468.282826658529,"lane_chunk":16,"sparse_blocks":112,"sparse_threads":256,"fused_blocks":56,"fused_threads":256,"mean_theoretical_occupancy":0.125}
+
+[HEARTBEAT] elapsed=21.0s | GPU0: util=100% mem=4025/16384 MiB temp=42C
+
+[HEARTBEAT] elapsed=31.0s | GPU0: util=100% mem=4025/16384 MiB temp=43C
+
+[HEARTBEAT] elapsed=41.0s | GPU0: util=100% mem=4025/16384 MiB temp=44C
+
+[HEARTBEAT] elapsed=51.1s | GPU0: util=100% mem=4025/16384 MiB temp=44C
+
+[HEARTBEAT] elapsed=61.1s | GPU0: util=100% mem=4025/16384 MiB temp=44C
+{"event":"training_benchmark","model":"Leo-TinyStories","neurons":32768,"fixed_synapses":1572864,"context_slots":524288,"context_embedding_dim":32,"workers":16,"gpu_devices":1,"stories":192,"input_bytes":152949,"training_steps":153141,"base_training_targets":153141,"replay_fraction":0,"replay_segments":0,"replay_steps":0,"replay_prefix_steps":0,"replay_execution_steps":0,"replay_step_fraction":0,"replay_prefix_step_fraction":0,"replay_seconds":0.00012321799999999997,"replay_sync_seconds":0.000006139999999999999,"replay_wall_fraction":0.000001963278683061479,"serial_replay_speedup_ceiling":509352.0388254964,"execution_steps_with_prefix":153141,"seconds":62.76133952,"input_bytes_per_second":2436.9938750472356,"steps_per_second":2440.0530831754945,"execution_steps_per_second":2440.0530831754945,"mean_loss":5.224449633705072,"bits_per_byte":7.53728757792047,"active_fraction":0.0004061515584366491,"recurrent_events_per_step":638.8211648089016,"context_cells_per_step":0,"context_probes_per_step":0,"output_madds_per_step":0,"training_state_sha256":"d9a8b11cd2aa15c11eac749ce2695ee1a54d74bf3cdaf06c6028ee87201affac","projected_seconds_1gb_2_epochs":820683.228004106,"projected_days_1gb_2_epochs":9.498648472269744}

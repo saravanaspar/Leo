@@ -798,6 +798,65 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("LEO_CUDA_SHARED_GROUPED", rust)
         self.assertIn("shared_grouped_blocks_256", rust)
 
+    def test_learning_signal_projection_interleaves_exact_rows(self):
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+
+        scalar = kernels.split("float leo_output_error_dot_exact", 1)[1].split(
+            "void leo_output_error_dot4_exact", 1
+        )[0]
+        quad = kernels.split("void leo_output_error_dot4_exact", 1)[1].split(
+            'extern "C" __global__ void leo_learning_signals', 1
+        )[0]
+        worklist = kernels.split("void leo_p_learning_signals_work", 1)[1].split(
+            "void leo_p_learning_signals_worklist", 1
+        )[0]
+
+        # The scalar compatibility path and the interleaved production path
+        # both retain output order. Interleaving only independent destination
+        # rows exposes instruction-level parallelism; it is not a tree/reduced
+        # dot product that would change FP32 accumulation order.
+        self.assertIn("for (unsigned int output = 0U; output < LEO_OUTPUTS; ++output)", scalar)
+        self.assertIn("signal += output_weight_row[output] * errors[output]", scalar)
+        self.assertIn("const float error = errors[output]", quad)
+        for row in range(4):
+            self.assertIn(
+                f"value{row} += output_weight_row{row}[output] * error", quad
+            )
+        self.assertNotIn("atomicAdd", quad)
+        self.assertNotIn("__shfl", quad)
+
+        self.assertIn("#define LEO_LEARNING_SIGNAL_ROWS_PER_THREAD 4U", kernels)
+        self.assertIn("stride * LEO_LEARNING_SIGNAL_ROWS_PER_THREAD", worklist)
+        self.assertIn("leo_output_error_dot4_exact", worklist)
+        self.assertIn("leo_output_error_dot_exact", worklist)
+        # The current-tick worklist is produced behind a phase barrier after
+        # epoch-tagged insertion, so re-reading the random epoch array here is
+        # redundant and defeats the sparse worklist's locality.
+        self.assertNotIn("LEO_P_LEARNING_DESTINATION_EPOCH", worklist)
+
+    def test_learning_signal_batching_covers_each_destination_once(self):
+        rows_per_thread = 4
+        for count in (0, 1, 3, 4, 5, 255, 256, 767, 768, 769, 3071, 3072, 32768):
+            for stride in (1, 7, 256, 768, 14336):
+                seen = []
+                for thread in range(stride):
+                    position = thread
+                    batched_stride = stride * rows_per_thread
+                    while position < count:
+                        position1 = position + stride
+                        position2 = position1 + stride
+                        position3 = position2 + stride
+                        if position3 < count:
+                            seen.extend((position, position1, position2, position3))
+                        else:
+                            tail = position
+                            while tail < count:
+                                seen.append(tail)
+                                tail += stride
+                        position += batched_stride
+                self.assertEqual(sorted(seen), list(range(count)))
+                self.assertEqual(len(seen), len(set(seen)))
+
     def test_device_batch_merge_marks_touched_rows_even_when_mean_cancels(self):
         rust = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
         kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()

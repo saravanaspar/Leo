@@ -50,7 +50,7 @@ bash ./scripts/profile_cuda.sh \
 
 Profiler evidence should identify the actual bottleneck being improved, such as transfer behavior, occupancy, divergence, memory traffic, atomics, or launch overhead.
 
-Performance evidence never overrides semantic conformance. For the current P100/TinyStories reference, record `--workers 16`; worker count is a semantic experiment input, so comparisons at a different logical batch width are separate experiments.
+Append durable target-GPU measurements to `docs/CUDA-PERFORMANCE-HISTORY.md`, keyed by software version and exact GitHub commit/PR. Performance evidence never overrides semantic conformance. For the current P100/TinyStories reference, record `--workers 16`; worker count is a semantic experiment input, so comparisons at a different logical batch width are separate experiments.
 
 For replay-focused measurements, `leo benchmark --train` reports `replay_fraction`, `replay_segments`, `replay_steps`, and `replay_step_fraction` alongside throughput. The v1 30% replay budget must stay enabled for production-policy measurements. Replay-disabled runs are diagnostics only and must be labeled as such.
 

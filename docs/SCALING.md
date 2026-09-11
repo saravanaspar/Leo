@@ -88,6 +88,8 @@ Current sparse execution optimizations include:
   path retained as a fallback;
 - flattened delayed recurrent-weight snapshot copies;
 - sparse learning-destination worklists;
+- exact four-row interleaving for learning-signal output-error dot products, preserving each row's
+  output accumulation order while exposing instruction-level parallelism and reusing error loads;
 - reuse of the exact FP32 softmax exponential instead of recomputing it.
 
 These change work placement, not the learning equations.

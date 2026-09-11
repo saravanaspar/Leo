@@ -1,0 +1,10 @@
+===== PREPARED DATA =====
+ 953787 /kaggle/working/leo-data/prepared/tinystories.train.bytes
+  89461 /kaggle/working/leo-data/prepared/tinystories.valid.bytes
+1043248 total
+
+===== SHA256 =====
+c6839426e7e15935a6c4f7b7fcc9ff4c541968c135378de5ef71ccf48d6684c0  /kaggle/working/leo-data/prepared/tinystories.train.bytes
+8eee9e66e921776a67c0d7d01bf3453235d219b4bc525a53aac1361b46b4b6ee  /kaggle/working/leo-data/prepared/tinystories.train.idx
+f9d12102da6869a288a23fa5bea40e4fb1e9c516a231765f7092043bd6c0df35  /kaggle/working/leo-data/prepared/tinystories.valid.bytes
+3b04509d08c29ad2744f4829d5e94491718d56b62aecb5a1054191e3d12a9d30  /kaggle/working/leo-data/prepared/tinystories.valid.idx

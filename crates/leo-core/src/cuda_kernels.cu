@@ -9,6 +9,7 @@
 #define LEO_SPARSE_GLOBAL_THRESHOLD 128
 #define LEO_SPARSE_HEAP_RECORD_BASE LEO_SPARSE_GLOBAL_THRESHOLD
 #define LEO_SPARSE_HEAP_META_BASE (LEO_SPARSE_HEAP_RECORD_BASE + LEO_SPARSE_GLOBAL_RUNS)
+#define LEO_LEARNING_SIGNAL_ROWS_PER_THREAD 4U
 
 static_assert(
     LEO_SPARSE_HEAP_META_BASE + LEO_SPARSE_GLOBAL_RUNS <= LEO_GLOBAL_SORT,
@@ -1297,6 +1298,48 @@ extern "C" __global__ void leo_capture_training_step(
     records[record_index] = record;
 }
 
+__device__ __forceinline__ float leo_output_error_dot_exact(
+    const float* __restrict__ output_weight_row,
+    const float* __restrict__ errors
+) {
+    float signal = 0.0f;
+    for (unsigned int output = 0U; output < LEO_OUTPUTS; ++output) {
+        signal += output_weight_row[output] * errors[output];
+    }
+    return signal;
+}
+
+__device__ __forceinline__ void leo_output_error_dot4_exact(
+    const float* __restrict__ output_weight_row0,
+    const float* __restrict__ output_weight_row1,
+    const float* __restrict__ output_weight_row2,
+    const float* __restrict__ output_weight_row3,
+    const float* __restrict__ errors,
+    float* signal0,
+    float* signal1,
+    float* signal2,
+    float* signal3
+) {
+    // Each row keeps the exact output 0..LEO_OUTPUTS-1 accumulation order.
+    // Interleaving four independent rows exposes ILP on low-occupancy persistent
+    // kernels and loads the shared error value only once per output.
+    float value0 = 0.0f;
+    float value1 = 0.0f;
+    float value2 = 0.0f;
+    float value3 = 0.0f;
+    for (unsigned int output = 0U; output < LEO_OUTPUTS; ++output) {
+        const float error = errors[output];
+        value0 += output_weight_row0[output] * error;
+        value1 += output_weight_row1[output] * error;
+        value2 += output_weight_row2[output] * error;
+        value3 += output_weight_row3[output] * error;
+    }
+    *signal0 = value0;
+    *signal1 = value1;
+    *signal2 = value2;
+    *signal3 = value3;
+}
+
 extern "C" __global__ void leo_learning_signals(
     const LeoConfig* cfg,
     unsigned long long tick,
@@ -1312,9 +1355,7 @@ extern "C" __global__ void leo_learning_signals(
         return;
     }
     const unsigned long long row = (unsigned long long)neuron * LEO_OUTPUTS;
-    float signal = 0.0f;
-    for (unsigned int output = 0U; output < LEO_OUTPUTS; ++output) signal += output_weights[row + output] * errors[output];
-    learning_signal[neuron] = signal;
+    learning_signal[neuron] = leo_output_error_dot_exact(output_weights + row, errors);
 }
 
 extern "C" __global__ void leo_update_output(
@@ -1598,8 +1639,9 @@ __device__ __forceinline__ unsigned int leo_p_global_stride() {
 
 
 // Exact per-tick worklists. Epoch arrays remain the source of truth for
-// membership; the lists only materialize the unique touched/destination set so
-// later phases do not scan every neuron.
+// insertion/deduplication; after the phase barrier the bounded lists materialize
+// the unique current-tick touched/destination set so later phases do not scan
+// every neuron or repeat random epoch reads.
 __device__ __forceinline__ void leo_p_mark_touched(
     const unsigned long long* p,
     unsigned int neuron,
@@ -3061,24 +3103,58 @@ __device__ void leo_p_learning_signals_work(const unsigned long long* p, unsigne
     unsigned int thread,
     unsigned int stride
 ) {
-    const LeoConfig* cfg = leo_p_cptr<LeoConfig>(p, LEO_P_CONFIG);
-    const float* output_weights = leo_p_cptr<float>(p, LEO_P_OUTPUT_WEIGHT);
-    const float* errors = leo_p_cptr<float>(p, LEO_P_ERRORS);
-    const unsigned long long* destination_epoch = leo_p_cptr<unsigned long long>(p, LEO_P_LEARNING_DESTINATION_EPOCH);
-    const unsigned int* destination_list = leo_p_cptr<unsigned int>(p, LEO_P_LEARNING_DESTINATION_LIST);
-    const unsigned int* destination_count = leo_p_cptr<unsigned int>(p, LEO_P_LEARNING_DESTINATION_COUNT);
-    float* learning_signal = leo_p_ptr<float>(p, LEO_P_LEARNING_SIGNAL);
-    const unsigned long long tag = tick + 1ULL;
+    const float* __restrict__ output_weights = leo_p_cptr<float>(p, LEO_P_OUTPUT_WEIGHT);
+    const float* __restrict__ errors = leo_p_cptr<float>(p, LEO_P_ERRORS);
+    const unsigned int* __restrict__ destination_list =
+        leo_p_cptr<unsigned int>(p, LEO_P_LEARNING_DESTINATION_LIST);
+    const unsigned int* destination_count =
+        leo_p_cptr<unsigned int>(p, LEO_P_LEARNING_DESTINATION_COUNT);
+    float* __restrict__ learning_signal = leo_p_ptr<float>(p, LEO_P_LEARNING_SIGNAL);
     const unsigned int count = *destination_count;
-    for (unsigned int position = thread; position < count; position += stride) {
-        const unsigned int neuron = destination_list[position];
-        if (neuron >= cfg->neuron_count || destination_epoch[neuron] != tag) continue;
-        const unsigned long long row = (unsigned long long)neuron * LEO_OUTPUTS;
-        float signal = 0.0f;
-        for (unsigned int output = 0U; output < LEO_OUTPUTS; ++output) {
-            signal += output_weights[row + output] * errors[output];
+    const unsigned int batched_stride = stride * LEO_LEARNING_SIGNAL_ROWS_PER_THREAD;
+    (void)tick;
+
+    // The count is reset at start_tick and entries are appended only after their
+    // destination epoch is atomically set to this tick. The phase barrier before
+    // this work therefore makes every list entry in [0, count) current and valid;
+    // re-reading the random epoch array here was redundant.
+    for (unsigned int position = thread; position < count; position += batched_stride) {
+        const unsigned int position1 = position + stride;
+        const unsigned int position2 = position1 + stride;
+        const unsigned int position3 = position2 + stride;
+
+        if (position3 < count) {
+            const unsigned int neuron0 = destination_list[position];
+            const unsigned int neuron1 = destination_list[position1];
+            const unsigned int neuron2 = destination_list[position2];
+            const unsigned int neuron3 = destination_list[position3];
+            const unsigned long long row0 = (unsigned long long)neuron0 * LEO_OUTPUTS;
+            const unsigned long long row1 = (unsigned long long)neuron1 * LEO_OUTPUTS;
+            const unsigned long long row2 = (unsigned long long)neuron2 * LEO_OUTPUTS;
+            const unsigned long long row3 = (unsigned long long)neuron3 * LEO_OUTPUTS;
+            float signal0;
+            float signal1;
+            float signal2;
+            float signal3;
+            leo_output_error_dot4_exact(
+                output_weights + row0, output_weights + row1, output_weights + row2,
+                output_weights + row3, errors, &signal0, &signal1, &signal2, &signal3
+            );
+            learning_signal[neuron0] = signal0;
+            learning_signal[neuron1] = signal1;
+            learning_signal[neuron2] = signal2;
+            learning_signal[neuron3] = signal3;
+            continue;
         }
-        learning_signal[neuron] = signal;
+
+        // At most one partial group exists per thread. Keep it on the same scalar
+        // helper used by the dense compatibility kernel rather than introducing
+        // separate two/three-row arithmetic.
+        for (unsigned int tail = position; tail < count; tail += stride) {
+            const unsigned int neuron = destination_list[tail];
+            const unsigned long long row = (unsigned long long)neuron * LEO_OUTPUTS;
+            learning_signal[neuron] = leo_output_error_dot_exact(output_weights + row, errors);
+        }
     }
 
 }
