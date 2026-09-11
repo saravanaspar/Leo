@@ -324,19 +324,7 @@ fn apply_replay_policy(
             prefix_amplification,
             selection_ms,
         );
-        if debug.ranges {
-            for (index, range) in ranges.iter().enumerate() {
-                eprintln!(
-                    "{{\"event\":\"replay_range_debug\",\"story_index\":{},\"segment_index\":{},\"start\":{},\"end\":{},\"targets\":{},\"estimated_prefix_steps\":{}}}",
-                    story_index,
-                    index,
-                    range.start,
-                    range.end,
-                    range.len(),
-                    range.start,
-                );
-            }
-        }
+        emit_replay_range_debug(story_index, &ranges);
     }
 
     execute_replay_ranges(
@@ -347,6 +335,50 @@ fn apply_replay_policy(
         story_index,
         selection_ms,
     )
+}
+
+fn emit_replay_range_debug(story_index: usize, ranges: &[std::ops::Range<usize>]) {
+    if !replay_debug_options().ranges {
+        return;
+    }
+    for (index, range) in ranges.iter().enumerate() {
+        eprintln!(
+            "{{\"event\":\"replay_range_debug\",\"story_index\":{},\"segment_index\":{},\"start\":{},\"end\":{},\"targets\":{},\"estimated_prefix_steps\":{}}}",
+            story_index,
+            index,
+            range.start,
+            range.end,
+            range.len(),
+            range.start,
+        );
+    }
+}
+
+fn emit_device_replay_selection_debug(
+    runtime: &BackendRuntime,
+    story: &[u8],
+    ranges: &[std::ops::Range<usize>],
+    story_index: usize,
+) {
+    let debug = replay_debug_options();
+    if !debug.selection {
+        return;
+    }
+    let selected_targets = ranges.iter().map(|range| range.len()).sum::<usize>();
+    let estimated_prefix_steps = ranges.iter().map(|range| range.start as u64).sum::<u64>();
+    let prefix_amplification = estimated_prefix_steps as f64 / selected_targets.max(1) as f64;
+    eprintln!(
+        "{{\"event\":\"replay_device_selection_debug\",\"story_index\":{},\"story_bytes\":{},\"fraction\":{},\"segment_targets\":{},\"selected_segments\":{},\"selected_targets\":{},\"estimated_prefix_steps\":{},\"prefix_amplification\":{},\"selection_source\":\"device_postprocess\",\"losses_resident_on_device\":true}}",
+        story_index,
+        story.len(),
+        runtime.model().config.replay.fraction,
+        runtime.model().config.replay.segment_bytes,
+        ranges.len(),
+        selected_targets,
+        estimated_prefix_steps,
+        prefix_amplification,
+    );
+    emit_replay_range_debug(story_index, ranges);
 }
 
 fn execute_replay_ranges(
@@ -1431,27 +1463,32 @@ fn apply_batch_replay_policy(
     if let Some(started) = batch_started {
         combined.timing.total_ms = started.elapsed().as_secs_f64() * 1000.0;
     }
-    if debug.summary {
-        eprintln!(
-            "{{\"event\":\"replay_batch_debug\",\"stories\":{},\"segments\":{},\"target_steps\":{},\"prefix_steps\":{},\"execution_steps\":{},\"selection_ms\":{},\"begin_ms\":{},\"prefix_build_ms\":{},\"prefix_execute_ms\":{},\"target_build_ms\":{},\"target_execute_ms\":{},\"reset_ms\":{},\"total_ms\":{},\"prefix_steps_per_second\":{},\"target_steps_per_second\":{}}}",
-            stories.len(),
-            combined.replay_segments,
-            combined.replay_steps,
-            combined.prefix_steps,
-            combined.replay_steps.saturating_add(combined.prefix_steps),
-            combined.selection_ms,
-            combined.timing.begin_ms,
-            combined.timing.prefix_build_ms,
-            combined.timing.prefix_execute_ms,
-            combined.timing.target_build_ms,
-            combined.timing.target_execute_ms,
-            combined.timing.reset_ms,
-            combined.timing.total_ms,
-            if combined.timing.prefix_execute_ms > 0.0 { combined.prefix_steps as f64 / (combined.timing.prefix_execute_ms / 1000.0) } else { 0.0 },
-            if combined.timing.target_execute_ms > 0.0 { combined.replay_steps as f64 / (combined.timing.target_execute_ms / 1000.0) } else { 0.0 },
-        );
-    }
+    emit_replay_batch_debug(stories.len(), &combined);
     Ok(combined)
+}
+
+fn emit_replay_batch_debug(story_count: usize, combined: &ReplayTrainingReport) {
+    if !replay_debug_options().summary {
+        return;
+    }
+    eprintln!(
+        "{{\"event\":\"replay_batch_debug\",\"stories\":{},\"segments\":{},\"target_steps\":{},\"prefix_steps\":{},\"execution_steps\":{},\"selection_ms\":{},\"begin_ms\":{},\"prefix_build_ms\":{},\"prefix_execute_ms\":{},\"target_build_ms\":{},\"target_execute_ms\":{},\"reset_ms\":{},\"total_ms\":{},\"prefix_steps_per_second\":{},\"target_steps_per_second\":{}}}",
+        story_count,
+        combined.replay_segments,
+        combined.replay_steps,
+        combined.prefix_steps,
+        combined.replay_steps.saturating_add(combined.prefix_steps),
+        combined.selection_ms,
+        combined.timing.begin_ms,
+        combined.timing.prefix_build_ms,
+        combined.timing.prefix_execute_ms,
+        combined.timing.target_build_ms,
+        combined.timing.target_execute_ms,
+        combined.timing.reset_ms,
+        combined.timing.total_ms,
+        if combined.timing.prefix_execute_ms > 0.0 { combined.prefix_steps as f64 / (combined.timing.prefix_execute_ms / 1000.0) } else { 0.0 },
+        if combined.timing.target_execute_ms > 0.0 { combined.replay_steps as f64 / (combined.timing.target_execute_ms / 1000.0) } else { 0.0 },
+    );
 }
 
 fn apply_batch_replay_ranges(
@@ -1469,12 +1506,14 @@ fn apply_batch_replay_ranges(
     let batch_started = debug.timing.then(Instant::now);
     let mut combined = ReplayTrainingReport::empty();
     for (story_index, (story, ranges)) in stories.iter().zip(ranges_by_story).enumerate() {
+        emit_device_replay_selection_debug(runtime, story, ranges, story_index);
         let replay = execute_replay_ranges(runtime, story, ranges, permission, story_index, 0.0)?;
         combined.add(replay);
     }
     if let Some(started) = batch_started {
         combined.timing.total_ms = started.elapsed().as_secs_f64() * 1000.0;
     }
+    emit_replay_batch_debug(stories.len(), &combined);
     Ok(combined)
 }
 

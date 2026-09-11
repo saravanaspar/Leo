@@ -23,7 +23,7 @@ Environment variables:
 | Variable | Effect |
 | --- | --- |
 | `LEO_REPLAY_DEBUG=1` | Story/batch replay timing summaries plus selection summaries. |
-| `LEO_REPLAY_DEBUG_SELECTION=1` | Selection budget, selected segments/targets, finite/positive losses, estimated prefix work. |
+| `LEO_REPLAY_DEBUG_SELECTION=1` | Selection diagnostics. Host selection reports loss statistics; device-native selection reports selected range geometry without downloading per-step losses. |
 | `LEO_REPLAY_DEBUG_RANGES=1` | Emits every selected range before execution. |
 | `LEO_REPLAY_DEBUG_SEGMENTS=1` | Emits detailed timing for sampled replay segments. |
 | `LEO_REPLAY_DEBUG_SEGMENT_STRIDE=N` | Emit one segment event every `N` segments; default `1`. |
@@ -31,11 +31,14 @@ Environment variables:
 
 Events:
 
-- `replay_selection_debug`
+- `replay_selection_debug` - host replay selector summary, including loss-distribution statistics.
+- `replay_device_selection_debug` - device-postprocess selector summary, including selected segments/targets and estimated prefix work while per-step losses remain GPU-resident.
 - `replay_range_debug`
 - `replay_segment_debug`
 - `replay_story_debug`
 - `replay_batch_debug`
+
+When normal single-GPU device story postprocessing is active, replay ranges are already selected on the GPU. In that path Leo emits `replay_device_selection_debug` instead of fabricating host-only loss statistics or downloading per-step losses solely for diagnostics. `replay_batch_debug` is emitted for both host-selected and device-selected replay execution.
 
 Segment/story/batch timing separates `begin_document`, prefix construction, frozen-prefix execution, target construction, supervised target execution, and final reset.
 

@@ -4,6 +4,8 @@ All notable project changes should be recorded here.
 
 ## Unreleased
 
+- Restore replay diagnostics for GPU-native replay selection by reporting device-selected range summaries and shared batch timing without downloading per-step losses, and make the P100 GPU gate require the device-native diagnostic path instead of the legacy host selector event.
+
 ## v1.0.32 - 2026-09-11
 
 - Fix CUDA device-postprocess dispatch so the GPU-native representation with one empty per-step metrics vector per logical story is correctly recognized, preserving device-side story loss/target summaries and exact device-selected replay ranges instead of incorrectly falling back to legacy host metrics.

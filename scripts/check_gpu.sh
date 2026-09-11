@@ -354,7 +354,6 @@ for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
 
 names = [event.get("event") for event in events]
 for required in (
-    "replay_selection_debug",
     "replay_batch_debug",
     "cuda_debug_runtime",
     "cuda_debug_launch",
@@ -362,6 +361,18 @@ for required in (
 ):
     if required not in names:
         raise SystemExit(f"replay GPU diagnostic run did not emit {required}")
+
+device_selection = [
+    event for event in events if event.get("event") == "replay_device_selection_debug"
+]
+if not device_selection:
+    raise SystemExit("replay GPU diagnostic run did not emit replay_device_selection_debug")
+if any(event.get("selection_source") != "device_postprocess" for event in device_selection):
+    raise SystemExit("device replay selection diagnostic reported a non-device selector")
+if not any(int(event.get("selected_targets", 0)) > 0 for event in device_selection):
+    raise SystemExit("device replay selection diagnostics reported no selected replay targets")
+if "replay_selection_debug" in names:
+    raise SystemExit("optimized replay diagnostic unexpectedly fell back to host replay selection")
 
 benchmarks = [event for event in events if event.get("event") == "training_benchmark"]
 if not benchmarks:
@@ -394,6 +405,7 @@ print(
     "CUDA replay diagnostics OK:",
     f"replay_steps={benchmark['replay_steps']}",
     f"prefix_steps={benchmark['replay_prefix_steps']}",
+    f"device_selection_events={len(device_selection)}",
 )
 PY
 
