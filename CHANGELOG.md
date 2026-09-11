@@ -5,6 +5,10 @@ All notable project changes should be recorded here.
 ## Unreleased
 
 - Revert the four-row CUDA learning-signal interleave after fresh P100 measurement showed a substantial exact-path throughput regression; retain the v1.0.3 result in the CUDA performance ledger as negative evidence.
+- Make the grouped persistent CUDA executor consume the complete tuner-approved cooperative CTA budget and replace cross-story whole-grid barriers with per-story lane-group barriers, allowing independent story lanes to advance without changing logical worker count or FP32 operation order.
+- Add compiled CUDA kernel resource telemetry (registers/thread, local/shared memory, cooperative capacity, resident threads/SM, and theoretical occupancy) as best-effort diagnostics that cannot make CUDA initialization fail.
+- Keep normal single-GPU story scheduling, per-story metric reduction, and exact bounded-surprise replay-range selection on-device for stories that fit the persistent batch capacity; retain explicit host fallbacks for long/debug/multi-GPU paths and order-sensitive keyed context merging.
+- Ignore raw `test-logs/` evidence directories; durable P100 measurements belong in `docs/CUDA-PERFORMANCE-HISTORY.md` plus external evidence archives, not the source tree.
 
 ## v1.0.3 - 2026-09-11
 

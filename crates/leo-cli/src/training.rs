@@ -339,13 +339,33 @@ fn apply_replay_policy(
         }
     }
 
+    execute_replay_ranges(
+        runtime,
+        story,
+        &ranges,
+        permission,
+        story_index,
+        selection_ms,
+    )
+}
+
+fn execute_replay_ranges(
+    runtime: &mut BackendRuntime,
+    story: &[u8],
+    ranges: &[std::ops::Range<usize>],
+    permission: Permission,
+    story_index: usize,
+    selection_ms: f64,
+) -> LeoResult<ReplayTrainingReport> {
+    let debug = replay_debug_options();
+    let estimated_prefix_steps = ranges.iter().map(|range| range.start as u64).sum::<u64>();
     let story_started = debug.timing.then(Instant::now);
     let mut activity = ActivityDiagnostics::default();
     let mut replay_steps = 0u64;
     let mut prefix_steps = 0u64;
     let mut timing = ReplayTiming::default();
     if replay_streaming_enabled() && !ranges.is_empty() {
-        let execution = replay_ranges_streaming(runtime, story, &ranges, permission, debug.timing)?;
+        let execution = replay_ranges_streaming(runtime, story, ranges, permission, debug.timing)?;
         replay_steps = execution.target_steps;
         prefix_steps = execution.prefix_steps;
         timing.add(execution.timing);
@@ -1434,6 +1454,30 @@ fn apply_batch_replay_policy(
     Ok(combined)
 }
 
+fn apply_batch_replay_ranges(
+    runtime: &mut BackendRuntime,
+    stories: &[Vec<u8>],
+    ranges_by_story: &[Vec<std::ops::Range<usize>>],
+    permission: Permission,
+) -> LeoResult<ReplayTrainingReport> {
+    if stories.len() != ranges_by_story.len() {
+        return Err(LeoError::internal(
+            "replay story/range batch length mismatch",
+        ));
+    }
+    let debug = replay_debug_options();
+    let batch_started = debug.timing.then(Instant::now);
+    let mut combined = ReplayTrainingReport::empty();
+    for (story_index, (story, ranges)) in stories.iter().zip(ranges_by_story).enumerate() {
+        let replay = execute_replay_ranges(runtime, story, ranges, permission, story_index, 0.0)?;
+        combined.add(replay);
+    }
+    if let Some(started) = batch_started {
+        combined.timing.total_ms = started.elapsed().as_secs_f64() * 1000.0;
+    }
+    Ok(combined)
+}
+
 pub(crate) fn train_story_batch(
     runtime: &mut BackendRuntime,
     stories: Vec<Vec<u8>>,
@@ -1484,18 +1528,43 @@ pub(crate) fn train_story_batch(
             let mut activity = ActivityDiagnostics::default();
             let mut loss_sum = 0.0f64;
             let mut targets = 0usize;
-            let mut losses_by_story = Vec::with_capacity(device_report.story_metrics.len());
-            for story_metrics in device_report.story_metrics {
-                let mut losses = Vec::with_capacity(story_metrics.len());
-                for metrics in story_metrics {
-                    if let Some(loss) = metrics.loss {
-                        losses.push(loss);
-                        loss_sum += loss as f64;
-                        targets = targets.saturating_add(1);
-                    }
-                    activity.record(metrics);
+            let device_postprocessed = device_report.story_metrics.is_empty()
+                && device_report.story_summaries.len() == stories.len()
+                && device_report.replay_ranges.len() == stories.len();
+
+            let mut losses_by_story = Vec::new();
+            if device_postprocessed {
+                for summary in &device_report.story_summaries {
+                    loss_sum += summary.training_loss_sum;
+                    targets = targets.saturating_add(summary.training_targets as usize);
+                    activity.steps = activity.steps.saturating_add(summary.training_targets);
+                    activity.active_neurons_sum = activity
+                        .active_neurons_sum
+                        .saturating_add(summary.active_neurons_sum);
+                    activity.active_neurons_peak = activity
+                        .active_neurons_peak
+                        .max(summary.active_neurons_peak);
+                    activity.emitted_events = activity
+                        .emitted_events
+                        .saturating_add(summary.synaptic_events);
+                    activity.context_applied_steps = activity
+                        .context_applied_steps
+                        .saturating_add(summary.context_applied_steps);
                 }
-                losses_by_story.push(losses);
+            } else {
+                losses_by_story = Vec::with_capacity(device_report.story_metrics.len());
+                for story_metrics in device_report.story_metrics {
+                    let mut losses = Vec::with_capacity(story_metrics.len());
+                    for metrics in story_metrics {
+                        if let Some(loss) = metrics.loss {
+                            losses.push(loss);
+                            loss_sum += loss as f64;
+                            targets = targets.saturating_add(1);
+                        }
+                        activity.record(metrics);
+                    }
+                    losses_by_story.push(losses);
+                }
             }
             // Replay advances the canonical device after the story-mean packet
             // has already synchronized all resident lanes. Track replay alone
@@ -1503,8 +1572,16 @@ pub(crate) fn train_story_batch(
             // next batch does not require a full canonical restore.
             runtime.enable_parameter_tracking();
             let replay_started = Instant::now();
-            let replay =
-                apply_batch_replay_policy(runtime, &stories, &losses_by_story, permission)?;
+            let replay = if device_postprocessed {
+                apply_batch_replay_ranges(
+                    runtime,
+                    &stories,
+                    &device_report.replay_ranges,
+                    permission,
+                )?
+            } else {
+                apply_batch_replay_policy(runtime, &stories, &losses_by_story, permission)?
+            };
             let replay_seconds = replay_started.elapsed().as_secs_f64();
             let replay_sync_started = Instant::now();
             if replay.replay_steps > 0 {

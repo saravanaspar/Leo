@@ -127,6 +127,8 @@ def benchmark_environment(base_env, legacy_execution=False):
         "LEO_CUDA_SHARED_PERSISTENT",
         "LEO_CUDA_SHARED_GROUPED",
         "LEO_CUDA_DEVICE_BATCH_MERGE",
+        "LEO_CUDA_DEVICE_STORY_STEPS",
+        "LEO_CUDA_DEVICE_STORY_POSTPROCESS",
         "LEO_CUDA_FULL_STEP_METRICS",
         "LEO_CUDA_REPLAY_BLOCKS",
         "LEO_CUDA_FROZEN_BLOCKS",

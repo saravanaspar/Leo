@@ -9,3 +9,4 @@ __pycache__/
 .ipynb_checkpoints/
 .leo_binary_path
 *.tmp
+test-logs/

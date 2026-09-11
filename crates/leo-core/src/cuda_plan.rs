@@ -42,13 +42,22 @@ pub(crate) struct CudaTuningLimits {
     pub fused_blocks_128: u32,
     pub fused_blocks_256: u32,
     pub fused_blocks_512: u32,
+    /// Compiled cooperative capacity of the production grouped persistent
+    /// kernel at its exact 256-thread reduction shape.
+    pub grouped_blocks_256: u32,
 }
 
 impl CudaTuningLimits {
     fn max_fused_blocks(self, threads: u32) -> u32 {
         match threads {
             128 => self.fused_blocks_128,
-            256 => self.fused_blocks_256,
+            256 => {
+                if self.grouped_blocks_256 == 0 {
+                    self.fused_blocks_256
+                } else {
+                    self.fused_blocks_256.min(self.grouped_blocks_256)
+                }
+            }
             512 => self.fused_blocks_512,
             _ => 0,
         }
@@ -631,6 +640,7 @@ mod tests {
             fused_blocks_128: 320,
             fused_blocks_256: 160,
             fused_blocks_512: 80,
+            grouped_blocks_256: 160,
         }
     }
 

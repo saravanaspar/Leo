@@ -16,6 +16,8 @@ unset LEO_CUDA_REPLAY_COOPERATIVE
 unset LEO_CUDA_SHARED_PERSISTENT
 unset LEO_CUDA_SHARED_GROUPED
 unset LEO_CUDA_DEVICE_BATCH_MERGE
+unset LEO_CUDA_DEVICE_STORY_STEPS
+unset LEO_CUDA_DEVICE_STORY_POSTPROCESS
 unset LEO_CUDA_FULL_STEP_METRICS
 unset LEO_CUDA_REPLAY_BLOCKS
 unset LEO_CUDA_FROZEN_BLOCKS
@@ -413,6 +415,8 @@ LEO_MULTI_GPU=0 "$LEO" benchmark \
 LEO_CUDA_SHARED_PERSISTENT=0 \
 LEO_CUDA_SHARED_GROUPED=0 \
 LEO_CUDA_DEVICE_BATCH_MERGE=0 \
+LEO_CUDA_DEVICE_STORY_STEPS=0 \
+LEO_CUDA_DEVICE_STORY_POSTPROCESS=0 \
 LEO_MULTI_GPU=0 "$LEO" benchmark \
   --train \
   --model "$TMP/model.pscls" \
@@ -449,6 +453,8 @@ legacy = final_benchmark(legacy_path)
 
 observed_kernels = []
 device_batch_merge_observed = False
+device_story_steps_observed = False
+device_story_postprocess_observed = False
 for raw in persistent_path.read_text(encoding="utf-8").splitlines():
     raw = raw.strip()
     if not raw.startswith("{"):
@@ -468,6 +474,16 @@ for raw in persistent_path.read_text(encoding="utf-8").splitlines():
         and event.get("kernel") == "leo_merge_shared_lane_fixed_parameters"
     ):
         device_batch_merge_observed = True
+    elif (
+        event.get("scope") == "device_story_steps"
+        and event.get("kernel") == "leo_build_shared_story_steps"
+    ):
+        device_story_steps_observed = True
+    elif (
+        event.get("scope") == "device_story_postprocess"
+        and event.get("kernel") == "leo_postprocess_shared_story_records"
+    ):
+        device_story_postprocess_observed = True
 
 for event, label in ((persistent, "optimized"), (legacy, "legacy")):
     if not event.get("training_state_sha256"):
@@ -483,12 +499,18 @@ if persistent["training_state_sha256"] != legacy["training_state_sha256"]:
     )
 if not device_batch_merge_observed:
     raise SystemExit("optimized exact-state leg did not execute device batch merge")
+if not device_story_steps_observed:
+    raise SystemExit("optimized exact-state leg did not execute device story step builder")
+if not device_story_postprocess_observed:
+    raise SystemExit("optimized exact-state leg did not execute device story postprocess")
 kernel_summary = ",".join(observed_kernels) if observed_kernels else "fallback/no-persistent-launch-observed"
 print(
     "Optimized-vs-legacy CUDA exact-state gate OK:",
     persistent["training_state_sha256"],
     f"optimized_kernel={kernel_summary}",
     "device_batch_merge=true",
+    "device_story_steps=true",
+    "device_story_postprocess=true",
 )
 PY
 

@@ -24,7 +24,8 @@ pub use artifact::{digest_bytes, digest_file, ArtifactDigest, Sha256, DIGEST_ALG
 pub use backend::{
     available_gpu_devices, visible_gpu_device_compatibility, BackendCapabilities, BackendKind,
     BackendRuntime, DeviceAccess, DeviceBufferSpec, DeviceModelLayout, DeviceScalarType,
-    DeviceStoryBatchDeltaReport, DeviceStoryBatchReport, GpuDeviceCompatibility, RuntimeBackend,
+    DeviceStoryBatchDeltaReport, DeviceStoryBatchReport, DeviceStorySummary,
+    GpuDeviceCompatibility, RuntimeBackend,
 };
 pub use config::Config;
 pub use metrics::{StepMetrics, TrainingStatistics};
