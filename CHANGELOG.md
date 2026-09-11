@@ -5,6 +5,7 @@ All notable project changes should be recorded here.
 ## Unreleased
 
 - Restore replay diagnostics for GPU-native replay selection by reporting device-selected range summaries and shared batch timing without downloading per-step losses, and make the P100 GPU gate require the device-native diagnostic path instead of the legacy host selector event.
+- Fix the grouped persistent CUDA executor's high-occupancy cross-CTA race by reusing CUDA cooperative whole-grid barriers for every shared-story phase, keeping all CTAs on the same max-step schedule, and adding a full-capacity repeated exact-state GPU regression against the legacy compatibility path.
 
 ## v1.0.32 - 2026-09-11
 

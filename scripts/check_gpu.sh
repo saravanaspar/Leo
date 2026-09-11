@@ -526,6 +526,202 @@ print(
 )
 PY
 
+
+# Full-capacity grouped-kernel exactness regression. The ordinary test model is
+# intentionally tiny and cannot schedule enough CTAs per logical lane to expose
+# cross-CTA synchronization defects. Build a moderate 4K-neuron model, force the
+# persisted 4-lane plan to the hardware's sanitized maximum cooperative grid,
+# then require two independent grouped runs to match each other and the exact
+# single-CTA-per-story compatibility path.
+GROUPED_CONFIG="$TMP/grouped-grid.toml"
+python3 - "configs/test.toml" "$GROUPED_CONFIG" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+source = source.replace('name = "Leo-test"', 'name = "Leo-grouped-grid"', 1)
+source, count = re.subn(r"(?m)^neuron_count = 128$", "neuron_count = 4096", source, count=1)
+if count != 1:
+    raise SystemExit("could not widen grouped regression neuron_count")
+source, count = re.subn(r"(?m)^block_count = 8$", "block_count = 256", source, count=1)
+if count != 1:
+    raise SystemExit("could not widen grouped regression block_count")
+source, count = re.subn(r"(?m)^fraction = 0\.30$", "fraction = 0.0", source, count=1)
+if count != 1:
+    raise SystemExit("could not disable replay in grouped regression config")
+Path(sys.argv[2]).write_text(source, encoding="utf-8")
+PY
+
+GROUPED_CACHE="$TMP/grouped-grid-cache"
+GROUPED_TUNE_MODEL="$TMP/grouped-grid-tune.pscls"
+GROUPED_A_MODEL="$TMP/grouped-grid-a.pscls"
+GROUPED_B_MODEL="$TMP/grouped-grid-b.pscls"
+GROUPED_LEGACY_MODEL="$TMP/grouped-grid-legacy.pscls"
+GROUPED_TUNE_LOG="$TMP/grouped-grid-tune.log"
+GROUPED_A_LOG="$TMP/grouped-grid-a.log"
+GROUPED_B_LOG="$TMP/grouped-grid-b.log"
+GROUPED_LEGACY_LOG="$TMP/grouped-grid-legacy.log"
+
+rm -rf "$GROUPED_CACHE"
+"$LEO" init --config "$GROUPED_CONFIG" --output "$GROUPED_TUNE_MODEL"
+"$LEO" init --config "$GROUPED_CONFIG" --output "$GROUPED_A_MODEL"
+"$LEO" init --config "$GROUPED_CONFIG" --output "$GROUPED_B_MODEL"
+"$LEO" init --config "$GROUPED_CONFIG" --output "$GROUPED_LEGACY_MODEL"
+
+# One grouped observation is sufficient to materialize the keyed lanes16 tuner
+# profile. Make it complete and deliberately request a u32-max fused grid;
+# CudaExecutionTuner::sanitize_plan clamps it to the compiled cooperative
+# capacity of the current GPU.
+LEO_CACHE_DIR="$GROUPED_CACHE" \
+LEO_CUDA_SHARED_PERSISTENT=1 \
+LEO_CUDA_SHARED_GROUPED=1 \
+LEO_CUDA_DEVICE_STORY_STEPS=0 \
+LEO_CUDA_DEVICE_STORY_POSTPROCESS=0 \
+LEO_CUDA_DEVICE_BATCH_MERGE=0 \
+LEO_MULTI_GPU=0 "$LEO" benchmark \
+  --train \
+  --model "$GROUPED_TUNE_MODEL" \
+  --bytes "$TMP/data/tinystories.train.bytes" \
+  --index "$TMP/data/tinystories.train.idx" \
+  --stories 4 \
+  --workers 4 \
+  --backend gpu 2>&1 | tee "$GROUPED_TUNE_LOG"
+
+python3 - "$GROUPED_CACHE" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1]) / "cuda" / "profiles"
+profiles = list(root.glob("*-lanes4.toml"))
+if len(profiles) != 1:
+    raise SystemExit(f"expected one grouped lanes4 profile, found {profiles}")
+path = profiles[0]
+text = path.read_text(encoding="utf-8")
+text, complete_count = re.subn(r"(?m)^complete = false$", "complete = true", text, count=1)
+if complete_count != 1:
+    raise SystemExit("grouped tuner profile was not incomplete as expected")
+marker = "[plan]\n"
+if marker not in text:
+    raise SystemExit("grouped tuner profile is missing [plan]")
+before, after = text.split(marker, 1)
+after, block_count = re.subn(
+    r"(?m)^fused_wavefront_blocks\s*=\s*\d+\s*$",
+    "fused_wavefront_blocks = 4294967295",
+    after,
+    count=1,
+)
+if block_count != 1:
+    raise SystemExit("could not force grouped tuner fused grid")
+path.write_text(before + marker + after, encoding="utf-8")
+PY
+
+run_grouped_exact_case() {
+  local model="$1"
+  local log="$2"
+  LEO_CACHE_DIR="$GROUPED_CACHE" \
+  LEO_CUDA_SHARED_PERSISTENT=1 \
+  LEO_CUDA_SHARED_GROUPED=1 \
+  LEO_CUDA_DEVICE_STORY_STEPS=0 \
+  LEO_CUDA_DEVICE_STORY_POSTPROCESS=0 \
+  LEO_CUDA_DEVICE_BATCH_MERGE=0 \
+  LEO_CUDA_DEBUG=1 \
+  LEO_CUDA_DEBUG_LAUNCHES=1 \
+  LEO_MULTI_GPU=0 "$LEO" benchmark \
+    --train \
+    --model "$model" \
+    --bytes "$TMP/data/tinystories.train.bytes" \
+    --index "$TMP/data/tinystories.train.idx" \
+    --stories 16 \
+    --workers 4 \
+    --backend gpu 2>&1 | tee "$log"
+}
+
+run_grouped_exact_case "$GROUPED_A_MODEL" "$GROUPED_A_LOG"
+run_grouped_exact_case "$GROUPED_B_MODEL" "$GROUPED_B_LOG"
+
+LEO_CACHE_DIR="$GROUPED_CACHE" \
+LEO_CUDA_SHARED_PERSISTENT=0 \
+LEO_CUDA_SHARED_GROUPED=0 \
+LEO_CUDA_DEVICE_STORY_STEPS=0 \
+LEO_CUDA_DEVICE_STORY_POSTPROCESS=0 \
+LEO_CUDA_DEVICE_BATCH_MERGE=0 \
+LEO_MULTI_GPU=0 "$LEO" benchmark \
+  --train \
+  --model "$GROUPED_LEGACY_MODEL" \
+  --bytes "$TMP/data/tinystories.train.bytes" \
+  --index "$TMP/data/tinystories.train.idx" \
+  --stories 16 \
+  --workers 4 \
+  --backend gpu 2>&1 | tee "$GROUPED_LEGACY_LOG"
+
+python3 - "$GROUPED_A_LOG" "$GROUPED_B_LOG" "$GROUPED_LEGACY_LOG" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+
+def events(path):
+    result = []
+    for raw in Path(path).read_text(encoding="utf-8").splitlines():
+        raw = raw.strip()
+        if not raw.startswith("{"):
+            continue
+        try:
+            result.append(json.loads(raw))
+        except json.JSONDecodeError:
+            pass
+    return result
+
+
+def benchmark(rows, label):
+    values = [row for row in rows if row.get("event") == "training_benchmark"]
+    if not values:
+        raise SystemExit(f"{label} did not emit training_benchmark")
+    return values[-1]
+
+
+a_events = events(sys.argv[1])
+b_events = events(sys.argv[2])
+legacy_events = events(sys.argv[3])
+a = benchmark(a_events, "grouped run A")
+b = benchmark(b_events, "grouped run B")
+legacy = benchmark(legacy_events, "grouped legacy control")
+
+launches = [
+    row
+    for row in a_events
+    if row.get("event") == "cuda_debug_launch"
+    and row.get("scope") == "shared_story_batch"
+    and row.get("kernel") == "leo_shared_wavefront_persistent_grouped"
+]
+if not launches:
+    raise SystemExit("full-capacity grouped gate did not observe grouped production launch")
+max_blocks_per_lane = max(int(row.get("blocks_per_lane_max", 0)) for row in launches)
+if max_blocks_per_lane < 3:
+    print(
+        "Full-capacity grouped stress note:",
+        f"hardware exposes only {max_blocks_per_lane} CTAs/lane; exactness is still checked",
+    )
+
+hash_a = a.get("training_state_sha256")
+hash_b = b.get("training_state_sha256")
+hash_legacy = legacy.get("training_state_sha256")
+if not hash_a or not hash_b or not hash_legacy:
+    raise SystemExit("full-capacity grouped gate is missing training-state hashes")
+if hash_a != hash_b:
+    raise SystemExit(f"grouped full-capacity runs are nondeterministic: {hash_a} != {hash_b}")
+if hash_a != hash_legacy:
+    raise SystemExit(f"grouped full-capacity state differs from legacy: {hash_a} != {hash_legacy}")
+
+print(
+    "Full-capacity grouped exact-state gate OK:",
+    hash_a,
+    f"blocks_per_lane_max={max_blocks_per_lane}",
+)
+PY
+
 # On hosts with at least two homogeneous GPUs, prove that physical placement is
 # execution-only: 1-GPU and 2-GPU runs must finish with the same complete
 # persistent training-state digest, not merely similar loss/counters.

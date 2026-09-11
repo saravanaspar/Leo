@@ -808,9 +808,11 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("lane_block = blockIdx.x / lane_count", grouped)
         self.assertIn("blocks_in_lane", grouped)
         self.assertIn("lane_step_count", grouped)
-        self.assertIn("leo_lane_group_barrier", grouped)
-        self.assertNotIn("grid.sync()", grouped)
-        self.assertGreaterEqual(grouped.count("leo_lane_group_barrier("), 19)
+        self.assertIn("cooperative_groups::this_grid()", grouped)
+        self.assertIn("step_index < max_step_count", grouped)
+        self.assertIn("active = lane_valid && step_index < lane_step_count", grouped)
+        self.assertNotIn("leo_lane_group_barrier", kernels)
+        self.assertGreaterEqual(grouped.count("grid.sync();"), 19)
         self.assertIn("lane_thread", grouped)
         self.assertIn("lane_stride", grouped)
         self.assertIn("leo_p_forward_context_latent_work", grouped)
@@ -823,6 +825,10 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("LEO_CUDA_SHARED_GROUPED", rust)
         self.assertIn("shared_grouped_blocks_256", rust)
         self.assertIn("grouped_blocks_256", planner)
+
+        gpu_gate = (ROOT / "scripts/check_gpu.sh").read_text()
+        self.assertIn("Full-capacity grouped exact-state gate OK", gpu_gate)
+        self.assertIn("blocks_per_lane_max", gpu_gate)
 
     def test_grouped_cta_remainder_distribution_covers_each_model_block_once(self):
         for grid_blocks in (16, 17, 31, 48, 55, 56, 112):
