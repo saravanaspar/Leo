@@ -5587,46 +5587,12 @@ __device__ __forceinline__ void leo_phase_profile_mark(
 // CTA; sparse/row-independent work and independent output logits use the whole
 // lane group.
 
-// Cooperative grouped story execution keeps every participating CTA resident,
-// so a small global-memory sense barrier can synchronize only the CTAs that
-// belong to one logical story lane. This removes unrelated cross-story waits
-// while preserving every within-story phase dependency and FP32 operation
-// order. The final kernel completion remains the logical batch barrier.
-__device__ __forceinline__ void leo_lane_group_barrier(
-    unsigned int* lane_barrier_counts,
-    unsigned int* lane_barrier_epochs,
-    unsigned int lane,
-    unsigned int blocks_in_lane,
-    unsigned int* local_epoch
-) {
-    // Every thread may have produced global writes in the preceding phase.
-    // Fence those writes before the lane leader publishes this CTA's arrival.
-    __threadfence();
-    __syncthreads();
-    if (threadIdx.x == 0U) {
-        const unsigned int next_epoch = *local_epoch + 1U;
-        const unsigned int arrival = atomicAdd(&lane_barrier_counts[lane], 1U);
-        if (arrival + 1U == blocks_in_lane) {
-            atomicExch(&lane_barrier_counts[lane], 0U);
-            __threadfence();
-            atomicExch(&lane_barrier_epochs[lane], next_epoch);
-        } else {
-            volatile unsigned int* epoch = &lane_barrier_epochs[lane];
-            while (*epoch != next_epoch) {
-                // Busy-wait is intentional: the cooperative launch guarantees
-                // every participating CTA is resident, including on Pascal
-                // devices where __nanosleep is unavailable.
-            }
-            __threadfence();
-        }
-        *local_epoch = next_epoch;
-    }
-    __syncthreads();
-    // Match cooperative grid-barrier visibility before any thread begins the
-    // next phase.
-    __threadfence();
-}
-
+// The grouped executor uses CUDA cooperative whole-grid barriers at every
+// cross-CTA phase boundary. Exact FP32 semantics require CUDA's defined
+// cooperative synchronization and memory-visibility guarantees whenever
+// multiple CTAs participate in one logical story. Every CTA therefore
+// advances through the same max_step_count schedule; completed lanes skip
+// work but never skip a barrier.
 template <bool PROFILED>
 __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
     const unsigned long long* pointer_table_addresses,
@@ -5645,6 +5611,7 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
     unsigned int* lane_barrier_epochs,
     unsigned long long* phase_profile_counters
 ) {
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
     __shared__ unsigned long long shared_selection_keys[LEO_GLOBAL_SORT];
     __shared__ float shared_reduction[512];
     if (lane_count == 0U || gridDim.x < lane_count) return;
@@ -5661,9 +5628,11 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
     const bool lane_leader = lane_block == 0U;
     const unsigned int lane_thread = lane_block * blockDim.x + threadIdx.x;
     const unsigned int lane_stride = blocks_in_lane * blockDim.x;
-    unsigned int lane_barrier_epoch = 0U;
     (void)minimum_blocks_per_lane;
-    (void)max_step_count;
+    // Retain the historical kernel ABI for now; these buffers are no longer
+    // synchronization primitives after the cooperative-grid correctness fix.
+    (void)lane_barrier_counts;
+    (void)lane_barrier_epochs;
     const bool profile_thread = PROFILED
         && phase_profile_counters != nullptr
         && lane_leader
@@ -5673,8 +5642,9 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
     (void)delta_pointers;
 
     const unsigned int lane_step_count = lane_valid ? step_counts[lane] : 0U;
-    for (unsigned int step_index = 0U; step_index < lane_step_count; ++step_index) {
-        const bool active = lane_valid;
+    for (unsigned int step_index = 0U; step_index < max_step_count; ++step_index) {
+        const bool active = lane_valid && step_index < lane_step_count;
+        const bool profile_step_thread = profile_thread && active;
         const unsigned long long* p = active
             ? reinterpret_cast<const unsigned long long*>(pointer_table_addresses[lane])
             : nullptr;
@@ -5700,9 +5670,9 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
                 lane_count, step_index, learning_trace_raw, lane
             );
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
         leo_phase_profile_mark<PROFILED>(
-            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_PRE, profile_thread, &phase_start
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_PRE, profile_step_thread, &phase_start
         );
 
         // Each lane group owns its story's model blocks. This retains the exact
@@ -5716,9 +5686,9 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
                 step_index, model_block_count, work, shared_selection_keys
             );
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
         leo_phase_profile_mark<PROFILED>(
-            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_SELECT, profile_thread, &phase_start
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_SELECT, profile_step_thread, &phase_start
         );
 
         if (active && lane_leader) {
@@ -5727,17 +5697,17 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
                 step_index, lane, shared_selection_keys
             );
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
         leo_phase_profile_mark<PROFILED>(
-            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_POST_SELECT, profile_thread, &phase_start
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_POST_SELECT, profile_step_thread, &phase_start
         );
 
         if (active) {
             leo_p_cache_surrogate_work(p, tick, lane_thread, lane_stride);
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
         leo_phase_profile_mark<PROFILED>(
-            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_CACHE_SURROGATE, profile_thread, &phase_start
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_CACHE_SURROGATE, profile_step_thread, &phase_start
         );
 
         unsigned int* rec_current_list = nullptr;
@@ -5772,7 +5742,7 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
             *rec_next_count = 0U;
             *input_next_count = 0U;
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
 
         if (learning_trace) {
             leo_p_update_recurrent_eligibility_work_fast(
@@ -5780,7 +5750,7 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
                 rec_next_count, lane_thread, lane_stride
             );
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
 
         if (learning_trace) {
             leo_p_update_input_eligibility_work_fast(
@@ -5788,47 +5758,47 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
                 input_next_count, lane_thread, lane_stride
             );
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
 
         if (active) {
             leo_p_post_and_emit_work(p, tick, lane_thread, lane_stride);
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
 
         if (active) {
             leo_p_forward_context_latent_work(p, lane_thread, lane_stride);
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
         if (active) {
             leo_p_forward_logits_work(p, lane_thread, lane_stride);
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
         if (active && lane_leader) {
             leo_p_forward_finalize(p, step.target_index, shared_reduction);
             __syncthreads();
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
         leo_phase_profile_mark<PROFILED>(
-            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_POST_CORE, profile_thread, &phase_start
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_POST_CORE, profile_step_thread, &phase_start
         );
 
         if (supervised) {
             leo_p_learning_signals_work(p, tick, lane_thread, lane_stride);
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
         leo_phase_profile_mark<PROFILED>(
-            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_LEARNING_SIGNALS, profile_thread, &phase_start
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_LEARNING_SIGNALS, profile_step_thread, &phase_start
         );
 
         if (supervised) {
             leo_p_update_output_work(p, step.supervised_strength, lane_thread, lane_stride);
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
 
         if (supervised && context_enabled) {
             leo_p_update_context_work(p, step.supervised_strength, lane_thread, lane_stride);
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
 
         if (supervised) {
             const unsigned int* learning_rec_list = learning_trace
@@ -5840,7 +5810,7 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
                 lane_thread, lane_stride
             );
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
 
         if (supervised) {
             const unsigned int* learning_input_list = learning_trace
@@ -5852,7 +5822,7 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
                 lane_thread, lane_stride
             );
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
 
         // Recurrent supervised updates and inhibitory homeostasis touch the
         // same recurrent weights, so keep an explicit grid barrier between
@@ -5860,27 +5830,27 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
         if (supervised) {
             leo_p_inhibitory_homeostasis_work(p, strength, lane_thread, lane_stride);
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
         leo_phase_profile_mark<PROFILED>(
-            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_POST_DELTAS, profile_thread, &phase_start
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_POST_DELTAS, profile_step_thread, &phase_start
         );
 
         if (learning_trace) {
             leo_p_homeostasis_work(p, tick, lane_thread, lane_stride);
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
         leo_phase_profile_mark<PROFILED>(
-            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_HOMEOSTASIS, profile_thread, &phase_start
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_HOMEOSTASIS, profile_step_thread, &phase_start
         );
 
         if (active && lane_leader) {
             leo_p_capture_training_step_fast(p, step.target_index, step_index);
         }
-        leo_lane_group_barrier(lane_barrier_counts, lane_barrier_epochs, lane, blocks_in_lane, &lane_barrier_epoch);
+        grid.sync();
         leo_phase_profile_mark<PROFILED>(
-            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_CAPTURE, profile_thread, &phase_start
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_CAPTURE, profile_step_thread, &phase_start
         );
-        if (PROFILED && profile_thread) {
+        if (PROFILED && profile_step_thread) {
             atomicAdd(&phase_profile_counters[LEO_CUDA_PHASE_PROFILE_SAMPLES], 1ULL);
         }
     }

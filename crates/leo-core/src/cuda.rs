@@ -7653,10 +7653,10 @@ fn launch_shared_wavefront_persistent_chunk(
     let mut delta_pointers = coordinator.buffers.batch_delta_pointer_table.pointer;
 
     if grouped_blocks_per_lane > 0 {
-        // The grouped kernel uses per-lane cooperative-residency barriers, so
-        // the physical grid no longer has to be rounded down to an exact
-        // multiple of logical lanes. Use every tuner-approved resident CTA;
-        // the first `grid_blocks % lane_count` lanes receive one extra block.
+        // The grouped kernel is one cooperative whole-grid launch. Every CTA
+        // participates in each cross-CTA phase barrier, while this interleaved
+        // block-to-lane mapping still uses every tuner-approved resident CTA.
+        // The first `grid_blocks % lane_count` lanes receive one extra block.
         let grid_blocks = grouped_budget;
         let extra_lane_blocks = grid_blocks % lane_count;
         let phase_profile_sampled =
