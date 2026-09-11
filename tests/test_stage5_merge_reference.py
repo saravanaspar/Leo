@@ -13,7 +13,7 @@ def better(left, right, rotation, neuron_count):
     return (ln + neuron_count - rotation) % neuron_count < (rn + neuron_count - rotation) % neuron_count
 
 
-def heap_merge(runs, rotation, neuron_count):
+def heap_merge(runs, rotation, neuron_count, limit=None):
     heads = [0] * len(runs)
     heap = []
 
@@ -35,7 +35,9 @@ def heap_merge(runs, rotation, neuron_count):
 
     result = []
     keep = len(runs[0])
-    while heap:
+    total = sum(sum(value > 0 for value, _ in run) for run in runs)
+    needed = total if limit is None else min(total, limit)
+    while heap and len(result) < needed:
         best = heap[0]
         result.append(candidate(best))
         next_head = heads[best] + 1
@@ -97,6 +99,7 @@ class Stage5MergeReferenceTests(unittest.TestCase):
             expected = [item for row in runs for item in row if item[0] > 0]
             expected.sort(key=cmp_to_key(cmp))
             self.assertEqual(heap_merge(runs, rotation, neuron_count), expected)
+            self.assertEqual(heap_merge(runs, rotation, neuron_count, 17), expected[:17])
 
 
 if __name__ == "__main__":

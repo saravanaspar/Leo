@@ -221,6 +221,9 @@ struct CudaPhaseProfileReport {
     fused_launches_total: u64,
     sample_stride: u64,
     planned_fused_blocks: u32,
+    normal_capacity_blocks: u32,
+    profiled_capacity_blocks: u32,
+    profiled_kernel: &'static str,
     geometry_skipped_samples: u64,
     sampled_grid_blocks_max: u32,
     skipped_grid_blocks_max: u32,
@@ -862,6 +865,7 @@ struct KernelFunctions {
     shared_wavefront_fused: CuFunction,
     shared_wavefront_persistent: CuFunction,
     shared_wavefront_persistent_grouped: CuFunction,
+    shared_wavefront_persistent_grouped_profiled: CuFunction,
     shared_wavefront_fused_profiled: CuFunction,
     shared_select_blocks: CuFunction,
     shared_post_select: CuFunction,
@@ -1022,6 +1026,7 @@ struct SharedCuda {
     fused_blocks_512: u32,
     shared_persistent_blocks_256: u32,
     shared_grouped_blocks_256: u32,
+    shared_grouped_profile_blocks_256: u32,
     fused_profile_blocks_256: u32,
     hardware: CudaHardwareIdentity,
 }
@@ -1895,6 +1900,14 @@ impl CudaRuntime {
             256,
             "grouped persistent shared wavefront 256",
         )?;
+        let shared_grouped_profile_blocks_256 = cooperative_grid_capacity(
+            &driver,
+            kernels.shared_wavefront_persistent_grouped_profiled,
+            cooperative_launch != 0,
+            multiprocessor_count,
+            256,
+            "profiled grouped persistent shared wavefront 256",
+        )?;
         let fused_profile_blocks_256 = cooperative_grid_capacity(
             &driver,
             kernels.shared_wavefront_fused_profiled,
@@ -1985,6 +1998,7 @@ impl CudaRuntime {
             fused_blocks_512,
             shared_persistent_blocks_256,
             shared_grouped_blocks_256,
+            shared_grouped_profile_blocks_256,
             fused_profile_blocks_256,
             hardware,
         });
@@ -6726,6 +6740,9 @@ impl CudaRuntime {
             fused_launches_total,
             sample_stride,
             planned_fused_blocks,
+            normal_capacity_blocks,
+            profiled_capacity_blocks,
+            profiled_kernel,
             geometry_skipped_samples,
             sampled_grid_blocks_max,
             skipped_grid_blocks_max,
@@ -6737,18 +6754,19 @@ impl CudaRuntime {
             let reason = if geometry_skipped_samples > 0 {
                 "profiled_kernel_cannot_match_production_grid"
             } else if fused_launches_total == 0 {
-                "no_fused_wavefront_launches"
+                "no_production_wavefront_launches"
             } else {
-                "no_sampled_fused_wavefront_launches"
+                "no_sampled_production_wavefront_launches"
             };
             eprintln!(
-                "{{\"event\":\"cuda_phase_profile_skipped\",\"reason\":\"{}\",\"logical_lanes\":{},\"sample_stride\":{},\"planned_fused_blocks\":{},\"normal_capacity_blocks\":{},\"profiled_capacity_blocks\":{},\"geometry_skipped_samples\":{},\"sampled_grid_blocks_max\":{},\"skipped_grid_blocks_max\":{},\"fused_launches_total\":{}}}",
+                "{{\"event\":\"cuda_phase_profile_skipped\",\"reason\":\"{}\",\"scope\":\"shared_story_batch_production\",\"profiled_kernel\":\"{}\",\"logical_lanes\":{},\"sample_stride\":{},\"planned_fused_blocks\":{},\"normal_capacity_blocks\":{},\"profiled_capacity_blocks\":{},\"geometry_skipped_samples\":{},\"sampled_grid_blocks_max\":{},\"skipped_grid_blocks_max\":{},\"fused_launches_total\":{}}}",
                 reason,
+                profiled_kernel,
                 logical_lanes,
                 sample_stride,
                 planned_fused_blocks,
-                self.shared.fused_blocks_256,
-                self.shared.fused_profile_blocks_256,
+                normal_capacity_blocks,
+                profiled_capacity_blocks,
                 geometry_skipped_samples,
                 sampled_grid_blocks_max,
                 skipped_grid_blocks_max,
@@ -6776,7 +6794,8 @@ impl CudaRuntime {
         eprintln!(
             concat!(
                 "{{\"event\":\"cuda_phase_profile\",",
-                "\"scope\":\"fused_wavefront_only\",",
+                "\"scope\":\"shared_story_batch_production\",",
+                "\"profiled_kernel\":\"{}\",",
                 "\"logical_lanes\":{},\"sample_stride\":{},",
                 "\"planned_fused_blocks\":{},",
                 "\"normal_capacity_blocks\":{},\"profiled_capacity_blocks\":{},",
@@ -6794,11 +6813,12 @@ impl CudaRuntime {
                 "\"homeostasis_cycles\":{},\"homeostasis_pct\":{},",
                 "\"capture_cycles\":{},\"capture_pct\":{}}}"
             ),
+            profiled_kernel,
             logical_lanes,
             sample_stride,
             planned_fused_blocks,
-            self.shared.fused_blocks_256,
-            self.shared.fused_profile_blocks_256,
+            normal_capacity_blocks,
+            profiled_capacity_blocks,
             geometry_skipped_samples,
             sampled_grid_blocks_max,
             skipped_grid_blocks_max,
@@ -7039,7 +7059,16 @@ impl CudaRuntime {
             work,
             THREADS,
             &mut params,
-        )
+        )?;
+        if self.debug.launches {
+            eprintln!(
+                "{{\"event\":\"cuda_debug_launch\",\"scope\":\"device_batch_merge\",\"kernel\":\"leo_merge_shared_lane_fixed_parameters\",\"lanes\":{},\"work_items\":{},\"threads\":{}}}",
+                lane_count,
+                work,
+                THREADS,
+            );
+        }
+        Ok(())
     }
 
     fn launch_sparse_apply_and_reset_direct(&self, blocks: u32, threads: u32) -> LeoResult<()> {
@@ -7357,6 +7386,7 @@ struct PersistentWavefrontChunkLaunch {
     strength: f32,
     batch_scale: f32,
     execution_plan: CudaExecutionPlan,
+    phase_profile: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -7364,6 +7394,10 @@ struct PersistentWavefrontLaunch {
     grid_blocks: u32,
     blocks_per_lane: u32,
     grouped: bool,
+    phase_profile_sampled: bool,
+    phase_profile_geometry_skipped: bool,
+    normal_capacity_blocks: u32,
+    profiled_capacity_blocks: u32,
 }
 
 fn launch_shared_wavefront_persistent_chunk(
@@ -7379,6 +7413,7 @@ fn launch_shared_wavefront_persistent_chunk(
         strength,
         batch_scale,
         execution_plan,
+        phase_profile,
     } = launch;
     let lane_count = as_u32("GPU persistent physical lane chunk", physical_lane_count)?;
     let pointer_offset = lane_start.saturating_mul(mem::size_of::<CuDevicePtr>());
@@ -7431,34 +7466,69 @@ fn launch_shared_wavefront_persistent_chunk(
         let grid_blocks = lane_count
             .checked_mul(grouped_blocks_per_lane)
             .ok_or_else(|| LeoError::cuda("GPU grouped persistent grid overflow"))?;
+        let phase_profile_sampled =
+            phase_profile && coordinator.shared.shared_grouped_profile_blocks_256 >= grid_blocks;
+        let phase_profile_geometry_skipped = phase_profile && !phase_profile_sampled;
         let mut blocks_per_lane_value = grouped_blocks_per_lane;
-        let mut parameters = [
-            param(&mut pointer_tables_ptr),
-            param(&mut step_buffers_ptr),
-            param(&mut step_counts_ptr),
-            param(&mut base_ticks_ptr),
-            param(&mut lane_count_value),
-            param(&mut max_step_count_value),
-            param(&mut block_count_value),
-            param(&mut learning_value),
-            param(&mut raw_strength),
-            param(&mut scale),
-            param(&mut delta_pointers),
-            param(&mut blocks_per_lane_value),
-        ];
-        coordinator.launch_cooperative_exact(
-            coordinator
-                .shared
-                .kernels
-                .shared_wavefront_persistent_grouped,
-            grid_blocks,
-            SHARED_BATCH_THREADS,
-            &mut parameters,
-        )?;
+        if phase_profile_sampled {
+            let mut phase_profile_counters = coordinator.buffers.phase_profile_counters.pointer;
+            let mut parameters = [
+                param(&mut pointer_tables_ptr),
+                param(&mut step_buffers_ptr),
+                param(&mut step_counts_ptr),
+                param(&mut base_ticks_ptr),
+                param(&mut lane_count_value),
+                param(&mut max_step_count_value),
+                param(&mut block_count_value),
+                param(&mut learning_value),
+                param(&mut raw_strength),
+                param(&mut scale),
+                param(&mut delta_pointers),
+                param(&mut blocks_per_lane_value),
+                param(&mut phase_profile_counters),
+            ];
+            coordinator.launch_cooperative_exact(
+                coordinator
+                    .shared
+                    .kernels
+                    .shared_wavefront_persistent_grouped_profiled,
+                grid_blocks,
+                SHARED_BATCH_THREADS,
+                &mut parameters,
+            )?;
+        } else {
+            let mut parameters = [
+                param(&mut pointer_tables_ptr),
+                param(&mut step_buffers_ptr),
+                param(&mut step_counts_ptr),
+                param(&mut base_ticks_ptr),
+                param(&mut lane_count_value),
+                param(&mut max_step_count_value),
+                param(&mut block_count_value),
+                param(&mut learning_value),
+                param(&mut raw_strength),
+                param(&mut scale),
+                param(&mut delta_pointers),
+                param(&mut blocks_per_lane_value),
+            ];
+            coordinator.launch_cooperative_exact(
+                coordinator
+                    .shared
+                    .kernels
+                    .shared_wavefront_persistent_grouped,
+                grid_blocks,
+                SHARED_BATCH_THREADS,
+                &mut parameters,
+            )?;
+        }
         return Ok(PersistentWavefrontLaunch {
             grid_blocks,
             blocks_per_lane: grouped_blocks_per_lane,
             grouped: true,
+            phase_profile_sampled,
+            phase_profile_geometry_skipped,
+            normal_capacity_blocks: coordinator.shared.shared_grouped_blocks_256,
+            profiled_capacity_blocks: coordinator.shared.shared_grouped_profile_blocks_256,
         });
     }
 
@@ -7488,6 +7558,10 @@ fn launch_shared_wavefront_persistent_chunk(
         grid_blocks,
         blocks_per_lane: 1,
         grouped: false,
+        phase_profile_sampled: false,
+        phase_profile_geometry_skipped: phase_profile,
+        normal_capacity_blocks: coordinator.shared.shared_persistent_blocks_256,
+        profiled_capacity_blocks: 0,
     })
 }
 
@@ -7934,6 +8008,9 @@ pub(crate) fn train_story_batch_shared_device(
     let mut phase_profile_geometry_skips = 0u64;
     let mut phase_profile_sampled_grid_max = 0u32;
     let mut phase_profile_skipped_grid_max = 0u32;
+    let mut phase_profile_normal_capacity = coordinator.shared.fused_blocks_256;
+    let mut phase_profile_profiled_capacity = coordinator.shared.fused_profile_blocks_256;
+    let mut phase_profile_kernel = "leo_shared_wavefront_fused_profiled";
     if phase_profile_sample_stride.is_some() {
         coordinator.clear_phase_profile_counters_async()?;
     }
@@ -8073,7 +8150,6 @@ pub(crate) fn train_story_batch_shared_device(
         let use_persistent_shared = coordinator.shared_persistent_enabled
             && learning_trace
             && !coordinator.full_step_metrics
-            && phase_profile_sample_stride.is_none()
             && coordinator.shared.cooperative_launch
             && (coordinator.shared.shared_persistent_blocks_256 > 0
                 || coordinator.shared.shared_grouped_blocks_256 > 0)
@@ -8125,6 +8201,12 @@ pub(crate) fn train_story_batch_shared_device(
                     .max()
                     .unwrap_or(0) as usize;
                 if group_max_steps != 0 {
+                    let phase_profile = phase_profile_sample_stride
+                        .is_some_and(|stride| phase_profile_launch_sequence % stride == 0);
+                    if phase_profile_sample_stride.is_some() {
+                        phase_profile_launch_sequence =
+                            phase_profile_launch_sequence.saturating_add(1);
+                    }
                     let persistent_launch = launch_shared_wavefront_persistent_chunk(
                         coordinator,
                         PersistentWavefrontChunkLaunch {
@@ -8136,11 +8218,31 @@ pub(crate) fn train_story_batch_shared_device(
                             strength,
                             batch_scale,
                             execution_plan,
+                            phase_profile,
                         },
                     )?;
                     telemetry.fused_launches = telemetry.fused_launches.saturating_add(1);
+                    phase_profile_normal_capacity = persistent_launch.normal_capacity_blocks;
+                    phase_profile_profiled_capacity = persistent_launch.profiled_capacity_blocks;
+                    phase_profile_kernel = if persistent_launch.grouped {
+                        "leo_shared_wavefront_persistent_grouped_profiled"
+                    } else {
+                        "unavailable_for_leo_shared_wavefront_persistent"
+                    };
+                    if persistent_launch.phase_profile_sampled {
+                        phase_profile_sampled_grid_max =
+                            phase_profile_sampled_grid_max.max(persistent_launch.grid_blocks);
+                    }
+                    if persistent_launch.phase_profile_geometry_skipped {
+                        phase_profile_geometry_skips =
+                            phase_profile_geometry_skips.saturating_add(1);
+                        phase_profile_skipped_grid_max =
+                            phase_profile_skipped_grid_max.max(persistent_launch.grid_blocks);
+                    }
                     if coordinator.debug.launches {
-                        let kernel = if persistent_launch.grouped {
+                        let kernel = if persistent_launch.phase_profile_sampled {
+                            "leo_shared_wavefront_persistent_grouped_profiled"
+                        } else if persistent_launch.grouped {
                             "leo_shared_wavefront_persistent_grouped"
                         } else {
                             "leo_shared_wavefront_persistent"
@@ -8625,6 +8727,9 @@ pub(crate) fn train_story_batch_shared_device(
             fused_launches_total: telemetry.fused_launches,
             sample_stride,
             planned_fused_blocks: execution_plan.fused_wavefront_blocks,
+            normal_capacity_blocks: phase_profile_normal_capacity,
+            profiled_capacity_blocks: phase_profile_profiled_capacity,
+            profiled_kernel: phase_profile_kernel,
             geometry_skipped_samples: phase_profile_geometry_skips,
             sampled_grid_blocks_max: phase_profile_sampled_grid_max,
             skipped_grid_blocks_max: phase_profile_skipped_grid_max,
@@ -8877,6 +8982,11 @@ fn load_kernels(driver: &DriverFunctions, module: CuModule) -> LeoResult<KernelF
             driver,
             module,
             "leo_shared_wavefront_persistent_grouped",
+        )?,
+        shared_wavefront_persistent_grouped_profiled: get_kernel(
+            driver,
+            module,
+            "leo_shared_wavefront_persistent_grouped_profiled",
         )?,
         shared_wavefront_fused_profiled: get_kernel(
             driver,

@@ -779,6 +779,14 @@ target/release/leo benchmark \
   2>&1 | tee cuda-phase-profile.jsonl
 ```
 
+The profiler samples the same grouped persistent shared-story kernel used by
+production when the profiled kernel can sustain the identical cooperative grid
+width. If instrumentation reduces cooperative residency below that production
+geometry, Leo emits `cuda_phase_profile_skipped` instead of silently switching
+to a smaller or fallback execution kernel. The non-grouped persistent fallback
+currently reports an explicit profiling skip rather than changing execution
+semantics.
+
 Disable profiling for final throughput numbers:
 
 ```bash
@@ -837,7 +845,10 @@ python3 scripts/benchmark_multi_gpu.py --help
 ```
 
 A typical exact-path comparison should keep replay policy, model, story count,
-and `--workers 16` fixed and vary only physical GPU count.
+and `--workers 16` fixed and vary only physical GPU count. The utility removes
+inherited Leo semantic/debug/rollback switches from its benchmark environment;
+use its explicit `--legacy-execution` option for an optimized-vs-legacy exact
+execution A/B instead of exporting rollback variables in the parent shell.
 
 The repository GPU gate automatically invokes this utility for a 1-vs-2 GPU
 exact-state test when at least two GPUs are visible.

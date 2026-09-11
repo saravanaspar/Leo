@@ -7,6 +7,13 @@
 #define LEO_GLOBAL_SORT 1024
 #define LEO_SPARSE_GLOBAL_RUNS 128
 #define LEO_SPARSE_GLOBAL_THRESHOLD 128
+#define LEO_SPARSE_HEAP_RECORD_BASE LEO_SPARSE_GLOBAL_THRESHOLD
+#define LEO_SPARSE_HEAP_META_BASE (LEO_SPARSE_HEAP_RECORD_BASE + LEO_SPARSE_GLOBAL_RUNS)
+
+static_assert(
+    LEO_SPARSE_HEAP_META_BASE + LEO_SPARSE_GLOBAL_RUNS <= LEO_GLOBAL_SORT,
+    "sparse global heap scratch must fit in shared selection storage"
+);
 #define LEO_MAX_CONTEXT_ORDER 16
 #define LEO_MAX_CONTEXT_DIM 256
 
@@ -172,6 +179,64 @@ __device__ __forceinline__ unsigned int leo_selection_record_neuron(
     return leo_fast_mod_u64_u32(
         (unsigned long long)rotated + (unsigned long long)rotation, neuron_count
     );
+}
+
+// Sparse global selection uses the existing shared selection buffer as a small
+// max-heap.  Each heap node has one packed exact-order record and one metadata
+// word containing its source run and current position.  Keeping the heap in
+// shared memory avoids the per-thread local array/spill cost of a dynamically
+// indexed 128-run heap while replacing the old O(winners * runs) linear scan
+// with O(runs + winners * log(runs)) exact merging.
+__device__ __forceinline__ unsigned long long leo_sparse_heap_meta(
+    unsigned int run_index,
+    unsigned int position
+) {
+    return ((unsigned long long)position << 32U) | (unsigned long long)run_index;
+}
+
+__device__ __forceinline__ unsigned int leo_sparse_heap_run(
+    unsigned long long meta
+) {
+    return (unsigned int)meta;
+}
+
+__device__ __forceinline__ unsigned int leo_sparse_heap_position(
+    unsigned long long meta
+) {
+    return (unsigned int)(meta >> 32U);
+}
+
+__device__ __forceinline__ void leo_sparse_heap_sift_down(
+    unsigned long long* shared_selection_keys,
+    unsigned int heap_size,
+    unsigned int root
+) {
+    const unsigned int record_base = LEO_SPARSE_HEAP_RECORD_BASE;
+    const unsigned int meta_base = LEO_SPARSE_HEAP_META_BASE;
+    const unsigned long long replacement_record = shared_selection_keys[record_base + root];
+    const unsigned long long replacement_meta = shared_selection_keys[meta_base + root];
+    unsigned int position = root;
+
+    while (true) {
+        const unsigned int left = position * 2U + 1U;
+        if (left >= heap_size) break;
+        const unsigned int right = left + 1U;
+        unsigned int child = left;
+        if (right < heap_size
+            && shared_selection_keys[record_base + right]
+                > shared_selection_keys[record_base + left]) {
+            child = right;
+        }
+        if (replacement_record >= shared_selection_keys[record_base + child]) break;
+        shared_selection_keys[record_base + position]
+            = shared_selection_keys[record_base + child];
+        shared_selection_keys[meta_base + position]
+            = shared_selection_keys[meta_base + child];
+        position = child;
+    }
+
+    shared_selection_keys[record_base + position] = replacement_record;
+    shared_selection_keys[meta_base + position] = replacement_meta;
 }
 
 __device__ __forceinline__ void leo_bitonic_sort_selection_keys(
@@ -2240,9 +2305,31 @@ __device__ void leo_p_select_global(
 
     if (sparse_merge) {
         if (lane == 0U) {
-            unsigned char run_position[LEO_SPARSE_GLOBAL_RUNS];
-            for (unsigned int index = 0U; index < cfg->block_count; ++index) {
-                run_position[index] = 0U;
+            const unsigned int record_base = LEO_SPARSE_HEAP_RECORD_BASE;
+            const unsigned int meta_base = LEO_SPARSE_HEAP_META_BASE;
+            unsigned int heap_size = 0U;
+
+            // Build one heap node per non-empty pre-sorted model-block run.
+            // The packed record is already Leo's exact finite-positive order,
+            // so heap comparisons are plain unsigned comparisons.
+            for (unsigned int run_index = 0U;
+                 run_index < cfg->block_count;
+                 ++run_index) {
+                const unsigned int source = run_index * run;
+                const float value = block_winner_value[source];
+                if (value <= 0.0f) continue;
+                shared_selection_keys[record_base + heap_size] = leo_selection_record(
+                    value,
+                    block_winner_neuron[source],
+                    rotation,
+                    cfg->neuron_count
+                );
+                shared_selection_keys[meta_base + heap_size]
+                    = leo_sparse_heap_meta(run_index, 0U);
+                heap_size += 1U;
+            }
+            for (unsigned int start = heap_size >> 1U; start > 0U; --start) {
+                leo_sparse_heap_sift_down(shared_selection_keys, heap_size, start - 1U);
             }
 
             const unsigned int cap = cfg->max_active_global;
@@ -2251,33 +2338,39 @@ __device__ void leo_p_select_global(
                 : sparse_total;
             unsigned int produced = 0U;
 
-            while (produced < needed) {
-                unsigned long long best_record = 0ULL;
-                unsigned int best_run = 0xffffffffU;
+            while (produced < needed && heap_size > 0U) {
+                const unsigned long long best_record = shared_selection_keys[record_base];
+                const unsigned long long best_meta = shared_selection_keys[meta_base];
+                shared_selection_keys[produced++] = best_record;
 
-                for (unsigned int run_index = 0U;
-                     run_index < cfg->block_count;
-                     ++run_index) {
-                    const unsigned int position = (unsigned int)run_position[run_index];
-                    if (position >= run) continue;
-                    const unsigned int source = run_index * run + position;
+                const unsigned int best_run = leo_sparse_heap_run(best_meta);
+                const unsigned int next_position = leo_sparse_heap_position(best_meta) + 1U;
+                bool replaced_root = false;
+                if (next_position < run) {
+                    const unsigned int source = best_run * run + next_position;
                     const float value = block_winner_value[source];
-                    if (value <= 0.0f) continue;
-                    const unsigned long long record = leo_selection_record(
-                        value,
-                        block_winner_neuron[source],
-                        rotation,
-                        cfg->neuron_count
-                    );
-                    if (best_run == 0xffffffffU || record > best_record) {
-                        best_record = record;
-                        best_run = run_index;
+                    if (value > 0.0f) {
+                        shared_selection_keys[record_base] = leo_selection_record(
+                            value,
+                            block_winner_neuron[source],
+                            rotation,
+                            cfg->neuron_count
+                        );
+                        shared_selection_keys[meta_base]
+                            = leo_sparse_heap_meta(best_run, next_position);
+                        replaced_root = true;
                     }
                 }
 
-                if (best_run == 0xffffffffU) break;
-                shared_selection_keys[produced++] = best_record;
-                run_position[best_run] += 1U;
+                if (!replaced_root) {
+                    heap_size -= 1U;
+                    if (heap_size == 0U) break;
+                    shared_selection_keys[record_base]
+                        = shared_selection_keys[record_base + heap_size];
+                    shared_selection_keys[meta_base]
+                        = shared_selection_keys[meta_base + heap_size];
+                }
+                leo_sparse_heap_sift_down(shared_selection_keys, heap_size, 0U);
             }
             total = sparse_total;
         }
@@ -5158,7 +5251,8 @@ extern "C" __global__ void leo_shared_wavefront_fused(
 // Learning arithmetic, phase order, replay fraction and FP32 equations are
 // unchanged. Production capture uses the compact loss/activity/error record;
 // the full per-step diagnostic path remains available through the legacy fused
-// kernel when detailed metrics/profiling are requested by the host.
+// kernel when detailed metrics are requested. Phase profiling has a separate
+// grouped persistent wrapper below so it never needs to change execution mode.
 extern "C" __global__ void leo_shared_wavefront_persistent(
     const unsigned long long* pointer_table_addresses,
     const unsigned long long* step_buffer_addresses,
@@ -5239,12 +5333,40 @@ extern "C" __global__ void leo_shared_wavefront_persistent(
     }
 }
 
+enum LeoCudaPhaseProfileCounter {
+    LEO_CUDA_PHASE_PROFILE_SAMPLES = 0,
+    LEO_CUDA_PHASE_PROFILE_PRE = 1,
+    LEO_CUDA_PHASE_PROFILE_SELECT = 2,
+    LEO_CUDA_PHASE_PROFILE_POST_SELECT = 3,
+    LEO_CUDA_PHASE_PROFILE_CACHE_SURROGATE = 4,
+    LEO_CUDA_PHASE_PROFILE_POST_CORE = 5,
+    LEO_CUDA_PHASE_PROFILE_LEARNING_SIGNALS = 6,
+    LEO_CUDA_PHASE_PROFILE_POST_DELTAS = 7,
+    LEO_CUDA_PHASE_PROFILE_HOMEOSTASIS = 8,
+    LEO_CUDA_PHASE_PROFILE_CAPTURE = 9
+};
+
+template <bool PROFILED>
+__device__ __forceinline__ void leo_phase_profile_mark(
+    unsigned long long* phase_profile_counters,
+    unsigned int counter,
+    bool profile_thread,
+    unsigned long long* phase_start
+) {
+    if (PROFILED && profile_thread) {
+        const unsigned long long now = clock64();
+        phase_profile_counters[counter] += now - *phase_start;
+        *phase_start = now;
+    }
+}
+
 // Grouped persistent shared-story executor. Unlike the compatibility
 // persistent kernel above, this launch is an exact multiple of lane_count and
 // assigns blocks_per_lane CTAs to every logical story. Order-sensitive pre and
 // winner-reduction phases remain on the lane leader CTA; sparse/row-independent
 // work and independent output logits use the whole lane group.
-extern "C" __global__ void leo_shared_wavefront_persistent_grouped(
+template <bool PROFILED>
+__device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
     const unsigned long long* pointer_table_addresses,
     const unsigned long long* step_buffer_addresses,
     const unsigned int* step_counts,
@@ -5256,7 +5378,8 @@ extern "C" __global__ void leo_shared_wavefront_persistent_grouped(
     float strength,
     float batch_scale,
     const unsigned long long* delta_pointers,
-    unsigned int blocks_per_lane
+    unsigned int blocks_per_lane,
+    unsigned long long* phase_profile_counters
 ) {
     cooperative_groups::grid_group grid = cooperative_groups::this_grid();
     __shared__ unsigned long long shared_selection_keys[LEO_GLOBAL_SORT];
@@ -5270,6 +5393,11 @@ extern "C" __global__ void leo_shared_wavefront_persistent_grouped(
     const unsigned int lane_thread = lane_block * blockDim.x + threadIdx.x;
     const unsigned int lane_stride = blocks_per_lane * blockDim.x;
     const unsigned int select_work = lane_count * model_block_count;
+    const bool profile_thread = PROFILED
+        && phase_profile_counters != nullptr
+        && blockIdx.x == 0U
+        && threadIdx.x == 0U;
+    unsigned long long phase_start = profile_thread ? clock64() : 0ULL;
     (void)batch_scale;
     (void)delta_pointers;
 
@@ -5301,6 +5429,9 @@ extern "C" __global__ void leo_shared_wavefront_persistent_grouped(
             );
         }
         grid.sync();
+        leo_phase_profile_mark<PROFILED>(
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_PRE, profile_thread, &phase_start
+        );
 
         // Selection is already decomposed over (lane, model_block), so use the
         // entire resident grid rather than restricting it to lane groups.
@@ -5311,6 +5442,9 @@ extern "C" __global__ void leo_shared_wavefront_persistent_grouped(
             );
         }
         grid.sync();
+        leo_phase_profile_mark<PROFILED>(
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_SELECT, profile_thread, &phase_start
+        );
 
         if (active && lane_leader) {
             leo_shared_phase_post_select_lane(
@@ -5319,11 +5453,17 @@ extern "C" __global__ void leo_shared_wavefront_persistent_grouped(
             );
         }
         grid.sync();
+        leo_phase_profile_mark<PROFILED>(
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_POST_SELECT, profile_thread, &phase_start
+        );
 
         if (active) {
             leo_p_cache_surrogate_work(p, tick, lane_thread, lane_stride);
         }
         grid.sync();
+        leo_phase_profile_mark<PROFILED>(
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_CACHE_SURROGATE, profile_thread, &phase_start
+        );
 
         unsigned int* rec_current_list = nullptr;
         unsigned int* rec_current_count = nullptr;
@@ -5393,11 +5533,17 @@ extern "C" __global__ void leo_shared_wavefront_persistent_grouped(
             __syncthreads();
         }
         grid.sync();
+        leo_phase_profile_mark<PROFILED>(
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_POST_CORE, profile_thread, &phase_start
+        );
 
         if (supervised) {
             leo_p_learning_signals_work(p, tick, lane_thread, lane_stride);
         }
         grid.sync();
+        leo_phase_profile_mark<PROFILED>(
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_LEARNING_SIGNALS, profile_thread, &phase_start
+        );
 
         if (supervised) {
             leo_p_update_output_work(p, step.supervised_strength, lane_thread, lane_stride);
@@ -5440,31 +5586,73 @@ extern "C" __global__ void leo_shared_wavefront_persistent_grouped(
             leo_p_inhibitory_homeostasis_work(p, strength, lane_thread, lane_stride);
         }
         grid.sync();
+        leo_phase_profile_mark<PROFILED>(
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_POST_DELTAS, profile_thread, &phase_start
+        );
 
         if (learning_trace) {
             leo_p_homeostasis_work(p, tick, lane_thread, lane_stride);
         }
         grid.sync();
+        leo_phase_profile_mark<PROFILED>(
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_HOMEOSTASIS, profile_thread, &phase_start
+        );
 
         if (active && lane_leader) {
             leo_p_capture_training_step_fast(p, step.target_index, step_index);
         }
         grid.sync();
+        leo_phase_profile_mark<PROFILED>(
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_CAPTURE, profile_thread, &phase_start
+        );
+        if (PROFILED && profile_thread) {
+            phase_profile_counters[LEO_CUDA_PHASE_PROFILE_SAMPLES] += 1ULL;
+        }
     }
 }
 
-enum LeoCudaPhaseProfileCounter {
-    LEO_CUDA_PHASE_PROFILE_SAMPLES = 0,
-    LEO_CUDA_PHASE_PROFILE_PRE = 1,
-    LEO_CUDA_PHASE_PROFILE_SELECT = 2,
-    LEO_CUDA_PHASE_PROFILE_POST_SELECT = 3,
-    LEO_CUDA_PHASE_PROFILE_CACHE_SURROGATE = 4,
-    LEO_CUDA_PHASE_PROFILE_POST_CORE = 5,
-    LEO_CUDA_PHASE_PROFILE_LEARNING_SIGNALS = 6,
-    LEO_CUDA_PHASE_PROFILE_POST_DELTAS = 7,
-    LEO_CUDA_PHASE_PROFILE_HOMEOSTASIS = 8,
-    LEO_CUDA_PHASE_PROFILE_CAPTURE = 9
-};
+extern "C" __global__ void leo_shared_wavefront_persistent_grouped(
+    const unsigned long long* pointer_table_addresses,
+    const unsigned long long* step_buffer_addresses,
+    const unsigned int* step_counts,
+    const unsigned long long* base_ticks,
+    unsigned int lane_count,
+    unsigned int max_step_count,
+    unsigned int model_block_count,
+    unsigned int learning_trace_raw,
+    float strength,
+    float batch_scale,
+    const unsigned long long* delta_pointers,
+    unsigned int blocks_per_lane
+) {
+    leo_shared_wavefront_persistent_grouped_body<false>(
+        pointer_table_addresses, step_buffer_addresses, step_counts, base_ticks, lane_count,
+        max_step_count, model_block_count, learning_trace_raw, strength, batch_scale,
+        delta_pointers, blocks_per_lane, nullptr
+    );
+}
+
+extern "C" __global__ void leo_shared_wavefront_persistent_grouped_profiled(
+    const unsigned long long* pointer_table_addresses,
+    const unsigned long long* step_buffer_addresses,
+    const unsigned int* step_counts,
+    const unsigned long long* base_ticks,
+    unsigned int lane_count,
+    unsigned int max_step_count,
+    unsigned int model_block_count,
+    unsigned int learning_trace_raw,
+    float strength,
+    float batch_scale,
+    const unsigned long long* delta_pointers,
+    unsigned int blocks_per_lane,
+    unsigned long long* phase_profile_counters
+) {
+    leo_shared_wavefront_persistent_grouped_body<true>(
+        pointer_table_addresses, step_buffer_addresses, step_counts, base_ticks, lane_count,
+        max_step_count, model_block_count, learning_trace_raw, strength, batch_scale,
+        delta_pointers, blocks_per_lane, phase_profile_counters
+    );
+}
 
 extern "C" __global__ void leo_shared_wavefront_fused_profiled(
     const unsigned long long* pointer_table_addresses,

@@ -41,6 +41,14 @@ def parse_args():
         default=1,
         help="number of clean measured runs per GPU count; report min/median/max",
     )
+    parser.add_argument(
+        "--legacy-execution",
+        action="store_true",
+        help=(
+            "disable persistent/grouped/device-batch-merge execution optimizations "
+            "for an exact legacy A/B; inherited LEO_* execution switches are otherwise ignored"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -108,21 +116,43 @@ def gpu_heartbeat(devices):
     return "; ".join(rows) if rows else "gpu telemetry unavailable"
 
 
+def benchmark_environment(base_env, legacy_execution=False):
+    env = base_env.copy()
+    explicit = {
+        "LEO_MULTI_GPU",
+        "LEO_CUDA_DEVICE",
+        "LEO_REPLAY_STREAMING",
+        "LEO_MULTI_GPU_PARALLEL_REPLAY",
+        "LEO_CUDA_REPLAY_COOPERATIVE",
+        "LEO_CUDA_SHARED_PERSISTENT",
+        "LEO_CUDA_SHARED_GROUPED",
+        "LEO_CUDA_DEVICE_BATCH_MERGE",
+        "LEO_CUDA_FULL_STEP_METRICS",
+        "LEO_CUDA_REPLAY_BLOCKS",
+        "LEO_CUDA_FROZEN_BLOCKS",
+    }
+    prefixes = (
+        "LEO_CUDA_DEBUG",
+        "LEO_CUDA_REPLAY_PROFILE",
+        "LEO_CUDA_PHASE_PROFILE",
+        "LEO_REPLAY_DEBUG",
+    )
+    for key in list(env):
+        if key in explicit or key.startswith(prefixes):
+            env.pop(key, None)
+
+    if legacy_execution:
+        env["LEO_CUDA_SHARED_PERSISTENT"] = "0"
+        env["LEO_CUDA_SHARED_GROUPED"] = "0"
+        env["LEO_CUDA_DEVICE_BATCH_MERGE"] = "0"
+    return env
+
+
 def run_case(args, devices, count):
     visible = devices[:count]
-    env = os.environ.copy()
+    env = benchmark_environment(os.environ, legacy_execution=args.legacy_execution)
     env["CUDA_VISIBLE_DEVICES"] = ",".join(visible)
-    # Device selection is already expressed by CUDA_VISIBLE_DEVICES. Avoid a
-    # caller's stale LEO_CUDA_DEVICE choosing the wrong visible ordinal.
-    env.pop("LEO_CUDA_DEVICE", None)
     env["LEO_MULTI_GPU"] = "1" if count > 1 else "0"
-
-    # Keep final throughput measurements free of optional profilers/debuggers.
-    for key in list(env):
-        if key.startswith("LEO_CUDA_DEBUG") or key.startswith("LEO_CUDA_REPLAY_PROFILE"):
-            env.pop(key, None)
-        if key.startswith("LEO_REPLAY_DEBUG") or key.startswith("LEO_CUDA_PHASE_PROFILE"):
-            env.pop(key, None)
 
     cmd = [
         str(args.leo),

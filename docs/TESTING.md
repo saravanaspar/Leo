@@ -32,7 +32,7 @@ bash ./scripts/check_gpu.sh
 
 This requires a real NVIDIA GPU/driver environment. The script exercises real CUDA/NVRTC execution rather than treating source inspection as proof of GPU correctness. In particular it runs the production multi-story story-batch path against CPU reference semantics twice: once with replay disabled to isolate the batch-end mean barrier, and once with `replay.fraction = 0.30` to cover replay selection/prefix reconstruction and the resulting canonical model. The gate compares replay counts, revisions, context identity/observations, training statistics, learned-parameter tolerances, and loss.
 
-The same GPU gate deliberately stops one 16-worker autotune process before a candidate is complete, launches a fresh process, and requires `cuda_autotune_resumed`. It also samples the internal phase profiler and requires either a comparable-geometry `cuda_phase_profile` event or an explicit `cuda_phase_profile_skipped` event; instrumentation is never allowed to silently shrink the production grid.
+The same GPU gate deliberately stops one 16-worker autotune process before a candidate is complete, launches a fresh process, and requires `cuda_autotune_resumed`. It also samples the internal phase profiler on the production shared-story path and requires either a comparable-geometry `cuda_phase_profile` event or an explicit `cuda_phase_profile_skipped` event; instrumentation is never allowed to silently shrink the production grid or switch to a different execution kernel.
 
 The GitHub GPU workflow is conditional on a configured `LEO_GPU_RUNNER`. If no GPU runner is configured, a skipped GPU job is **not** evidence that CUDA was tested.
 

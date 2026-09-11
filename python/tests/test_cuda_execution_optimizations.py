@@ -1,3 +1,4 @@
+import runpy
 import unittest
 from pathlib import Path
 
@@ -231,11 +232,15 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("LEO_CUDA_PHASE_PROFILE", cuda)
         self.assertIn("LEO_CUDA_PHASE_PROFILE_STRIDE", cuda)
         self.assertIn("cuda_phase_profile", cuda)
-        self.assertIn("fused_wavefront_only", cuda)
+        self.assertIn("shared_story_batch_production", cuda)
         self.assertIn("profiled_capacity_blocks", cuda)
         self.assertIn("phase_profile_counters", cuda)
         self.assertIn("phase_profile_sample_stride", cuda)
         self.assertIn("shared_wavefront_fused_profiled", cuda)
+        self.assertIn("shared_wavefront_persistent_grouped_profiled", cuda)
+        self.assertIn("shared_grouped_profile_blocks_256", cuda)
+        self.assertIn('"leo_shared_wavefront_persistent_grouped_profiled"', cuda)
+        self.assertNotIn("&& phase_profile_sample_stride.is_none()", cuda)
 
         normal_fused = kernels.split(
             'extern "C" __global__ void leo_shared_wavefront_fused', 1
@@ -247,6 +252,11 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
             'extern "C" __global__ void leo_shared_wavefront_fused_profiled', 1
         )[1].split(
             'extern "C" __global__ void leo_apply_shared_wavefront_deltas', 1
+        )[0]
+        persistent_profiled = kernels.split(
+            "leo_shared_wavefront_persistent_grouped_body", 1
+        )[1].split(
+            'extern "C" __global__ void leo_shared_wavefront_persistent_grouped(', 1
         )[0]
         for phase in (
             "LEO_CUDA_PHASE_PROFILE_PRE",
@@ -263,6 +273,9 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("clock64()", profiled)
         self.assertIn("grid.sync();", profiled)
         self.assertNotIn("atomicAdd", profiled)
+        self.assertIn("leo_phase_profile_mark<PROFILED>", persistent_profiled)
+        self.assertIn("LEO_CUDA_PHASE_PROFILE_SAMPLES", persistent_profiled)
+        self.assertIn("leo_shared_phase_select_block_fast", persistent_profiled)
         self.assertIn(
             "fused_profile_blocks_256 >= grid_blocks",
             cuda,
@@ -536,6 +549,40 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertNotIn("upload_current_sparse_model", cuda)
         self.assertIn("fn synchronize_packed_model", backend)
 
+    def test_scaling_benchmark_environment_is_hermetic(self):
+        scaling = runpy.run_path(ROOT / "scripts/benchmark_multi_gpu.py")
+        benchmark_environment = scaling["benchmark_environment"]
+        dirty = {
+            "PATH": "/bin",
+            "KEEP_ME": "yes",
+            "LEO_MULTI_GPU": "1",
+            "LEO_REPLAY_STREAMING": "1",
+            "LEO_MULTI_GPU_PARALLEL_REPLAY": "1",
+            "LEO_CUDA_SHARED_PERSISTENT": "0",
+            "LEO_CUDA_SHARED_GROUPED": "0",
+            "LEO_CUDA_DEVICE_BATCH_MERGE": "0",
+            "LEO_CUDA_FULL_STEP_METRICS": "1",
+            "LEO_CUDA_DEBUG_LAUNCHES": "1",
+            "LEO_CUDA_REPLAY_PROFILE_STRIDE": "1",
+            "LEO_CUDA_PHASE_PROFILE": "1",
+            "LEO_REPLAY_DEBUG_SEGMENTS": "1",
+        }
+
+        clean = benchmark_environment(dirty)
+        self.assertEqual(clean["KEEP_ME"], "yes")
+        self.assertEqual(clean["PATH"], "/bin")
+        self.assertFalse(any(key.startswith("LEO_") for key in clean))
+
+        legacy = benchmark_environment(dirty, legacy_execution=True)
+        self.assertEqual(legacy["KEEP_ME"], "yes")
+        self.assertEqual(legacy["LEO_CUDA_SHARED_PERSISTENT"], "0")
+        self.assertEqual(legacy["LEO_CUDA_SHARED_GROUPED"], "0")
+        self.assertEqual(legacy["LEO_CUDA_DEVICE_BATCH_MERGE"], "0")
+        self.assertNotIn("LEO_REPLAY_STREAMING", legacy)
+        self.assertNotIn("LEO_MULTI_GPU_PARALLEL_REPLAY", legacy)
+        self.assertNotIn("LEO_CUDA_FULL_STEP_METRICS", legacy)
+        self.assertNotIn("LEO_CUDA_DEBUG_LAUNCHES", legacy)
+
     def test_multi_gpu_exactness_and_reproducibility_gates_are_present(self):
         training = (ROOT / "crates/leo-cli/src/training.rs").read_text()
         lifecycle = (ROOT / "crates/leo-cli/src/training/lifecycle.rs").read_text()
@@ -556,6 +603,13 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("selectors.DefaultSelector", scaling)
         self.assertIn("gpu_heartbeat", scaling)
         self.assertIn("training_state_sha256", scaling)
+        self.assertIn("benchmark_environment", scaling)
+        self.assertIn("LEO_REPLAY_STREAMING", scaling)
+        self.assertIn("LEO_MULTI_GPU_PARALLEL_REPLAY", scaling)
+        self.assertIn("--legacy-execution", scaling)
+        self.assertIn("unset LEO_REPLAY_STREAMING", gpu_gate)
+        self.assertIn("unset LEO_MULTI_GPU_PARALLEL_REPLAY", gpu_gate)
+        self.assertIn("unset LEO_CUDA_FULL_STEP_METRICS", gpu_gate)
         self.assertIn("--counts 1,2", gpu_gate)
         self.assertIn("final-state conformance gate", gpu_gate)
 
@@ -716,7 +770,11 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("LEO_CUDA_SHARED_PERSISTENT=0", gpu_gate)
         self.assertIn("LEO_CUDA_SHARED_GROUPED=0", gpu_gate)
         self.assertIn("LEO_CUDA_DEVICE_BATCH_MERGE=0", gpu_gate)
-        self.assertIn("Persistent/grouped/device-merge CUDA exact-state gate OK", gpu_gate)
+        self.assertIn("Optimized-vs-legacy CUDA exact-state gate OK", gpu_gate)
+        self.assertIn("LEO_CUDA_DEBUG_LAUNCHES=1", gpu_gate)
+        self.assertIn("optimized_kernel=", gpu_gate)
+        self.assertIn("device_batch_merge_observed", gpu_gate)
+        self.assertIn("device_batch_merge=true", gpu_gate)
         self.assertIn("training_state_sha256", gpu_gate)
 
     def test_grouped_shared_wavefront_parallelizes_each_logical_lane(self):
@@ -724,8 +782,10 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
 
         grouped = kernels.split(
-            'extern "C" __global__ void leo_shared_wavefront_persistent_grouped', 1
-        )[1].split("enum LeoCudaPhaseProfileCounter", 1)[0]
+            "leo_shared_wavefront_persistent_grouped_body", 1
+        )[1].split(
+            'extern "C" __global__ void leo_shared_wavefront_persistent_grouped(', 1
+        )[0]
         self.assertIn("blocks_per_lane", grouped)
         self.assertIn("lane = blockIdx.x / blocks_per_lane", grouped)
         self.assertIn("lane_thread", grouped)
@@ -750,6 +810,8 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("if (lane_changed)", merge)
         self.assertIn("leo_mark_changed", merge)
         self.assertIn("LEO_CUDA_DEVICE_BATCH_MERGE", rust)
+        self.assertIn(r'\"scope\":\"device_batch_merge', rust)
+        self.assertIn("leo_merge_shared_lane_fixed_parameters", rust)
         self.assertIn("snapshot_batch_lane_context_values_batched", rust)
         # Device merge must include every input symbol: 256 bytes plus the
         # BEGIN_DOCUMENT and END_DOCUMENT control symbols.

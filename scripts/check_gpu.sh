@@ -4,6 +4,29 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
+# The GPU acceptance gate must be hermetic.  Clear inherited Leo execution,
+# experimental, geometry, debug, and profiling switches before establishing
+# each case explicitly below.  CUDA_VISIBLE_DEVICES is intentionally retained
+# because callers use it to choose the physical devices under test.
+unset LEO_MULTI_GPU
+unset LEO_CUDA_DEVICE
+unset LEO_REPLAY_STREAMING
+unset LEO_MULTI_GPU_PARALLEL_REPLAY
+unset LEO_CUDA_REPLAY_COOPERATIVE
+unset LEO_CUDA_SHARED_PERSISTENT
+unset LEO_CUDA_SHARED_GROUPED
+unset LEO_CUDA_DEVICE_BATCH_MERGE
+unset LEO_CUDA_FULL_STEP_METRICS
+unset LEO_CUDA_REPLAY_BLOCKS
+unset LEO_CUDA_FROZEN_BLOCKS
+while IFS='=' read -r name _; do
+  case "$name" in
+    LEO_CUDA_DEBUG*|LEO_CUDA_REPLAY_PROFILE*|LEO_CUDA_PHASE_PROFILE*|LEO_REPLAY_DEBUG*)
+      unset "$name"
+      ;;
+  esac
+done < <(env)
+
 command -v cargo >/dev/null 2>&1 || { echo "cargo is required" >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 2; }
 command -v nvidia-smi >/dev/null 2>&1 || { echo "nvidia-smi is required" >&2; exit 2; }
@@ -276,13 +299,17 @@ for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
 if not phase_events:
     raise SystemExit("phase-profiler GPU run emitted neither a profile nor an explicit skip")
 for event in phase_events:
+    if event.get("scope") != "shared_story_batch_production":
+        raise SystemExit(f"phase profiler did not report production shared-story scope: {event}")
     if event.get("event") == "cuda_phase_profile":
+        if event.get("profiled_kernel") != "leo_shared_wavefront_persistent_grouped_profiled":
+            raise SystemExit(f"phase profiler sampled the wrong production kernel: {event}")
         normal = int(event.get("normal_capacity_blocks", 0))
         profiled = int(event.get("profiled_capacity_blocks", 0))
         sampled_grid = int(event.get("sampled_grid_blocks_max", 0))
         if sampled_grid <= 0 or normal < sampled_grid or profiled < sampled_grid:
             raise SystemExit(f"phase profile used non-comparable launch geometry: {event}")
-print("CUDA phase-profiler geometry gate OK")
+print("CUDA phase-profiler production-geometry gate OK")
 PY
 
 # Exercise replay-specific diagnostics on a short real GPU path. Profiling is
@@ -374,6 +401,7 @@ PY
 # exact same starting model and story sequence.
 PERSISTENT_LOG="$TMP/gpu-persistent-shared.log"
 LEGACY_LOG="$TMP/gpu-legacy-shared.log"
+LEO_CUDA_DEBUG_LAUNCHES=1 \
 LEO_MULTI_GPU=0 "$LEO" benchmark \
   --train \
   --model "$TMP/model.pscls" \
@@ -414,9 +442,34 @@ def final_benchmark(path):
         raise SystemExit(f"no training_benchmark event in {path}")
     return events[-1]
 
-persistent = final_benchmark(sys.argv[1])
-legacy = final_benchmark(sys.argv[2])
-for event, label in ((persistent, "persistent"), (legacy, "legacy")):
+persistent_path = Path(sys.argv[1])
+legacy_path = Path(sys.argv[2])
+persistent = final_benchmark(persistent_path)
+legacy = final_benchmark(legacy_path)
+
+observed_kernels = []
+device_batch_merge_observed = False
+for raw in persistent_path.read_text(encoding="utf-8").splitlines():
+    raw = raw.strip()
+    if not raw.startswith("{"):
+        continue
+    try:
+        event = json.loads(raw)
+    except json.JSONDecodeError:
+        continue
+    if event.get("event") != "cuda_debug_launch":
+        continue
+    if event.get("scope") == "shared_story_batch":
+        kernel = event.get("kernel")
+        if kernel and kernel not in observed_kernels:
+            observed_kernels.append(kernel)
+    elif (
+        event.get("scope") == "device_batch_merge"
+        and event.get("kernel") == "leo_merge_shared_lane_fixed_parameters"
+    ):
+        device_batch_merge_observed = True
+
+for event, label in ((persistent, "optimized"), (legacy, "legacy")):
     if not event.get("training_state_sha256"):
         raise SystemExit(f"{label} benchmark missing training_state_sha256")
     if round(float(event.get("replay_fraction", -1.0)), 2) != 0.30:
@@ -428,9 +481,14 @@ if persistent["training_state_sha256"] != legacy["training_state_sha256"]:
         f"persistent={persistent['training_state_sha256']} "
         f"legacy={legacy['training_state_sha256']}"
     )
+if not device_batch_merge_observed:
+    raise SystemExit("optimized exact-state leg did not execute device batch merge")
+kernel_summary = ",".join(observed_kernels) if observed_kernels else "fallback/no-persistent-launch-observed"
 print(
-    "Persistent/grouped/device-merge CUDA exact-state gate OK:",
+    "Optimized-vs-legacy CUDA exact-state gate OK:",
     persistent["training_state_sha256"],
+    f"optimized_kernel={kernel_summary}",
+    "device_batch_merge=true",
 )
 PY
 
