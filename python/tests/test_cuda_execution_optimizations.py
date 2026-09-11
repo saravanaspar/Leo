@@ -802,7 +802,7 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         grouped = kernels.split(
             "leo_shared_wavefront_persistent_grouped_body", 1
         )[1].split(
-            'extern "C" __global__ void leo_shared_wavefront_persistent_grouped(', 1
+            "leo_shared_wavefront_persistent_grouped(", 1
         )[0]
         self.assertIn("lane = blockIdx.x % lane_count", grouped)
         self.assertIn("lane_block = blockIdx.x / lane_count", grouped)
@@ -812,7 +812,19 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("step_index < max_step_count", grouped)
         self.assertIn("active = lane_valid && step_index < lane_step_count", grouped)
         self.assertNotIn("leo_lane_group_barrier", kernels)
-        self.assertGreaterEqual(grouped.count("grid.sync();"), 19)
+        self.assertGreaterEqual(
+            grouped.count("cooperative_groups::this_grid().sync();"), 19
+        )
+        self.assertNotIn("cooperative_groups::grid_group grid", grouped)
+        self.assertNotIn("rec_current_list = nullptr", grouped)
+        self.assertIn(
+            "__launch_bounds__(256, 2)\nleo_shared_wavefront_persistent_grouped(",
+            kernels,
+        )
+        self.assertIn(
+            "__launch_bounds__(256, 2)\nleo_shared_wavefront_persistent_grouped_profiled(",
+            kernels,
+        )
         self.assertIn("lane_thread", grouped)
         self.assertIn("lane_stride", grouped)
         self.assertIn("leo_p_forward_context_latent_work", grouped)
@@ -829,6 +841,7 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         gpu_gate = (ROOT / "scripts/check_gpu.sh").read_text()
         self.assertIn("Full-capacity grouped exact-state gate OK", gpu_gate)
         self.assertIn("blocks_per_lane_max", gpu_gate)
+        self.assertIn("Grouped residency gate OK", gpu_gate)
 
     def test_grouped_cta_remainder_distribution_covers_each_model_block_once(self):
         for grid_blocks in (16, 17, 31, 48, 55, 56, 112):

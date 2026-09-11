@@ -701,6 +701,39 @@ launches = [
 ]
 if not launches:
     raise SystemExit("full-capacity grouped gate did not observe grouped production launch")
+
+resources = [
+    row
+    for row in a_events
+    if row.get("event") == "cuda_kernel_resources"
+    and row.get("kernel") == "leo_shared_wavefront_persistent_grouped"
+]
+runtimes = [row for row in a_events if row.get("event") == "cuda_debug_runtime"]
+if not resources or not runtimes:
+    raise SystemExit("full-capacity grouped gate is missing runtime/resource telemetry")
+resource = resources[-1]
+runtime = runtimes[-1]
+blocks_per_sm = float(resource.get("blocks_per_sm", 0.0))
+occupancy = float(resource.get("theoretical_thread_occupancy", 0.0))
+capacity = int(resource.get("cooperative_capacity_blocks", 0))
+sm_count = int(runtime.get("sm_count", 0))
+if blocks_per_sm < 2.0:
+    raise SystemExit(f"grouped kernel residency below two CTAs/SM: {resource}")
+if occupancy < 0.25:
+    raise SystemExit(f"grouped kernel theoretical occupancy below 25%: {resource}")
+if sm_count <= 0 or capacity < 2 * sm_count:
+    raise SystemExit(
+        "grouped cooperative capacity does not cover two CTAs per SM: "
+        f"capacity={capacity} sm_count={sm_count}"
+    )
+print(
+    "Grouped residency gate OK:",
+    f"registers_per_thread={resource.get('registers_per_thread')}",
+    f"blocks_per_sm={blocks_per_sm}",
+    f"occupancy={occupancy}",
+    f"cooperative_capacity_blocks={capacity}",
+)
+
 max_blocks_per_lane = max(int(row.get("blocks_per_lane_max", 0)) for row in launches)
 if max_blocks_per_lane < 3:
     print(

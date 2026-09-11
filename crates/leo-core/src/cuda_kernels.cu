@@ -5611,7 +5611,6 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
     unsigned int* lane_barrier_epochs,
     unsigned long long* phase_profile_counters
 ) {
-    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
     __shared__ unsigned long long shared_selection_keys[LEO_GLOBAL_SORT];
     __shared__ float shared_reduction[512];
     if (lane_count == 0U || gridDim.x < lane_count) return;
@@ -5670,7 +5669,7 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
                 lane_count, step_index, learning_trace_raw, lane
             );
         }
-        grid.sync();
+        cooperative_groups::this_grid().sync();
         leo_phase_profile_mark<PROFILED>(
             phase_profile_counters, LEO_CUDA_PHASE_PROFILE_PRE, profile_step_thread, &phase_start
         );
@@ -5686,7 +5685,7 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
                 step_index, model_block_count, work, shared_selection_keys
             );
         }
-        grid.sync();
+        cooperative_groups::this_grid().sync();
         leo_phase_profile_mark<PROFILED>(
             phase_profile_counters, LEO_CUDA_PHASE_PROFILE_SELECT, profile_step_thread, &phase_start
         );
@@ -5697,7 +5696,7 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
                 step_index, lane, shared_selection_keys
             );
         }
-        grid.sync();
+        cooperative_groups::this_grid().sync();
         leo_phase_profile_mark<PROFILED>(
             phase_profile_counters, LEO_CUDA_PHASE_PROFILE_POST_SELECT, profile_step_thread, &phase_start
         );
@@ -5705,79 +5704,77 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
         if (active) {
             leo_p_cache_surrogate_work(p, tick, lane_thread, lane_stride);
         }
-        grid.sync();
+        cooperative_groups::this_grid().sync();
         leo_phase_profile_mark<PROFILED>(
             phase_profile_counters, LEO_CUDA_PHASE_PROFILE_CACHE_SURROGATE, profile_step_thread, &phase_start
         );
 
-        unsigned int* rec_current_list = nullptr;
-        unsigned int* rec_current_count = nullptr;
-        unsigned int* rec_next_list = nullptr;
-        unsigned int* rec_next_count = nullptr;
-        unsigned int* input_current_list = nullptr;
-        unsigned int* input_current_count = nullptr;
-        unsigned int* input_next_list = nullptr;
-        unsigned int* input_next_count = nullptr;
-        if (active) {
+        // Rebuild ping-pong eligibility pointers only in the phases that consume
+        // them. Keeping eight 64-bit pointers live across the whole persistent
+        // step inflated register pressure enough to halve Pascal residency.
+        if (learning_trace && lane_leader && threadIdx.x == 0U) {
+            const bool even = (step_index & 1U) == 0U;
+            unsigned int* rec_a_count = leo_p_ptr<unsigned int>(p, LEO_P_REC_ELIGIBLE_COUNT);
+            unsigned int* rec_b_count = leo_p_ptr<unsigned int>(p, LEO_P_REC_NEXT_ELIGIBLE_COUNT);
+            unsigned int* input_a_count = leo_p_ptr<unsigned int>(p, LEO_P_INPUT_ELIGIBLE_COUNT);
+            unsigned int* input_b_count = leo_p_ptr<unsigned int>(p, LEO_P_INPUT_NEXT_ELIGIBLE_COUNT);
+            *(even ? rec_b_count : rec_a_count) = 0U;
+            *(even ? input_b_count : input_a_count) = 0U;
+        }
+        cooperative_groups::this_grid().sync();
+
+        if (learning_trace) {
+            const bool even = (step_index & 1U) == 0U;
             unsigned int* rec_a_list = leo_p_ptr<unsigned int>(p, LEO_P_REC_ELIGIBLE_LIST);
             unsigned int* rec_a_count = leo_p_ptr<unsigned int>(p, LEO_P_REC_ELIGIBLE_COUNT);
             unsigned int* rec_b_list = leo_p_ptr<unsigned int>(p, LEO_P_REC_NEXT_ELIGIBLE_LIST);
             unsigned int* rec_b_count = leo_p_ptr<unsigned int>(p, LEO_P_REC_NEXT_ELIGIBLE_COUNT);
+            leo_p_update_recurrent_eligibility_work_fast(
+                p, tick,
+                even ? rec_a_list : rec_b_list,
+                even ? rec_a_count : rec_b_count,
+                even ? rec_b_list : rec_a_list,
+                even ? rec_b_count : rec_a_count,
+                lane_thread, lane_stride
+            );
+        }
+        cooperative_groups::this_grid().sync();
+
+        if (learning_trace) {
+            const bool even = (step_index & 1U) == 0U;
             unsigned int* input_a_list = leo_p_ptr<unsigned int>(p, LEO_P_INPUT_ELIGIBLE_LIST);
             unsigned int* input_a_count = leo_p_ptr<unsigned int>(p, LEO_P_INPUT_ELIGIBLE_COUNT);
             unsigned int* input_b_list = leo_p_ptr<unsigned int>(p, LEO_P_INPUT_NEXT_ELIGIBLE_LIST);
             unsigned int* input_b_count = leo_p_ptr<unsigned int>(p, LEO_P_INPUT_NEXT_ELIGIBLE_COUNT);
-            const bool even = (step_index & 1U) == 0U;
-            rec_current_list = even ? rec_a_list : rec_b_list;
-            rec_current_count = even ? rec_a_count : rec_b_count;
-            rec_next_list = even ? rec_b_list : rec_a_list;
-            rec_next_count = even ? rec_b_count : rec_a_count;
-            input_current_list = even ? input_a_list : input_b_list;
-            input_current_count = even ? input_a_count : input_b_count;
-            input_next_list = even ? input_b_list : input_a_list;
-            input_next_count = even ? input_b_count : input_a_count;
-        }
-
-        if (learning_trace && lane_leader && threadIdx.x == 0U) {
-            *rec_next_count = 0U;
-            *input_next_count = 0U;
-        }
-        grid.sync();
-
-        if (learning_trace) {
-            leo_p_update_recurrent_eligibility_work_fast(
-                p, tick, rec_current_list, rec_current_count, rec_next_list,
-                rec_next_count, lane_thread, lane_stride
-            );
-        }
-        grid.sync();
-
-        if (learning_trace) {
             leo_p_update_input_eligibility_work_fast(
-                p, tick, input_current_list, input_current_count, input_next_list,
-                input_next_count, lane_thread, lane_stride
+                p, tick,
+                even ? input_a_list : input_b_list,
+                even ? input_a_count : input_b_count,
+                even ? input_b_list : input_a_list,
+                even ? input_b_count : input_a_count,
+                lane_thread, lane_stride
             );
         }
-        grid.sync();
+        cooperative_groups::this_grid().sync();
 
         if (active) {
             leo_p_post_and_emit_work(p, tick, lane_thread, lane_stride);
         }
-        grid.sync();
+        cooperative_groups::this_grid().sync();
 
         if (active) {
             leo_p_forward_context_latent_work(p, lane_thread, lane_stride);
         }
-        grid.sync();
+        cooperative_groups::this_grid().sync();
         if (active) {
             leo_p_forward_logits_work(p, lane_thread, lane_stride);
         }
-        grid.sync();
+        cooperative_groups::this_grid().sync();
         if (active && lane_leader) {
             leo_p_forward_finalize(p, step.target_index, shared_reduction);
             __syncthreads();
         }
-        grid.sync();
+        cooperative_groups::this_grid().sync();
         leo_phase_profile_mark<PROFILED>(
             phase_profile_counters, LEO_CUDA_PHASE_PROFILE_POST_CORE, profile_step_thread, &phase_start
         );
@@ -5785,7 +5782,7 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
         if (supervised) {
             leo_p_learning_signals_work(p, tick, lane_thread, lane_stride);
         }
-        grid.sync();
+        cooperative_groups::this_grid().sync();
         leo_phase_profile_mark<PROFILED>(
             phase_profile_counters, LEO_CUDA_PHASE_PROFILE_LEARNING_SIGNALS, profile_step_thread, &phase_start
         );
@@ -5793,36 +5790,50 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
         if (supervised) {
             leo_p_update_output_work(p, step.supervised_strength, lane_thread, lane_stride);
         }
-        grid.sync();
+        cooperative_groups::this_grid().sync();
 
         if (supervised && context_enabled) {
             leo_p_update_context_work(p, step.supervised_strength, lane_thread, lane_stride);
         }
-        grid.sync();
+        cooperative_groups::this_grid().sync();
 
         if (supervised) {
+            const bool even = (step_index & 1U) == 0U;
+            const unsigned int* rec_a_list = leo_p_ptr<unsigned int>(p, LEO_P_REC_ELIGIBLE_LIST);
+            const unsigned int* rec_a_count = leo_p_ptr<unsigned int>(p, LEO_P_REC_ELIGIBLE_COUNT);
+            const unsigned int* rec_b_list = leo_p_ptr<unsigned int>(p, LEO_P_REC_NEXT_ELIGIBLE_LIST);
+            const unsigned int* rec_b_count = leo_p_ptr<unsigned int>(p, LEO_P_REC_NEXT_ELIGIBLE_COUNT);
             const unsigned int* learning_rec_list = learning_trace
-                ? rec_next_list : rec_current_list;
+                ? (even ? rec_b_list : rec_a_list)
+                : (even ? rec_a_list : rec_b_list);
             const unsigned int* learning_rec_count = learning_trace
-                ? rec_next_count : rec_current_count;
+                ? (even ? rec_b_count : rec_a_count)
+                : (even ? rec_a_count : rec_b_count);
             leo_p_update_recurrent_weights_work_fast(
                 p, learning_rec_list, learning_rec_count, step.supervised_strength,
                 lane_thread, lane_stride
             );
         }
-        grid.sync();
+        cooperative_groups::this_grid().sync();
 
         if (supervised) {
+            const bool even = (step_index & 1U) == 0U;
+            const unsigned int* input_a_list = leo_p_ptr<unsigned int>(p, LEO_P_INPUT_ELIGIBLE_LIST);
+            const unsigned int* input_a_count = leo_p_ptr<unsigned int>(p, LEO_P_INPUT_ELIGIBLE_COUNT);
+            const unsigned int* input_b_list = leo_p_ptr<unsigned int>(p, LEO_P_INPUT_NEXT_ELIGIBLE_LIST);
+            const unsigned int* input_b_count = leo_p_ptr<unsigned int>(p, LEO_P_INPUT_NEXT_ELIGIBLE_COUNT);
             const unsigned int* learning_input_list = learning_trace
-                ? input_next_list : input_current_list;
+                ? (even ? input_b_list : input_a_list)
+                : (even ? input_a_list : input_b_list);
             const unsigned int* learning_input_count = learning_trace
-                ? input_next_count : input_current_count;
+                ? (even ? input_b_count : input_a_count)
+                : (even ? input_a_count : input_b_count);
             leo_p_update_input_weights_work_fast(
                 p, learning_input_list, learning_input_count, step.supervised_strength,
                 lane_thread, lane_stride
             );
         }
-        grid.sync();
+        cooperative_groups::this_grid().sync();
 
         // Recurrent supervised updates and inhibitory homeostasis touch the
         // same recurrent weights, so keep an explicit grid barrier between
@@ -5830,7 +5841,7 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
         if (supervised) {
             leo_p_inhibitory_homeostasis_work(p, strength, lane_thread, lane_stride);
         }
-        grid.sync();
+        cooperative_groups::this_grid().sync();
         leo_phase_profile_mark<PROFILED>(
             phase_profile_counters, LEO_CUDA_PHASE_PROFILE_POST_DELTAS, profile_step_thread, &phase_start
         );
@@ -5838,7 +5849,7 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
         if (learning_trace) {
             leo_p_homeostasis_work(p, tick, lane_thread, lane_stride);
         }
-        grid.sync();
+        cooperative_groups::this_grid().sync();
         leo_phase_profile_mark<PROFILED>(
             phase_profile_counters, LEO_CUDA_PHASE_PROFILE_HOMEOSTASIS, profile_step_thread, &phase_start
         );
@@ -5846,7 +5857,7 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
         if (active && lane_leader) {
             leo_p_capture_training_step_fast(p, step.target_index, step_index);
         }
-        grid.sync();
+        cooperative_groups::this_grid().sync();
         leo_phase_profile_mark<PROFILED>(
             phase_profile_counters, LEO_CUDA_PHASE_PROFILE_CAPTURE, profile_step_thread, &phase_start
         );
@@ -5856,7 +5867,9 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
     }
 }
 
-extern "C" __global__ void leo_shared_wavefront_persistent_grouped(
+extern "C" __global__ void
+__launch_bounds__(256, 2)
+leo_shared_wavefront_persistent_grouped(
     const unsigned long long* pointer_table_addresses,
     const unsigned long long* step_buffer_addresses,
     const unsigned int* step_counts,
@@ -5879,7 +5892,9 @@ extern "C" __global__ void leo_shared_wavefront_persistent_grouped(
     );
 }
 
-extern "C" __global__ void leo_shared_wavefront_persistent_grouped_profiled(
+extern "C" __global__ void
+__launch_bounds__(256, 2)
+leo_shared_wavefront_persistent_grouped_profiled(
     const unsigned long long* pointer_table_addresses,
     const unsigned long long* step_buffer_addresses,
     const unsigned int* step_counts,
