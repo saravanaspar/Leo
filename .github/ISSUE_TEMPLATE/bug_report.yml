@@ -12,7 +12,7 @@ body:
     attributes:
       label: Leo version / commit
       description: Prefer the exact git commit hash.
-      placeholder: v1.0.1 / abc1234
+      placeholder: vX.Y.Z / abc1234
     validations:
       required: true
   - type: input

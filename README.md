@@ -1,4 +1,4 @@
-# Leo v1.0.1
+# Leo
 
 <p align="center">
   <strong>Open-source AI source code for a sparse recurrent byte-learning system with a CPU reference backend and a custom NVIDIA CUDA backend.</strong>
@@ -9,7 +9,7 @@
   <a href="https://github.com/saravanaspar/Leo/actions/workflows/gpu-ci.yml"><img alt="GPU CI" src="https://github.com/saravanaspar/Leo/actions/workflows/gpu-ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
   <img alt="Rust 1.85" src="https://img.shields.io/badge/Rust-1.85%2B-orange.svg">
-  <img alt="Version 1.0.1" src="https://img.shields.io/badge/version-1.0.1-informational.svg">
+  <a href="https://github.com/saravanaspar/Leo/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/saravanaspar/Leo?display_name=tag"></a>
 </p>
 
 <p align="center">
@@ -25,7 +25,7 @@
 > [!IMPORTANT]
 > **Current public development and quality testing is specifically centered on the [TinyStories dataset](https://huggingface.co/datasets/roneneldan/TinyStories).** Leo is research-oriented AI source code. Passing repository tests proves implementation invariants; it does not by itself prove model quality, generalization, or production readiness.
 
-Leo v1.0.1 is the current patch release of the clean v1 durability baseline for fresh training and long-lived experiments. It keeps **FP32 learning semantics**, **30% bounded-surprise replay** in the standard configurations, strict artifact identity, checkpoint/resume safety, a CPU reference path, and execution-only CUDA optimization.
+Leo maintains a clean v1 durability baseline for fresh training and long-lived experiments. It keeps **FP32 learning semantics**, **30% bounded-surprise replay** in the standard configurations, strict artifact identity, checkpoint/resume safety, a CPU reference path, and execution-focused CUDA optimization. Release numbers are tracked by GitHub Releases rather than hardcoded into this README.
 
 ## Project status
 
@@ -38,8 +38,8 @@ Leo v1.0.1 is the current patch release of the clean v1 durability baseline for 
 | Async pinned H2D/D2H pipeline | Supported |
 | Cooperative fused wavefront | Preferred when hardware supports it |
 | Multi-GPU training | Exact logical-batch data parallelism implemented; multi-GPU hardware validation required; replay remains canonical/serial |
-| FP16/BF16 training | Not part of v1.0.1 |
-| Dynamic topology growth | Not part of v1.0.1 |
+| FP16/BF16 training | Not part of the stable v1 contract |
+| Dynamic topology growth | Not part of the stable v1 contract |
 | Pre-v1 artifact compatibility | Intentionally not supported |
 
 ### Core v1 guarantees
@@ -109,7 +109,7 @@ bash ./scripts/check.sh
 ```
 
 > [!NOTE]
-> `Cargo.lock` should be committed for the v1.0.1 application baseline. Dependency changes should be explicit, reviewed, and validated rather than silently drifting between training environments.
+> `Cargo.lock` should be committed for every application release. Dependency changes should be explicit, reviewed, and validated rather than silently drifting between training environments.
 
 ---
 
@@ -226,6 +226,7 @@ Leo/
 - [Testing strategy](docs/TESTING.md)
 - [Reproducibility](docs/REPRODUCIBILITY.md)
 - [Optimized training guide](docs/TRAINING-GUIDE.md)
+- [Releasing](docs/RELEASING.md)
 - [Training/CUDA debugging](docs/DEBUGGING.md)
 
 Historical GPU stage documents remain in `docs/` as implementation history; the current v1 contract is defined by the files above and the code.

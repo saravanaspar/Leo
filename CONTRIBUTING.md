@@ -88,7 +88,7 @@ perf/<short-description>
 
 ## Semantic compatibility rules
 
-The following are part of the v1.0.1 learning/execution contract and must not change accidentally:
+The following are part of the stable v1 learning/execution contract and must not change accidentally:
 
 - FP32 training semantics
 - standard bounded-surprise replay fraction of 30%
@@ -181,3 +181,7 @@ Before requesting review, confirm:
 - [ ] no external dataset or generated run artifacts were committed.
 
 By participating, you agree to follow [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
+## Releases
+
+Software releases are prepared and published through the automated GitHub Actions flow documented in [docs/RELEASING.md](docs/RELEASING.md).

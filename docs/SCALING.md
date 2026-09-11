@@ -1,6 +1,6 @@
 # Leo scaling architecture
 
-Leo's unreleased scaling work on top of v1.0.1 keeps one learning contract while
+Leo's scaling work keeps one stable v1 learning contract while
 allowing the execution layer to use more CUDA devices. The model, replay policy,
 FP32 arithmetic, logical worker count, and canonical mean barrier are semantic
 inputs; physical GPU placement is not. Multi-GPU production acceptance still

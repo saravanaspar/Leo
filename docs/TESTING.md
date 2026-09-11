@@ -1,4 +1,4 @@
-# Leo v1.0.1 testing strategy
+# Leo testing strategy
 
 ## Purpose
 

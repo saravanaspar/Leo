@@ -1,4 +1,4 @@
-# Leo v1.0.1 training and CUDA debugging
+# Leo training and CUDA debugging
 
 Leo keeps debugging separate from the learning contract. The options below do **not** change the configured replay fraction, story/range order, logical `--workers` batch, canonical mean barrier, or FP32 learning equations. Heavy CUDA phase profiling is intentionally opt-in because instrumentation adds barriers and timing overhead.
 
