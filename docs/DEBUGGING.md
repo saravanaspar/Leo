@@ -115,15 +115,16 @@ These controls change execution geometry only; they do not change replay selecti
 
 These overrides are useful for diagnosing barrier-vs-parallel-work tradeoffs on a new GPU. Do not treat them as learning hyperparameters.
 
-## Existing fused-wavefront profiler
+## Production shared-story profiler
 
-The production logical story-batch path retains its existing sampled profiler:
+The logical story-batch path has a sampled profiler that stays on the production
+persistent/grouped execution path instead of switching to the legacy fused path:
 
 - `LEO_CUDA_PHASE_PROFILE=1`
 - `LEO_CUDA_PHASE_PROFILE_STRIDE=N`
 - events `cuda_phase_profile` / `cuda_phase_profile_skipped`
 
-This profiler covers the multi-story fused wavefront. The replay profiler above covers the separate single-story replay and frozen-prefix paths.
+When the grouped profiled kernel cannot sustain the same cooperative grid width, Leo leaves production execution unchanged and emits `cuda_phase_profile_skipped` rather than shrinking the grid or switching kernels. The replay profiler above covers the separate single-story replay and frozen-prefix paths.
 
 ## Recommended debugging ladder
 

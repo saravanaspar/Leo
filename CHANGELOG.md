@@ -4,9 +4,13 @@ All notable project changes should be recorded here.
 
 ## Unreleased
 
+- Replace the sparse global winner selector's repeated 128-run linear scan with an exact shared-memory max-heap merge, preserving packed ordering, cutoff behavior, and the dense/non-finite fallback.
+- Make GPU acceptance/scaling helpers ignore inherited semantic/debug/rollback environment switches by default; add `--legacy-execution` for explicit exact legacy A/B runs and report the optimized shared kernel actually observed by the GPU gate.
+- Keep `LEO_CUDA_PHASE_PROFILE` on the grouped persistent production path when comparable profiled occupancy is available, otherwise emit an explicit skip without changing the execution kernel.
+
 ## v1.0.2 - 2026-09-11
 
-- Add an automated protected release flow that accepts a SemVer input, rolls `Unreleased` changelog entries into a dated release section, updates release metadata, waits for required CI, squash-merges through the protected `main` branch, creates the immutable release tag, and publishes GitHub Release notes.
+- Add an automated protected release flow that accepts a SemVer input, rolls `Unreleased` changelog entries into a dated release section, updates release metadata, waits for required CI, squash-merges through the protected `main` branch, creates the release tag, and publishes GitHub Release notes.
 - Make the README and active documentation release-version-neutral so normal software version bumps no longer require broad manual documentation edits.
 - Keep the reference GPU logical batch at 16 workers by default so backend selection cannot silently change the training denominator.
 - Normalize exact GPU story-mean resume identity across physical GPU counts while accepting the two prior exact aliases and continuing to reject experimental device-mean resumes.

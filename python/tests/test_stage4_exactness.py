@@ -140,6 +140,71 @@ def sparse_kway_merge(block_runs, limit=None):
         positions[best_run] += 1
     return merged
 
+def sparse_heap_merge(block_runs, limit=None):
+    if not block_runs:
+        return []
+
+    heap = []
+    positions = [0] * len(block_runs)
+
+    def record(run_index):
+        return block_runs[run_index][positions[run_index]]
+
+    for run_index, run in enumerate(block_runs):
+        if not run or run[0] == 0:
+            continue
+        heap.append(run_index)
+
+    for start in range(len(heap) // 2 - 1, -1, -1):
+        position = start
+        replacement = heap[position]
+        while True:
+            left = position * 2 + 1
+            if left >= len(heap):
+                break
+            right = left + 1
+            child = left
+            if right < len(heap) and record(heap[right]) > record(heap[left]):
+                child = right
+            if record(replacement) >= record(heap[child]):
+                break
+            heap[position] = heap[child]
+            position = child
+        heap[position] = replacement
+
+    total = sum(sum(value != 0 for value in run) for run in block_runs)
+    needed = total if limit is None else min(total, limit)
+    merged = []
+
+    while heap and len(merged) < needed:
+        best_run = heap[0]
+        merged.append(record(best_run))
+        next_position = positions[best_run] + 1
+        if next_position < len(block_runs[best_run]) and block_runs[best_run][next_position] != 0:
+            positions[best_run] = next_position
+            replacement = best_run
+        else:
+            replacement = heap.pop()
+            if not heap:
+                break
+
+        position = 0
+        while True:
+            left = position * 2 + 1
+            if left >= len(heap):
+                break
+            right = left + 1
+            child = left
+            if right < len(heap) and record(heap[right]) > record(heap[left]):
+                child = right
+            if record(replacement) >= record(heap[child]):
+                break
+            heap[position] = heap[child]
+            position = child
+        heap[position] = replacement
+
+    return merged
+
 def stage4_exact_select(values, keep, rotation, neuron_count):
     positive = [(value, neuron) for value, neuron in values if value > 0.0]
     # Total ordering corresponding to leo_better.
@@ -243,6 +308,8 @@ class Stage4ExactnessTests(unittest.TestCase):
             expected = sorted(all_records, reverse=True)
             self.assertEqual(sparse_kway_merge(block_runs), expected)
             self.assertEqual(sparse_kway_merge(block_runs, 17), expected[:17])
+            self.assertEqual(sparse_heap_merge(block_runs), expected)
+            self.assertEqual(sparse_heap_merge(block_runs, 17), expected[:17])
 
     def test_cuda_sparse_selection_keeps_exact_dense_fallback(self):
         cuda = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
@@ -251,7 +318,9 @@ class Stage4ExactnessTests(unittest.TestCase):
             "leo_next_power_of_two(positive)",
             "LEO_SPARSE_GLOBAL_THRESHOLD",
             "const bool sparse_merge",
-            "run_position[LEO_SPARSE_GLOBAL_RUNS]",
+            "LEO_SPARSE_HEAP_RECORD_BASE",
+            "LEO_SPARSE_HEAP_META_BASE",
+            "leo_sparse_heap_sift_down",
             "Dense/rare fallback",
             "leo_bitonic_sort_selection_records_legacy",
         ):
@@ -260,7 +329,9 @@ class Stage4ExactnessTests(unittest.TestCase):
         # The sparse fast path must still use the exact packed record ordering.
         sparse = cuda.split("if (sparse_merge)", 1)[1].split("} else {", 1)[0]
         self.assertIn("leo_selection_record(", sparse)
-        self.assertIn("record > best_record", sparse)
+        self.assertIn("leo_sparse_heap_sift_down", sparse)
+        merge_loop = sparse.split("while (produced < needed && heap_size > 0U)", 1)[1]
+        self.assertNotIn("run_index < cfg->block_count", merge_loop)
 
     def test_persistent_forward_reuses_exact_exponential(self):
         cuda = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()

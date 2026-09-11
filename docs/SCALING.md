@@ -84,7 +84,7 @@ The CUDA executor also uses sparse worklists and exact packed-key selection.
 Current sparse execution optimizations include:
 
 - compacting positive block candidates before exact sorting;
-- exact k-way merge of sparse sorted block-winner runs with the dense bitonic
+- exact shared-memory heap k-way merge of sparse sorted block-winner runs with the dense bitonic
   path retained as a fallback;
 - flattened delayed recurrent-weight snapshot copies;
 - sparse learning-destination worklists;
