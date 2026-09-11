@@ -200,6 +200,59 @@ The heap selector therefore removed the first dominant bottleneck without changi
 state, but exact replay-prefix selection and the production learning-signal projection remain major
 cost centers.
 
+## Leo v1.0.3
+
+## Snapshot A - four-row learning-signal interleave regression
+
+- GitHub release commit:
+  `a68b4bfb41b8503522aefa2e755ba4e4fb1c18ec`.
+- Performance change: PR #21,
+  `perf(cuda): interleave learning signal projection`.
+- Release metadata: PR #22, `chore(release): v1.0.3`.
+- Evidence archive: `p100-v103-round2-regression-evidence.tar.gz`.
+- Evidence SHA-256:
+  `4a6a703e8ff7e8d1681d252b80016ce13e26d89c342da04f4584f8e3c13f00dc`.
+- Hardware: Tesla P100-PCIE-16GB, compute capability 6.0, 56 SMs.
+- CUDA toolkit: 12.8.
+- Rust: 1.85.0.
+- Dataset and prepared-file SHA-256 values matched the reference TinyStories identity above.
+- `scripts/check_gpu.sh` passed.
+- Optimized-vs-legacy GPU state equality passed.
+
+### Throughput
+
+| Measurement | v1.0.2 heap | v1.0.3 interleave | Change |
+| --- | ---: | ---: | ---: |
+| 32K replay-off autotune | 3,733.630 | 2,433.395 | 0.652x |
+| 32K replay-off optimized, 64 stories | 3,628.031 | 2,408.681 | 0.664x |
+| 32K replay-off legacy, 64 stories | 2,000.709 | 791.037 | 0.395x |
+| Classic/default 30% replay, 16 stories | 1,897.610 | 1,559.470 | 0.822x |
+
+The replay-off optimized and legacy executions remained exactly state-identical:
+
+`14894f9039c59359a81ebed48d71b563617636348fb4347f2accefc5bfcd50e9`
+
+The classic 30% replay digest also remained unchanged:
+
+`5b30b3f442f3aecf17a6a41e1b98b21b802cd27aa70fbe0c79cb1f9257527e6e`
+
+### Regression diagnosis
+
+The four-row learning-signal interleave is rejected for P100 production use.
+
+The 32K production phase profile changed from 42.02% learning-signal share in the exact heap
+baseline to 55.45%. Replay-off optimized throughput fell by 33.6%, and the legacy path using the
+same shared learning-signal helper fell by 60.5%.
+
+This was not explained by the autotuner selecting `lane_chunk=8`: the measured
+`lane_chunk=16`, 56-block candidates were also only about 2,395 work-units/s.
+
+Classic replay regressed less severely because frozen replay-prefix reconstruction does not execute
+the learning-signal projection. Replay execution time itself remained approximately unchanged at
+4.57 seconds.
+
+The implementation is therefore reverted rather than used as the basis for further optimization.
+
 ## Next snapshot
 
 Append the next merged optimization here. Record the version reported by the GitHub source at that
