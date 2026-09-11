@@ -179,8 +179,11 @@ def run_case(args, devices, count):
     selector.register(proc.stdout, selectors.EVENT_READ)
     try:
         while True:
-            for key, _ in selector.select(timeout=1.0):
-                line = key.fileobj.readline()
+            # proc.stdout is the only registered stream. Read it directly so
+            # static type checkers do not treat SelectorKey.fileobj as an
+            # int/HasFileno union while preserving the selector-driven wait.
+            for _ in selector.select(timeout=1.0):
+                line = proc.stdout.readline()
                 if line:
                     consume(line)
             now = time.monotonic()
@@ -213,6 +216,7 @@ def run_case(args, devices, count):
     ):
         raise RuntimeError("multi-GPU run did not report exact_flat_story_mean=true")
     return benchmark, tuning_events
+
 
 def run_clean_case(args, devices, count):
     for attempt in range(1, args.max_attempts + 1):
@@ -257,8 +261,10 @@ def main():
             raise FileNotFoundError(path)
     if args.workers <= 0 or args.stories <= 0:
         raise ValueError("--workers and --stories must be positive")
-    if args.max_attempts <= 0 or args.repeats <= 0:
+    if args.max_attempts <= 0:
         raise ValueError("--max-attempts must be positive")
+    if args.repeats <= 0:
+        raise ValueError("--repeats must be positive")
 
     devices = discover_devices(args.devices)
     max_devices = min(len(devices), args.workers)

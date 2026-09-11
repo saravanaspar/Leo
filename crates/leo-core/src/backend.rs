@@ -407,6 +407,28 @@ pub trait RuntimeBackend: Send {
         Ok(())
     }
 
+    /// Execute a mixed replay timeline without resetting transient state
+    /// between selected ranges. `Some(target)` positions are supervised with
+    /// `permission`; `None` positions advance frozen recurrent/context state.
+    /// Metrics are returned only for supervised positions. GPU backends may
+    /// keep the complete mixed schedule device-resident in one cooperative
+    /// launch per chunk.
+    fn replay_streaming_batch(
+        &mut self,
+        steps: &[(u32, Option<u32>)],
+        permission: Permission,
+    ) -> LeoResult<Vec<StepMetrics>> {
+        let mut metrics = Vec::new();
+        for &(input, target) in steps {
+            if target.is_some() {
+                metrics.push(self.step(input, target, permission)?);
+            } else {
+                self.step(input, None, Permission::Frozen)?;
+            }
+        }
+        Ok(metrics)
+    }
+
     /// Optional GPU-native whole-story batch execution. Implementations return
     /// `None` when they do not support device-resident independent story lanes.
     fn training_story_batch(
@@ -679,6 +701,14 @@ impl RuntimeBackend for GpuRuntime {
         self.runtime.advance_frozen_batch(steps)
     }
 
+    fn replay_streaming_batch(
+        &mut self,
+        steps: &[(u32, Option<u32>)],
+        permission: Permission,
+    ) -> LeoResult<Vec<StepMetrics>> {
+        self.runtime.replay_streaming_batch(steps, permission)
+    }
+
     fn training_story_batch(
         &mut self,
         stories: &[Vec<u8>],
@@ -871,6 +901,14 @@ impl BackendRuntime {
 
     pub fn advance_frozen_batch(&mut self, steps: &[(u32, Option<u32>)]) -> LeoResult<()> {
         self.inner.advance_frozen_batch(steps)
+    }
+
+    pub fn replay_streaming_batch(
+        &mut self,
+        steps: &[(u32, Option<u32>)],
+        permission: Permission,
+    ) -> LeoResult<Vec<StepMetrics>> {
+        self.inner.replay_streaming_batch(steps, permission)
     }
 
     pub fn training_story_batch(

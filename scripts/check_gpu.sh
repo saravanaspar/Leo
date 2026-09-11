@@ -366,8 +366,12 @@ print(
 )
 PY
 
-# A final short fresh process validates complete cache reuse rather than only
-# the in-memory state of the process that completed tuning.
+# The production shared trainer is now chunk-persistent by default. Prove that
+# the launch/metrics optimization is execution-only by comparing the complete
+# training-state digest against the legacy per-step shared wavefront from the
+# exact same starting model and story sequence.
+PERSISTENT_LOG="$TMP/gpu-persistent-shared.log"
+LEGACY_LOG="$TMP/gpu-legacy-shared.log"
 LEO_MULTI_GPU=0 "$LEO" benchmark \
   --train \
   --model "$TMP/model.pscls" \
@@ -375,7 +379,58 @@ LEO_MULTI_GPU=0 "$LEO" benchmark \
   --index "$TMP/data/tinystories.train.idx" \
   --stories 32 \
   --workers 16 \
-  --backend gpu
+  --backend gpu 2>&1 | tee "$PERSISTENT_LOG"
+LEO_CUDA_SHARED_PERSISTENT=0 \
+LEO_CUDA_SHARED_GROUPED=0 \
+LEO_CUDA_DEVICE_BATCH_MERGE=0 \
+LEO_MULTI_GPU=0 "$LEO" benchmark \
+  --train \
+  --model "$TMP/model.pscls" \
+  --bytes "$TMP/data/tinystories.train.bytes" \
+  --index "$TMP/data/tinystories.train.idx" \
+  --stories 32 \
+  --workers 16 \
+  --backend gpu 2>&1 | tee "$LEGACY_LOG"
+python3 - "$PERSISTENT_LOG" "$LEGACY_LOG" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+def final_benchmark(path):
+    events = []
+    for raw in Path(path).read_text(encoding="utf-8").splitlines():
+        raw = raw.strip()
+        if not raw.startswith("{"):
+            continue
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event") == "training_benchmark":
+            events.append(event)
+    if not events:
+        raise SystemExit(f"no training_benchmark event in {path}")
+    return events[-1]
+
+persistent = final_benchmark(sys.argv[1])
+legacy = final_benchmark(sys.argv[2])
+for event, label in ((persistent, "persistent"), (legacy, "legacy")):
+    if not event.get("training_state_sha256"):
+        raise SystemExit(f"{label} benchmark missing training_state_sha256")
+    if round(float(event.get("replay_fraction", -1.0)), 2) != 0.30:
+        raise SystemExit(f"{label} benchmark did not preserve 30% replay: {event}")
+
+if persistent["training_state_sha256"] != legacy["training_state_sha256"]:
+    raise SystemExit(
+        "persistent shared CUDA path changed final training state: "
+        f"persistent={persistent['training_state_sha256']} "
+        f"legacy={legacy['training_state_sha256']}"
+    )
+print(
+    "Persistent/grouped/device-merge CUDA exact-state gate OK:",
+    persistent["training_state_sha256"],
+)
+PY
 
 # On hosts with at least two homogeneous GPUs, prove that physical placement is
 # execution-only: 1-GPU and 2-GPU runs must finish with the same complete
