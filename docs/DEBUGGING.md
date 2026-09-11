@@ -115,6 +115,26 @@ These controls change execution geometry only; they do not change replay selecti
 
 These overrides are useful for diagnosing barrier-vs-parallel-work tradeoffs on a new GPU. Do not treat them as learning hyperparameters.
 
+## Compiled CUDA resource and device-postprocess diagnostics
+
+`LEO_CUDA_DEBUG=1` now emits `cuda_kernel_resources` for the grouped persistent
+trainer, cooperative replay trainer, and frozen-prefix kernel. Each event reports
+compiled registers/thread, static and maximum dynamic shared memory, local bytes
+per thread, maximum threads/block, cooperative grid capacity, resident
+threads/SM, and theoretical thread occupancy. This is the preferred first check
+when a source change unexpectedly changes P100 occupancy.
+
+Normal single-GPU persistent training uploads raw story bytes and builds the exact
+BEGIN/byte/END step descriptors on-device, then keeps per-step fast records on-device
+and returns compact per-story summaries plus exact replay ranges. Set
+`LEO_CUDA_DEVICE_STORY_STEPS=0` to restore host-built step descriptors while retaining
+device postprocessing. Set `LEO_CUDA_DEVICE_STORY_POSTPROCESS=0` to force the historical per-step record
+download and CPU replay-range selector. This flag changes execution placement
+only; the GPU acceptance gate compares the default path with the legacy exact
+path by complete training-state SHA-256. With `LEO_CUDA_DEBUG_LAUNCHES=1`, the
+default path emits `scope="device_story_steps"` and
+`scope="device_story_postprocess"` when both device-resident stages are actually used.
+
 ## Production shared-story profiler
 
 The logical story-batch path has a sampled profiler that stays on the production

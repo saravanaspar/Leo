@@ -123,6 +123,23 @@ The CPU runtime is the reference implementation. The single-GPU CUDA path is exp
 
 Multi-GPU data parallelism preserves the logical story-batch reduction: one sparse delta per original story is flattened in canonical story order and one `1 / workers` mean is applied. Multi-GPU hardware tests should compare 1-GPU and N-GPU semantic counters/loss within the existing CPU/CUDA numerical thresholds and report scaling efficiency separately. The default/exact replay path remains canonical/serial, so its replay-on scaling is lower than base-pass scaling. `LEO_MULTI_GPU_PARALLEL_REPLAY=1` and `LEO_REPLAY_STREAMING=1` are separate semantic experiments: they retain FP32 and the configured replay fraction, but require held-out quality A/B validation and are not covered by the exact-state acceptance claim.
 
+## Device-resident production-path acceptance
+
+The single-GPU exact-state gate must exercise the default device story-step builder
+and device story postprocess, not merely source-inspect them. `scripts/check_gpu.sh`
+requires both `leo_build_shared_story_steps` and `leo_postprocess_shared_story_records`
+launches in the optimized leg and compares
+the complete final training-state SHA-256 with the legacy execution leg. The
+compact device path is therefore rejected if GPU replay-range selection,
+per-story statistics, lane-local synchronization, or physical CTA allocation
+changes learned state.
+
+The grouped kernel is allowed to change only physical execution geometry. Tests
+assert that all tuner-approved resident CTAs can be used, unrelated logical
+lanes synchronize independently, and the exact selector/learning helpers remain
+the same. Final throughput numbers must still be measured with heavy profiling
+disabled.
+
 ## 8. Regression-test rule
 
 A bug fix should normally include a test that fails before the fix and passes after it. Prefer behavioral tests over source-string assertions when the behavior is testable without hardware-specific dependencies.

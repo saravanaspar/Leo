@@ -1,4 +1,7 @@
+import math
+import random
 import runpy
+import struct
 import unittest
 from pathlib import Path
 
@@ -159,6 +162,11 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
             self.assertIn(marker, cuda)
         self.assertIn("leo-cuda-plan-v4", cuda)
         self.assertIn("pci_bus_id", cuda)
+        self.assertIn("cuFuncGetAttribute", cuda)
+        self.assertIn("cuda_kernel_resources", cuda)
+        self.assertIn("registers_per_thread", cuda)
+        self.assertIn("local_bytes_per_thread", cuda)
+        self.assertIn("cooperative_capacity_blocks", cuda)
         for field in ("sparse_apply_blocks", "sparse_apply_threads", "fused_wavefront_blocks"):
             self.assertIn(field, planner)
         self.assertIn("--set full", profiler)
@@ -561,6 +569,8 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
             "LEO_CUDA_SHARED_PERSISTENT": "0",
             "LEO_CUDA_SHARED_GROUPED": "0",
             "LEO_CUDA_DEVICE_BATCH_MERGE": "0",
+            "LEO_CUDA_DEVICE_STORY_STEPS": "0",
+            "LEO_CUDA_DEVICE_STORY_POSTPROCESS": "0",
             "LEO_CUDA_FULL_STEP_METRICS": "1",
             "LEO_CUDA_DEBUG_LAUNCHES": "1",
             "LEO_CUDA_REPLAY_PROFILE_STRIDE": "1",
@@ -775,10 +785,15 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("optimized_kernel=", gpu_gate)
         self.assertIn("device_batch_merge_observed", gpu_gate)
         self.assertIn("device_batch_merge=true", gpu_gate)
+        self.assertIn("device_story_steps_observed", gpu_gate)
+        self.assertIn("device_story_steps=true", gpu_gate)
+        self.assertIn("device_story_postprocess_observed", gpu_gate)
+        self.assertIn("device_story_postprocess=true", gpu_gate)
         self.assertIn("training_state_sha256", gpu_gate)
 
     def test_grouped_shared_wavefront_parallelizes_each_logical_lane(self):
         rust = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
+        planner = (ROOT / "crates/leo-core/src/cuda_plan.rs").read_text()
         kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
 
         grouped = kernels.split(
@@ -786,8 +801,13 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         )[1].split(
             'extern "C" __global__ void leo_shared_wavefront_persistent_grouped(', 1
         )[0]
-        self.assertIn("blocks_per_lane", grouped)
-        self.assertIn("lane = blockIdx.x / blocks_per_lane", grouped)
+        self.assertIn("lane = blockIdx.x % lane_count", grouped)
+        self.assertIn("lane_block = blockIdx.x / lane_count", grouped)
+        self.assertIn("blocks_in_lane", grouped)
+        self.assertIn("lane_step_count", grouped)
+        self.assertIn("leo_lane_group_barrier", grouped)
+        self.assertNotIn("grid.sync()", grouped)
+        self.assertGreaterEqual(grouped.count("leo_lane_group_barrier("), 19)
         self.assertIn("lane_thread", grouped)
         self.assertIn("lane_stride", grouped)
         self.assertIn("leo_p_forward_context_latent_work", grouped)
@@ -795,8 +815,155 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("leo_p_update_recurrent_weights_work_fast", grouped)
         self.assertIn("leo_p_update_input_weights_work_fast", grouped)
         self.assertIn("leo_p_homeostasis_work", grouped)
+        self.assertIn("let grid_blocks = grouped_budget;", rust)
+        self.assertIn("extra_lane_blocks", rust)
         self.assertIn("LEO_CUDA_SHARED_GROUPED", rust)
         self.assertIn("shared_grouped_blocks_256", rust)
+        self.assertIn("grouped_blocks_256", planner)
+
+    def test_grouped_cta_remainder_distribution_covers_each_model_block_once(self):
+        for grid_blocks in (16, 17, 31, 48, 55, 56, 112):
+            for lane_count in (1, 2, 7, 8, 16):
+                if grid_blocks < lane_count:
+                    continue
+                for lane in range(lane_count):
+                    blocks_in_lane = (grid_blocks + lane_count - 1 - lane) // lane_count
+                    covered = []
+                    for lane_block in range(blocks_in_lane):
+                        covered.extend(range(lane_block, 128, blocks_in_lane))
+                    self.assertEqual(sorted(covered), list(range(128)))
+                    self.assertEqual(len(covered), len(set(covered)))
+
+    def test_device_replay_packed_order_reconstructs_host_ranges(self):
+        def f32(value):
+            return struct.unpack("<f", struct.pack("<f", value))[0]
+
+        def host_ranges(losses, fraction, segment_targets):
+            if not losses or not math.isfinite(fraction) or fraction <= 0.0 or segment_targets == 0:
+                return []
+            fraction = f32(fraction)
+            target_budget = max(1, math.ceil(len(losses) * min(fraction, 1.0)))
+            positions = [
+                (position, loss)
+                for position, loss in enumerate(losses)
+                if math.isfinite(loss) and loss > 0.0
+            ]
+            positions.sort(key=lambda item: (-item[1], item[0]))
+            selected = []
+            selected_targets = 0
+            for position, _loss in positions:
+                if selected_targets >= target_budget:
+                    break
+                remaining = target_budget - selected_targets
+                width = min(segment_targets, remaining, len(losses))
+                start = max(0, position - width // 2)
+                end = min(len(losses), start + width)
+                start = end - width
+                candidate = (start, end)
+                if any(left < end and start < right for left, right in selected):
+                    continue
+                selected.append(candidate)
+                selected_targets += width
+            return sorted(selected)
+
+        def device_ranges(losses, fraction, segment_targets):
+            fraction = f32(fraction)
+            if not losses or not math.isfinite(fraction) or fraction <= 0.0 or segment_targets == 0:
+                return []
+            keys = []
+            for position, loss in enumerate(losses):
+                if not math.isfinite(loss) or loss <= 0.0:
+                    continue
+                bits = struct.unpack("<I", struct.pack("<f", loss))[0]
+                keys.append(((bits << 32) | (0xFFFFFFFF - position), position))
+            keys.sort(reverse=True)
+            target_budget = max(1, math.ceil(len(losses) * min(fraction, 1.0)))
+            selected = []
+            selected_targets = 0
+            for _key, position in keys:
+                if selected_targets >= target_budget:
+                    break
+                remaining = target_budget - selected_targets
+                width = min(segment_targets, remaining, len(losses))
+                start = max(0, position - width // 2)
+                end = min(len(losses), start + width)
+                start = end - width
+                if any(left < end and start < right for left, right in selected):
+                    continue
+                selected.append((start, end))
+                selected_targets += width
+            return sorted(selected)
+
+        rng = random.Random(1337)
+        for length in (1, 2, 7, 48, 127, 512):
+            for fraction in (0.0, 0.01, 0.3, 1.0):
+                for segment_targets in (1, 7, 48):
+                    losses = [f32(rng.random() * 9.0) for _ in range(length)]
+                    if length >= 7:
+                        losses[0] = f32(1.0)
+                        losses[1] = f32(1.0)
+                        losses[2] = 0.0
+                        losses[3] = -0.0
+                        losses[4] = float("inf")
+                        losses[5] = float("nan")
+                    self.assertEqual(
+                        device_ranges(losses, fraction, segment_targets),
+                        host_ranges(losses, fraction, segment_targets),
+                    )
+
+    def test_device_story_step_builder_preserves_schedule_contract(self):
+        rust = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+
+        builder = kernels.split('extern "C" __global__ void leo_build_shared_story_steps', 1)[1].split(
+            'extern "C" __global__ void leo_postprocess_shared_story_records', 1
+        )[0]
+        dropout = kernels.split("bool leo_context_survives_dropout_exact", 1)[1].split(
+            'extern "C" __global__ void leo_build_shared_story_steps', 1
+        )[0]
+        self.assertIn("symbol = 256U; // BEGIN_DOCUMENT", builder)
+        self.assertIn("target_index = (int)bytes[0]", builder)
+        self.assertIn("target_index = 256; // END_DOCUMENT_OUTPUT_INDEX", builder)
+        self.assertIn("strength * target_weight", builder)
+        self.assertIn("0x9e3779b97f4a7c15ULL", dropout)
+        self.assertIn("0xbf58476d1ce4e5b9ULL", dropout)
+        self.assertIn("0x94d049bb133111ebULL", dropout)
+        self.assertIn("16777216.0f", dropout)
+        self.assertIn("cuda_device_story_steps_enabled", rust)
+        self.assertIn("LEO_CUDA_DEVICE_STORY_STEPS", rust)
+        self.assertIn("launch_device_story_step_builder", rust)
+        self.assertIn("batch_story_bytes", rust)
+        self.assertIn("host_batch_story_bytes", rust)
+
+    def test_device_story_postprocess_keeps_losses_and_replay_selection_on_gpu(self):
+        rust = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
+        backend = (ROOT / "crates/leo-core/src/backend.rs").read_text()
+        training = (ROOT / "crates/leo-cli/src/training.rs").read_text()
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+
+        self.assertIn("leo_build_shared_story_steps", kernels)
+        self.assertIn("leo_context_survives_dropout_exact", kernels)
+        self.assertIn("leo_postprocess_shared_story_records", kernels)
+        self.assertIn("leo_replay_loss_record", kernels)
+        self.assertIn("LeoFastStorySummary", kernels)
+        self.assertIn("LeoReplayRange", kernels)
+        self.assertIn("leo_bitonic_sort_selection_keys", kernels)
+        self.assertIn("LEO_DEVICE_REPLAY_MAX_STEPS 4096U", kernels)
+        self.assertIn("cuda_device_story_steps_enabled", rust)
+        self.assertIn("LEO_CUDA_DEVICE_STORY_STEPS", rust)
+        self.assertIn("launch_device_story_step_builder", rust)
+        self.assertIn("cuda_device_story_postprocess_enabled", rust)
+        self.assertIn("LEO_CUDA_DEVICE_STORY_POSTPROCESS", rust)
+        self.assertIn("launch_device_story_postprocess", rust)
+        self.assertIn("read_device_story_postprocess", rust)
+        self.assertIn("batch_story_summaries", rust)
+        self.assertIn("batch_replay_ranges", rust)
+        self.assertIn("DeviceStorySummary", backend)
+        self.assertIn("device_postprocessed", training)
+        self.assertIn("apply_batch_replay_ranges", training)
+        # The CPU selector remains the exact fallback for debug, long stories,
+        # multi-GPU retained deltas, and explicit execution A/B.
+        self.assertIn("select_replay_ranges(losses, fraction, segment_targets)", training)
 
     def test_device_batch_merge_marks_touched_rows_even_when_mean_cancels(self):
         rust = (ROOT / "crates/leo-core/src/cuda.rs").read_text()

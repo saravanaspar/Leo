@@ -119,6 +119,38 @@ per byte is deliberately undesirable. NVLink/NVSwitch is preferred for this
 fine-grained model-parallel stage; ordinary PCIe is much less restrictive for
 story data parallelism.
 
+## Hardware-adaptive single-GPU scheduling
+
+Logical story workers are semantic; physical CUDA resources are not. Leo keeps
+`--workers` unchanged and asks the CUDA driver/tuner how many cooperative CTAs
+can actually be resident for the grouped persistent kernel. The production
+launch now consumes the complete tuner-approved CTA budget instead of rounding
+it down to an exact multiple of the logical lane count. Remainder CTAs are
+distributed across story lanes, while every within-story dependency is protected
+by a lane-local cooperative-residency barrier. Unrelated stories therefore no
+longer wait at a whole-grid barrier after every CUDA phase.
+
+This is deliberately different from auto-increasing `--workers`: a larger GPU
+may run more blocks for the same 16 logical stories, but the canonical
+`1 / workers` mean, RNG inputs, FP32 equations, story order, and replay policy do
+not change. Kernel-resource telemetry (`cuda_kernel_resources`) exposes
+registers/thread, local/shared memory, cooperative capacity, resident
+threads/SM, and theoretical thread occupancy so future tuning can be based on
+the actual compiled kernel rather than a GPU-model lookup table.
+
+For normal single-GPU persistent batches of at most 4096 targets per story, the
+host uploads raw story bytes once and the GPU constructs the exact persistent
+BEGIN/byte/END schedule, including deterministic context dropout and END_DOCUMENT
+weighting. The compact loss/activity reduction and exact bounded-surprise replay-range
+selection also run on-device. The host receives one summary plus a small range list per
+story rather than one record per byte. `LEO_CUDA_DEVICE_STORY_STEPS=0` restores
+host-built step descriptors for execution A/B; `LEO_CUDA_DEVICE_STORY_POSTPROCESS=0`
+restores the historical per-step D2H/CPU-selection path for exact A/B testing.
+Long stories, full-step diagnostics, and multi-GPU retained-delta execution keep
+the established fallback. The keyed context hash-table merge remains an explicit
+batch safe point because its collision semantics are order-sensitive; it is not
+changed merely to claim a CPU-free path.
+
 ## Scaling targets
 
 Targets are engineering goals, not guarantees. Measure them on the intended

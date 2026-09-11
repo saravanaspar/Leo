@@ -41,6 +41,7 @@ const GLOBAL_SELECTION_THREADS: c_uint = 1024;
 const PERSISTENT_THREADS: c_uint = 256;
 const SHARED_BATCH_THREADS: c_uint = 256;
 const TRAINING_STEP_BATCH_CAPACITY: usize = 4096;
+const CUDA_DEVICE_STORY_BYTES_PER_LANE: usize = TRAINING_STEP_BATCH_CAPACITY;
 pub(crate) const GPU_STORY_BATCH_MAX_LANES: usize = 128;
 const CUDA_PHASE_PROFILE_COUNTER_COUNT: usize = 10;
 const CUDA_PHASE_PROFILE_SAMPLES: usize = 0;
@@ -88,6 +89,11 @@ const CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR: c_int = 39;
 const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 const CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH: c_int = 95;
+const CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK: c_int = 0;
+const CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES: c_int = 1;
+const CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES: c_int = 3;
+const CU_FUNC_ATTRIBUTE_NUM_REGS: c_int = 4;
+const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
 const CUDA_KERNEL_BODY: &str = include_str!("cuda_kernels.cu");
 const CUDA_ABI_HEADER: &str = include_str!(concat!(env!("OUT_DIR"), "/leo_cuda_abi.h"));
 include!(concat!(env!("OUT_DIR"), "/cuda_abi_generated.rs"));
@@ -193,6 +199,26 @@ fn cuda_shared_persistent_enabled() -> bool {
 
 fn cuda_shared_grouped_enabled() -> bool {
     !env::var("LEO_CUDA_SHARED_GROUPED")
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
+}
+
+fn cuda_device_story_steps_enabled() -> bool {
+    !env::var("LEO_CUDA_DEVICE_STORY_STEPS")
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
+}
+
+fn cuda_device_story_postprocess_enabled() -> bool {
+    !env::var("LEO_CUDA_DEVICE_STORY_POSTPROCESS")
         .ok()
         .map(|value| {
             let value = value.trim().to_ascii_lowercase();
@@ -340,6 +366,27 @@ struct CudaFastTrainingStepRecord {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct CudaFastStorySummary {
+    training_loss_sum: f64,
+    active_neurons_sum: u64,
+    synaptic_events: u64,
+    context_applied_steps: u64,
+    training_targets: u32,
+    active_neurons_peak: u32,
+    error_code: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct CudaReplayRange {
+    start: u32,
+    end: u32,
+}
+
+const CUDA_DEVICE_REPLAY_MAX_STEPS: usize = TRAINING_STEP_BATCH_CAPACITY;
+
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct CudaPersistentStep {
     symbol: u32,
@@ -389,6 +436,7 @@ type CuStreamWaitEvent = unsafe extern "C" fn(CuStream, CuEvent, c_uint) -> c_in
 type CuModuleLoadData = unsafe extern "C" fn(*mut CuModule, *const c_void) -> c_int;
 type CuModuleUnload = unsafe extern "C" fn(CuModule) -> c_int;
 type CuModuleGetFunction = unsafe extern "C" fn(*mut CuFunction, CuModule, *const c_char) -> c_int;
+type CuFuncGetAttribute = unsafe extern "C" fn(*mut c_int, c_int, CuFunction) -> c_int;
 type CuMemAlloc = unsafe extern "C" fn(*mut CuDevicePtr, usize) -> c_int;
 type CuMemFree = unsafe extern "C" fn(CuDevicePtr) -> c_int;
 type CuMemAllocHost = unsafe extern "C" fn(*mut *mut c_void, usize) -> c_int;
@@ -573,6 +621,7 @@ struct DriverFunctions {
     module_load_data: CuModuleLoadData,
     module_unload: CuModuleUnload,
     module_get_function: CuModuleGetFunction,
+    func_get_attribute: CuFuncGetAttribute,
     mem_alloc: CuMemAlloc,
     mem_free: CuMemFree,
     mem_alloc_host: CuMemAllocHost,
@@ -672,6 +721,11 @@ impl DriverFunctions {
                 library,
                 &["cuModuleGetFunction"],
                 CuModuleGetFunction
+            ),
+            func_get_attribute: load_function!(
+                library,
+                &["cuFuncGetAttribute"],
+                CuFuncGetAttribute
             ),
             mem_alloc: load_function!(library, &["cuMemAlloc_v2", "cuMemAlloc"], CuMemAlloc),
             mem_free: load_function!(library, &["cuMemFree_v2", "cuMemFree"], CuMemFree),
@@ -875,6 +929,8 @@ struct KernelFunctions {
     shared_post_deltas: CuFunction,
     shared_homeostasis_worklist: CuFunction,
     shared_capture_training_step: CuFunction,
+    build_shared_story_steps: CuFunction,
+    postprocess_shared_story_records: CuFunction,
     merge_shared_lane_fixed_parameters: CuFunction,
     apply_shared_wavefront_deltas: CuFunction,
     reset_shared_wavefront_deltas: CuFunction,
@@ -979,6 +1035,37 @@ fn query_cuda_hardware_identity(
     })
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct CudaKernelResourceUsage {
+    max_threads_per_block: u32,
+    static_shared_bytes: u32,
+    local_bytes_per_thread: u32,
+    registers_per_thread: u32,
+    max_dynamic_shared_bytes: u32,
+}
+
+fn kernel_resource_usage(driver: &DriverFunctions, kernel: CuFunction) -> CudaKernelResourceUsage {
+    // Resource telemetry is diagnostic only. Older drivers may not expose
+    // every CUfunction attribute, so an unsupported query must never make an
+    // otherwise valid CUDA runtime fail to initialize.
+    let query = |attribute: c_int| -> u32 {
+        let mut value = 0;
+        let status = unsafe { (driver.func_get_attribute)(&mut value, attribute, kernel) };
+        if status == CUDA_SUCCESS {
+            value.max(0) as u32
+        } else {
+            0
+        }
+    };
+    CudaKernelResourceUsage {
+        max_threads_per_block: query(CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK),
+        static_shared_bytes: query(CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES),
+        local_bytes_per_thread: query(CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES),
+        registers_per_thread: query(CU_FUNC_ATTRIBUTE_NUM_REGS),
+        max_dynamic_shared_bytes: query(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES),
+    }
+}
+
 fn cooperative_grid_capacity(
     driver: &DriverFunctions,
     kernel: CuFunction,
@@ -1028,6 +1115,9 @@ struct SharedCuda {
     shared_grouped_blocks_256: u32,
     shared_grouped_profile_blocks_256: u32,
     fused_profile_blocks_256: u32,
+    shared_grouped_resources: CudaKernelResourceUsage,
+    replay_fast_resources: CudaKernelResourceUsage,
+    frozen_resources: CudaKernelResourceUsage,
     hardware: CudaHardwareIdentity,
 }
 
@@ -1229,6 +1319,12 @@ struct Buffers {
     batch_step_buffers: DeviceBuffer,
     batch_step_counts: DeviceBuffer,
     batch_base_ticks: DeviceBuffer,
+    batch_story_bytes: DeviceBuffer,
+    batch_lane_barrier_counts: DeviceBuffer,
+    batch_lane_barrier_epochs: DeviceBuffer,
+    batch_story_summaries: DeviceBuffer,
+    batch_replay_ranges: DeviceBuffer,
+    batch_replay_range_counts: DeviceBuffer,
     batch_delta_pointer_table: DeviceBuffer,
     phase_profile_counters: DeviceBuffer,
     replay_profile_counters: DeviceBuffer,
@@ -1385,6 +1481,12 @@ impl Buffers {
             self.batch_step_buffers,
             self.batch_step_counts,
             self.batch_base_ticks,
+            self.batch_story_bytes,
+            self.batch_lane_barrier_counts,
+            self.batch_lane_barrier_epochs,
+            self.batch_story_summaries,
+            self.batch_replay_ranges,
+            self.batch_replay_range_counts,
             self.batch_delta_pointer_table,
             self.phase_profile_counters,
             self.replay_profile_counters,
@@ -1465,6 +1567,7 @@ pub(crate) struct CudaRuntime {
     host_batch_step_buffers: PinnedHostBuffer,
     host_batch_step_counts: PinnedHostBuffer,
     host_batch_base_ticks: PinnedHostBuffer,
+    host_batch_story_bytes: PinnedHostBuffer,
     host_batch_change_counts: PinnedHostBuffer,
     batch_snapshot_device_f32: DeviceBuffer,
     batch_snapshot_device_u32: DeviceBuffer,
@@ -1511,8 +1614,20 @@ pub(crate) struct CudaBatchLane {
 
 unsafe impl Send for CudaBatchLane {}
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaDeviceStorySummary {
+    pub(crate) training_loss_sum: f64,
+    pub(crate) training_targets: u64,
+    pub(crate) active_neurons_sum: u64,
+    pub(crate) active_neurons_peak: u64,
+    pub(crate) synaptic_events: u64,
+    pub(crate) context_applied_steps: u64,
+}
+
 pub(crate) struct CudaStoryBatchReport {
     pub(crate) story_metrics: Vec<Vec<StepMetrics>>,
+    pub(crate) story_summaries: Vec<CudaDeviceStorySummary>,
+    pub(crate) replay_ranges: Vec<Vec<std::ops::Range<usize>>>,
     pub(crate) merge: MergeMetrics,
     pub(crate) story_deltas: Vec<SparseModelDelta>,
     pub(crate) story_changes: Vec<ParameterChanges>,
@@ -1956,6 +2071,11 @@ impl CudaRuntime {
             PERSISTENT_THREADS as c_int,
             "profiled cooperative replay trainer",
         )?;
+        let shared_grouped_resources =
+            kernel_resource_usage(&driver, kernels.shared_wavefront_persistent_grouped);
+        let replay_fast_resources = kernel_resource_usage(&driver, kernels.train_cooperative_fast);
+        let frozen_resources = kernel_resource_usage(&driver, kernels.advance_frozen_cooperative);
+
         let persistent_grid_blocks = if cooperative_launch != 0 && multiprocessor_count > 0 {
             let mut active_blocks_per_sm = 0;
             driver.check(
@@ -2000,6 +2120,9 @@ impl CudaRuntime {
             shared_grouped_blocks_256,
             shared_grouped_profile_blocks_256,
             fused_profile_blocks_256,
+            shared_grouped_resources,
+            replay_fast_resources,
+            frozen_resources,
             hardware,
         });
         let mut runtime = Self::with_shared(model, shared)?;
@@ -2053,6 +2176,7 @@ impl CudaRuntime {
                 fused_blocks_128: shared.fused_blocks_128,
                 fused_blocks_256: shared.fused_blocks_256,
                 fused_blocks_512: shared.fused_blocks_512,
+                grouped_blocks_256: shared.shared_grouped_blocks_256,
             },
         );
         let phase_profile_sample_stride = cuda_phase_profile_sample_stride();
@@ -2091,6 +2215,7 @@ impl CudaRuntime {
             host_batch_step_buffers: PinnedHostBuffer::default(),
             host_batch_step_counts: PinnedHostBuffer::default(),
             host_batch_base_ticks: PinnedHostBuffer::default(),
+            host_batch_story_bytes: PinnedHostBuffer::default(),
             host_batch_change_counts: PinnedHostBuffer::default(),
             batch_snapshot_device_f32: DeviceBuffer::default(),
             batch_snapshot_device_u32: DeviceBuffer::default(),
@@ -2140,6 +2265,55 @@ impl CudaRuntime {
                 runtime.frozen_grid_override.unwrap_or(0),
             );
         }
+        if runtime.debug.summary {
+            for (kernel, threads, capacity, resources) in [
+                (
+                    "leo_shared_wavefront_persistent_grouped",
+                    SHARED_BATCH_THREADS,
+                    runtime.shared.shared_grouped_blocks_256,
+                    runtime.shared.shared_grouped_resources,
+                ),
+                (
+                    "leo_train_cooperative_fast",
+                    PERSISTENT_THREADS,
+                    runtime.shared.replay_fast_grid_blocks,
+                    runtime.shared.replay_fast_resources,
+                ),
+                (
+                    "leo_advance_frozen_cooperative",
+                    PERSISTENT_THREADS,
+                    runtime.shared.frozen_grid_blocks,
+                    runtime.shared.frozen_resources,
+                ),
+            ] {
+                let blocks_per_sm = if runtime.shared.multiprocessor_count == 0 {
+                    0.0
+                } else {
+                    capacity as f64 / runtime.shared.multiprocessor_count as f64
+                };
+                let resident_threads_per_sm = blocks_per_sm * threads as f64;
+                let occupancy = if runtime.shared.max_threads_per_sm == 0 {
+                    0.0
+                } else {
+                    resident_threads_per_sm / runtime.shared.max_threads_per_sm as f64
+                };
+                eprintln!(
+                    "{{\"event\":\"cuda_kernel_resources\",\"kernel\":\"{}\",\"threads\":{},\"registers_per_thread\":{},\"static_shared_bytes\":{},\"local_bytes_per_thread\":{},\"max_dynamic_shared_bytes\":{},\"max_threads_per_block\":{},\"cooperative_capacity_blocks\":{},\"blocks_per_sm\":{:.3},\"resident_threads_per_sm\":{:.1},\"theoretical_thread_occupancy\":{:.6}}}",
+                    kernel,
+                    threads,
+                    resources.registers_per_thread,
+                    resources.static_shared_bytes,
+                    resources.local_bytes_per_thread,
+                    resources.max_dynamic_shared_bytes,
+                    resources.max_threads_per_block,
+                    capacity,
+                    blocks_per_sm,
+                    resident_threads_per_sm,
+                    occupancy,
+                );
+            }
+        }
+
         if runtime.debug.memory {
             let allocated_bytes = runtime
                 .buffers
@@ -5197,6 +5371,20 @@ impl CudaRuntime {
         b.batch_step_buffers = self.allocate_u64(GPU_STORY_BATCH_MAX_LANES)?;
         b.batch_step_counts = self.allocate_u32(GPU_STORY_BATCH_MAX_LANES)?;
         b.batch_base_ticks = self.allocate_u64(GPU_STORY_BATCH_MAX_LANES)?;
+        b.batch_story_bytes = self.allocate_bytes(
+            GPU_STORY_BATCH_MAX_LANES.saturating_mul(CUDA_DEVICE_STORY_BYTES_PER_LANE),
+        )?;
+        b.batch_lane_barrier_counts = self.allocate_u32(GPU_STORY_BATCH_MAX_LANES)?;
+        b.batch_lane_barrier_epochs = self.allocate_u32(GPU_STORY_BATCH_MAX_LANES)?;
+        b.batch_story_summaries = self.allocate_bytes(
+            GPU_STORY_BATCH_MAX_LANES.saturating_mul(mem::size_of::<CudaFastStorySummary>()),
+        )?;
+        b.batch_replay_ranges = self.allocate_bytes(
+            GPU_STORY_BATCH_MAX_LANES
+                .saturating_mul(CUDA_DEVICE_REPLAY_MAX_STEPS)
+                .saturating_mul(mem::size_of::<CudaReplayRange>()),
+        )?;
+        b.batch_replay_range_counts = self.allocate_u32(GPU_STORY_BATCH_MAX_LANES)?;
         b.batch_delta_pointer_table = self.allocate_u64(BATCH_DELTA_POINTER_COUNT)?;
         b.phase_profile_counters = self.allocate_u64(CUDA_PHASE_PROFILE_COUNTER_COUNT)?;
         b.replay_profile_counters = self.allocate_u64(CUDA_REPLAY_PROFILE_COUNTER_COUNT)?;
@@ -5293,6 +5481,9 @@ impl CudaRuntime {
         )?;
         self.host_batch_base_ticks = self.allocate_pinned_host(
             GPU_STORY_BATCH_MAX_LANES.saturating_mul(mem::size_of::<u64>()),
+        )?;
+        self.host_batch_story_bytes = self.allocate_pinned_host(
+            GPU_STORY_BATCH_MAX_LANES.saturating_mul(CUDA_DEVICE_STORY_BYTES_PER_LANE),
         )?;
         self.host_batch_change_counts = self.allocate_pinned_host(
             GPU_STORY_BATCH_MAX_LANES
@@ -7290,6 +7481,7 @@ impl Drop for CudaRuntime {
             self.host_batch_step_buffers,
             self.host_batch_step_counts,
             self.host_batch_base_ticks,
+            self.host_batch_story_bytes,
             self.host_batch_change_counts,
             self.batch_snapshot_host_f32,
             self.batch_snapshot_host_u32,
@@ -7393,6 +7585,7 @@ struct PersistentWavefrontChunkLaunch {
 struct PersistentWavefrontLaunch {
     grid_blocks: u32,
     blocks_per_lane: u32,
+    extra_lane_blocks: u32,
     grouped: bool,
     phase_profile_sampled: bool,
     phase_profile_geometry_skipped: bool,
@@ -7460,16 +7653,20 @@ fn launch_shared_wavefront_persistent_chunk(
     let mut delta_pointers = coordinator.buffers.batch_delta_pointer_table.pointer;
 
     if grouped_blocks_per_lane > 0 {
-        // Cooperative grids must keep every CTA resident at a grid barrier.
-        // Launch an exact multiple of lane_count so every logical story owns
-        // the same number of CTAs and lane-local work has a stable stride.
-        let grid_blocks = lane_count
-            .checked_mul(grouped_blocks_per_lane)
-            .ok_or_else(|| LeoError::cuda("GPU grouped persistent grid overflow"))?;
+        // The grouped kernel uses per-lane cooperative-residency barriers, so
+        // the physical grid no longer has to be rounded down to an exact
+        // multiple of logical lanes. Use every tuner-approved resident CTA;
+        // the first `grid_blocks % lane_count` lanes receive one extra block.
+        let grid_blocks = grouped_budget;
+        let extra_lane_blocks = grid_blocks % lane_count;
         let phase_profile_sampled =
             phase_profile && coordinator.shared.shared_grouped_profile_blocks_256 >= grid_blocks;
         let phase_profile_geometry_skipped = phase_profile && !phase_profile_sampled;
         let mut blocks_per_lane_value = grouped_blocks_per_lane;
+        coordinator.memset_zero_async(coordinator.buffers.batch_lane_barrier_counts)?;
+        coordinator.memset_zero_async(coordinator.buffers.batch_lane_barrier_epochs)?;
+        let mut lane_barrier_counts = coordinator.buffers.batch_lane_barrier_counts.pointer;
+        let mut lane_barrier_epochs = coordinator.buffers.batch_lane_barrier_epochs.pointer;
         if phase_profile_sampled {
             let mut phase_profile_counters = coordinator.buffers.phase_profile_counters.pointer;
             let mut parameters = [
@@ -7485,6 +7682,8 @@ fn launch_shared_wavefront_persistent_chunk(
                 param(&mut scale),
                 param(&mut delta_pointers),
                 param(&mut blocks_per_lane_value),
+                param(&mut lane_barrier_counts),
+                param(&mut lane_barrier_epochs),
                 param(&mut phase_profile_counters),
             ];
             coordinator.launch_cooperative_exact(
@@ -7510,6 +7709,8 @@ fn launch_shared_wavefront_persistent_chunk(
                 param(&mut scale),
                 param(&mut delta_pointers),
                 param(&mut blocks_per_lane_value),
+                param(&mut lane_barrier_counts),
+                param(&mut lane_barrier_epochs),
             ];
             coordinator.launch_cooperative_exact(
                 coordinator
@@ -7524,6 +7725,7 @@ fn launch_shared_wavefront_persistent_chunk(
         return Ok(PersistentWavefrontLaunch {
             grid_blocks,
             blocks_per_lane: grouped_blocks_per_lane,
+            extra_lane_blocks,
             grouped: true,
             phase_profile_sampled,
             phase_profile_geometry_skipped,
@@ -7557,6 +7759,7 @@ fn launch_shared_wavefront_persistent_chunk(
     Ok(PersistentWavefrontLaunch {
         grid_blocks,
         blocks_per_lane: 1,
+        extra_lane_blocks: 0,
         grouped: false,
         phase_profile_sampled: false,
         phase_profile_geometry_skipped: phase_profile,
@@ -7915,6 +8118,180 @@ fn combine_parameter_changes(
     fixed
 }
 
+fn device_replay_range_stride(model: &Model) -> usize {
+    let fraction = model.config.replay.fraction;
+    let segment_targets = model.config.replay.segment_bytes;
+    if !fraction.is_finite() || fraction <= 0.0 || segment_targets == 0 {
+        return 1;
+    }
+    let target_budget = ((CUDA_DEVICE_REPLAY_MAX_STEPS as f64) * (fraction.min(1.0) as f64))
+        .ceil()
+        .max(1.0) as usize;
+    target_budget.div_ceil(segment_targets).max(1)
+}
+
+fn launch_device_story_step_builder(
+    coordinator: &CudaRuntime,
+    lane_count: usize,
+    strength: f32,
+) -> LeoResult<()> {
+    let mut story_bytes = coordinator.buffers.batch_story_bytes.pointer;
+    let mut story_byte_stride = as_u32(
+        "GPU device story byte stride",
+        CUDA_DEVICE_STORY_BYTES_PER_LANE,
+    )?;
+    let mut step_counts = coordinator.buffers.batch_step_counts.pointer;
+    let mut base_ticks = coordinator.buffers.batch_base_ticks.pointer;
+    let mut step_buffers = coordinator.buffers.batch_step_buffers.pointer;
+    let mut lane_count_value = as_u32("GPU device story step lane count", lane_count)?;
+    let mut model_seed = coordinator.model.config.model.seed;
+    let mut context_dropout_rate = coordinator.model.config.context.dropout_rate;
+    let mut strength_value = strength;
+    let mut end_document_weight = coordinator.model.config.learning.end_document_weight;
+    let mut parameters = [
+        param(&mut story_bytes),
+        param(&mut story_byte_stride),
+        param(&mut step_counts),
+        param(&mut base_ticks),
+        param(&mut step_buffers),
+        param(&mut lane_count_value),
+        param(&mut model_seed),
+        param(&mut context_dropout_rate),
+        param(&mut strength_value),
+        param(&mut end_document_weight),
+    ];
+    coordinator.launch_exact(
+        coordinator.shared.kernels.build_shared_story_steps,
+        lane_count_value,
+        SHARED_BATCH_THREADS,
+        &mut parameters,
+    )?;
+    if coordinator.debug.launches {
+        eprintln!(
+            "{{\"event\":\"cuda_debug_launch\",\"scope\":\"device_story_steps\",\"kernel\":\"leo_build_shared_story_steps\",\"grid_blocks\":{},\"threads\":{},\"story_byte_stride\":{}}}",
+            lane_count_value,
+            SHARED_BATCH_THREADS,
+            story_byte_stride,
+        );
+    }
+    Ok(())
+}
+
+fn launch_device_story_postprocess(
+    coordinator: &CudaRuntime,
+    lane_count: usize,
+    replay_range_stride: usize,
+) -> LeoResult<()> {
+    let mut pointer_tables = coordinator.buffers.batch_pointer_tables.pointer;
+    let mut step_buffers = coordinator.buffers.batch_step_buffers.pointer;
+    let mut step_counts = coordinator.buffers.batch_step_counts.pointer;
+    let mut lane_count_value = as_u32("GPU device story postprocess lane count", lane_count)?;
+    let mut replay_fraction = coordinator.model.config.replay.fraction;
+    let mut replay_segment_targets = as_u32(
+        "GPU replay segment targets",
+        coordinator.model.config.replay.segment_bytes,
+    )?;
+    let mut recurrent_capacity = as_u32(
+        "GPU recurrent capacity per neuron",
+        coordinator.model.recurrent.capacity_per_neuron,
+    )?;
+    let mut replay_range_stride_value = as_u32("GPU replay range stride", replay_range_stride)?;
+    let mut story_summaries = coordinator.buffers.batch_story_summaries.pointer;
+    let mut replay_ranges = coordinator.buffers.batch_replay_ranges.pointer;
+    let mut replay_range_counts = coordinator.buffers.batch_replay_range_counts.pointer;
+    let mut parameters = [
+        param(&mut pointer_tables),
+        param(&mut step_buffers),
+        param(&mut step_counts),
+        param(&mut lane_count_value),
+        param(&mut replay_fraction),
+        param(&mut replay_segment_targets),
+        param(&mut recurrent_capacity),
+        param(&mut replay_range_stride_value),
+        param(&mut story_summaries),
+        param(&mut replay_ranges),
+        param(&mut replay_range_counts),
+    ];
+    coordinator.launch_exact(
+        coordinator.shared.kernels.postprocess_shared_story_records,
+        lane_count_value,
+        SHARED_BATCH_THREADS,
+        &mut parameters,
+    )?;
+    if coordinator.debug.launches {
+        eprintln!(
+            "{{\"event\":\"cuda_debug_launch\",\"scope\":\"device_story_postprocess\",\"kernel\":\"leo_postprocess_shared_story_records\",\"grid_blocks\":{},\"threads\":{},\"replay_range_stride\":{}}}",
+            lane_count_value,
+            SHARED_BATCH_THREADS,
+            replay_range_stride_value,
+        );
+    }
+    Ok(())
+}
+
+type CudaDeviceStoryPostprocess = (
+    Vec<CudaDeviceStorySummary>,
+    Vec<Vec<std::ops::Range<usize>>>,
+);
+
+fn read_device_story_postprocess(
+    coordinator: &CudaRuntime,
+    lane_count: usize,
+    replay_range_stride: usize,
+) -> LeoResult<CudaDeviceStoryPostprocess> {
+    let mut raw_summaries = vec![CudaFastStorySummary::default(); lane_count];
+    let mut range_counts = vec![0u32; lane_count];
+    coordinator.copy_from_device_prefix(
+        coordinator.buffers.batch_story_summaries,
+        &mut raw_summaries,
+    )?;
+    coordinator.copy_from_device_prefix(
+        coordinator.buffers.batch_replay_range_counts,
+        &mut range_counts,
+    )?;
+
+    let range_slots = lane_count.saturating_mul(replay_range_stride);
+    let mut raw_ranges = vec![CudaReplayRange::default(); range_slots];
+    if range_slots != 0 {
+        coordinator
+            .copy_from_device_prefix(coordinator.buffers.batch_replay_ranges, &mut raw_ranges)?;
+    }
+
+    let mut summaries = Vec::with_capacity(lane_count);
+    let mut replay_ranges = Vec::with_capacity(lane_count);
+    for lane in 0..lane_count {
+        let raw = raw_summaries[lane];
+        if raw.error_code != 0 {
+            return Err(LeoError::cuda(format!(
+                "CUDA device story postprocess rejected lane {lane} (code {})",
+                raw.error_code
+            )));
+        }
+        summaries.push(CudaDeviceStorySummary {
+            training_loss_sum: raw.training_loss_sum,
+            training_targets: raw.training_targets as u64,
+            active_neurons_sum: raw.active_neurons_sum,
+            active_neurons_peak: raw.active_neurons_peak as u64,
+            synaptic_events: raw.synaptic_events,
+            context_applied_steps: raw.context_applied_steps,
+        });
+
+        let count = range_counts[lane] as usize;
+        if count > replay_range_stride {
+            return Err(LeoError::cuda(format!(
+                "CUDA device replay range count {count} exceeds stride {replay_range_stride} for lane {lane}"
+            )));
+        }
+        let base = lane.saturating_mul(replay_range_stride);
+        let mut ranges = Vec::with_capacity(count);
+        for raw_range in &raw_ranges[base..base + count] {
+            ranges.push(raw_range.start as usize..raw_range.end as usize);
+        }
+        replay_ranges.push(ranges);
+    }
+    Ok((summaries, replay_ranges))
+}
+
 pub(crate) fn train_story_batch_shared_device(
     coordinator: &mut CudaRuntime,
     lanes: &mut [CudaBatchLane],
@@ -7955,41 +8332,35 @@ pub(crate) fn train_story_batch_shared_device(
         lane.model_revision = u64::MAX;
     }
 
-    let story_steps = stories
+    let story_step_counts_total = stories
         .iter()
         .map(|story| {
             if story.is_empty() {
-                return Vec::new();
+                0usize
+            } else {
+                story.len() + 1
             }
-            let mut steps = Vec::with_capacity(story.len() + 1);
-            steps.push((BEGIN_DOCUMENT, Some(story[0] as u32)));
-            steps.extend(
-                story
-                    .windows(2)
-                    .map(|window| (window[0] as u32, Some(window[1] as u32))),
-            );
-            steps.push((
-                *story.last().expect("nonempty story") as u32,
-                Some(END_DOCUMENT),
-            ));
-            steps
         })
         .collect::<Vec<_>>();
-    let tuning_work_units = story_steps
+    let tuning_work_units = story_step_counts_total
         .iter()
-        .map(|steps| steps.len() as u64)
+        .map(|&count| count as u64)
         .sum::<u64>();
     let tuning_started = Instant::now();
     let execution_plan = coordinator.execution_tuner.plan_for(lanes.len());
     let physical_lane_chunk = execution_plan.physical_lane_chunk.max(1);
-
-    let mut offsets = vec![0usize; lanes.len()];
-    let mut story_metrics = story_steps
-        .iter()
-        .map(|steps| Vec::with_capacity(steps.len()))
-        .collect::<Vec<_>>();
     let learning_trace = !matches!(permission, Permission::Frozen);
     let strength = permission.strength(&coordinator.model.config);
+    let use_persistent_shared = coordinator.shared_persistent_enabled
+        && learning_trace
+        && !coordinator.full_step_metrics
+        && coordinator.shared.cooperative_launch
+        && (coordinator.shared.shared_persistent_blocks_256 > 0
+            || coordinator.shared.shared_grouped_blocks_256 > 0)
+        && execution_plan.fused_wavefront_blocks > 0
+        && execution_plan.fused_wavefront_threads == SHARED_BATCH_THREADS;
+
+    let mut offsets = vec![0usize; lanes.len()];
     // Retained in kernel launch ABI for compatibility with cached/source-tested
     // launch plumbing. Exact story-local learning no longer applies this scale
     // per byte; `apply_mean_deltas` performs the only 1/workers reduction.
@@ -7997,6 +8368,50 @@ pub(crate) fn train_story_batch_shared_device(
     let mut lane_learned_steps = vec![0u64; lanes.len()];
     let mut lane_context_learning = vec![false; lanes.len()];
     let mut lane_statistics = vec![StatisticsDelta::default(); lanes.len()];
+    let device_postprocess_enabled = cuda_device_story_postprocess_enabled()
+        && !retain_story_deltas
+        && use_persistent_shared
+        && coordinator.shared.shared_grouped_blocks_256 >= lanes.len() as u32
+        && execution_plan.fused_wavefront_blocks >= lanes.len() as u32
+        && story_step_counts_total
+            .iter()
+            .all(|&count| count <= CUDA_DEVICE_REPLAY_MAX_STEPS);
+    let device_story_steps_enabled = cuda_device_story_steps_enabled()
+        && device_postprocess_enabled
+        && stories
+            .iter()
+            .all(|story| story.len() < CUDA_DEVICE_STORY_BYTES_PER_LANE);
+    let story_steps = if device_story_steps_enabled {
+        vec![Vec::new(); stories.len()]
+    } else {
+        stories
+            .iter()
+            .map(|story| {
+                if story.is_empty() {
+                    return Vec::new();
+                }
+                let mut steps = Vec::with_capacity(story.len() + 1);
+                steps.push((BEGIN_DOCUMENT, Some(story[0] as u32)));
+                steps.extend(
+                    story
+                        .windows(2)
+                        .map(|window| (window[0] as u32, Some(window[1] as u32))),
+                );
+                steps.push((
+                    *story.last().expect("nonempty story") as u32,
+                    Some(END_DOCUMENT),
+                ));
+                steps
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut story_metrics = story_step_counts_total
+        .iter()
+        .map(|&count| Vec::with_capacity(count))
+        .collect::<Vec<_>>();
+    let replay_range_stride = device_replay_range_stride(&coordinator.model);
+    let mut device_story_summaries = Vec::new();
+    let mut device_replay_ranges = Vec::new();
 
     let profile_batch = coordinator.execution_tuner.should_profile_batch();
     let mut telemetry = CudaBatchTelemetry {
@@ -8015,10 +8430,20 @@ pub(crate) fn train_story_batch_shared_device(
         coordinator.clear_phase_profile_counters_async()?;
     }
 
+    if device_story_steps_enabled {
+        let mut packed_story_bytes =
+            vec![0u8; lanes.len().saturating_mul(CUDA_DEVICE_STORY_BYTES_PER_LANE)];
+        for (lane_index, story) in stories.iter().enumerate() {
+            let base = lane_index.saturating_mul(CUDA_DEVICE_STORY_BYTES_PER_LANE);
+            packed_story_bytes[base..base + story.len()].copy_from_slice(story);
+        }
+        pinned_write(coordinator.host_batch_story_bytes, &packed_story_bytes)?;
+    }
+
     while offsets
         .iter()
-        .zip(&story_steps)
-        .any(|(&offset, steps)| offset < steps.len())
+        .zip(&story_step_counts_total)
+        .any(|(&offset, &count)| offset < count)
     {
         let mut pointer_tables = Vec::with_capacity(lanes.len());
         let mut step_buffers = Vec::with_capacity(lanes.len());
@@ -8029,73 +8454,85 @@ pub(crate) fn train_story_batch_shared_device(
         let mut chunk_h2d_bytes = 0u64;
         let mut chunk_d2h_bytes = 0u64;
 
-        // Prepare every pinned host lane first. Uploads are intentionally
-        // deferred until physical groups are scheduled so the transfer stream
-        // can stage group N+1 while the compute stream executes group N.
+        // Prepare every lane descriptor first. The common production path
+        // uploads raw story bytes once and lets the GPU derive exact persistent
+        // steps; the historical host descriptor path remains the fallback for
+        // long/debug/multi-GPU executions.
         for lane_index in 0..lanes.len() {
             let lane = &mut lanes[lane_index];
-            let steps = &story_steps[lane_index];
             let start = offsets[lane_index];
             let end = start
                 .saturating_add(TRAINING_STEP_BATCH_CAPACITY)
-                .min(steps.len());
-            let chunk = &steps[start..end];
-            max_chunk_steps = max_chunk_steps.max(chunk.len());
+                .min(story_step_counts_total[lane_index]);
+            let chunk_count = end.saturating_sub(start);
+            max_chunk_steps = max_chunk_steps.max(chunk_count);
             let base_tick = lane.current_tick;
-            let mut device_steps = Vec::with_capacity(chunk.len());
-            let mut lane_metadata = Vec::with_capacity(chunk.len());
+            let mut lane_metadata = Vec::with_capacity(chunk_count);
 
-            for (record_index, &(symbol, target)) in chunk.iter().enumerate() {
-                if !is_input_symbol(symbol) {
-                    return Err(LeoError::cuda(format!("invalid input symbol: {symbol}")));
+            if device_story_steps_enabled {
+                if start != 0 {
+                    return Err(LeoError::cuda(
+                        "device story-step builder unexpectedly required multiple chunks",
+                    ));
                 }
-                let target_index = target
-                    .map(|value| {
-                        output_symbol_to_index(value).ok_or_else(|| {
-                            LeoError::cuda(format!("invalid output target: {value}"))
+            } else {
+                let steps = &story_steps[lane_index];
+                let chunk = &steps[start..end];
+                let mut device_steps = Vec::with_capacity(chunk.len());
+                for (record_index, &(symbol, target)) in chunk.iter().enumerate() {
+                    if !is_input_symbol(symbol) {
+                        return Err(LeoError::cuda(format!("invalid input symbol: {symbol}")));
+                    }
+                    let target_index = target
+                        .map(|value| {
+                            output_symbol_to_index(value).ok_or_else(|| {
+                                LeoError::cuda(format!("invalid output target: {value}"))
+                            })
                         })
-                    })
-                    .transpose()?;
-                let tick = base_tick.saturating_add(record_index as u64);
-                let context_enabled = matches!(permission, Permission::Frozen)
-                    || context_survives_dropout(
-                        coordinator.model.config.model.seed,
-                        tick,
+                        .transpose()?;
+                    let tick = base_tick.saturating_add(record_index as u64);
+                    let context_enabled = matches!(permission, Permission::Frozen)
+                        || context_survives_dropout(
+                            coordinator.model.config.model.seed,
+                            tick,
+                            symbol,
+                            coordinator.model.config.context.dropout_rate,
+                        );
+                    let learned = target_index.is_some() && strength > 0.0;
+                    let supervised_strength = target_index.map_or(0.0, |target_output_index| {
+                        let target_weight = if target_output_index == END_DOCUMENT_OUTPUT_INDEX {
+                            coordinator.model.config.learning.end_document_weight
+                        } else {
+                            1.0
+                        };
+                        strength * target_weight
+                    });
+                    if learned {
+                        lane_learned_steps[lane_index] =
+                            lane_learned_steps[lane_index].saturating_add(1);
+                        lane_context_learning[lane_index] |= context_enabled;
+                    }
+                    device_steps.push(CudaPersistentStep {
                         symbol,
-                        coordinator.model.config.context.dropout_rate,
-                    );
-                let learned = target_index.is_some() && strength > 0.0;
-                let supervised_strength = target_index.map_or(0.0, |target_output_index| {
-                    let target_weight = if target_output_index == END_DOCUMENT_OUTPUT_INDEX {
-                        coordinator.model.config.learning.end_document_weight
-                    } else {
-                        1.0
-                    };
-                    strength * target_weight
-                });
-                if learned {
-                    lane_learned_steps[lane_index] =
-                        lane_learned_steps[lane_index].saturating_add(1);
-                    lane_context_learning[lane_index] |= context_enabled;
+                        target_index: target_index.map(|index| index as i32).unwrap_or(-1),
+                        context_enabled: u32::from(context_enabled),
+                        supervised_strength,
+                    });
+                    lane_metadata.push((symbol, target_index, context_enabled, learned));
                 }
-                device_steps.push(CudaPersistentStep {
-                    symbol,
-                    target_index: target_index.map(|index| index as i32).unwrap_or(-1),
-                    context_enabled: u32::from(context_enabled),
-                    supervised_strength,
-                });
-                lane_metadata.push((symbol, target_index, context_enabled, learned));
+
+                pinned_write(lane.host_steps, &device_steps)?;
+                chunk_h2d_bytes = chunk_h2d_bytes.saturating_add(
+                    (device_steps
+                        .len()
+                        .saturating_mul(mem::size_of::<CudaPersistentStep>()))
+                        as u64,
+                );
             }
 
-            pinned_write(lane.host_steps, &device_steps)?;
-            chunk_h2d_bytes = chunk_h2d_bytes.saturating_add(
-                (device_steps
-                    .len()
-                    .saturating_mul(mem::size_of::<CudaPersistentStep>())) as u64,
-            );
             pointer_tables.push(lane.buffers.persistent_pointer_table.pointer);
             step_buffers.push(lane.buffers.persistent_steps.pointer);
-            step_counts.push(as_u32("GPU shared story batch step count", chunk.len())?);
+            step_counts.push(as_u32("GPU shared story batch step count", chunk_count)?);
             base_ticks.push(base_tick);
             metadata.push(lane_metadata);
             offsets[lane_index] = end;
@@ -8137,6 +8574,16 @@ pub(crate) fn train_story_batch_shared_device(
             base_ticks.len(),
             coordinator.transfer_stream,
         )?;
+        if device_story_steps_enabled {
+            let story_bytes = lanes.len().saturating_mul(CUDA_DEVICE_STORY_BYTES_PER_LANE);
+            coordinator.copy_pinned_to_device_async_on::<u8>(
+                coordinator.buffers.batch_story_bytes,
+                coordinator.host_batch_story_bytes,
+                story_bytes,
+                coordinator.transfer_stream,
+            )?;
+            chunk_h2d_bytes = chunk_h2d_bytes.saturating_add(story_bytes as u64);
+        }
         chunk_h2d_bytes = chunk_h2d_bytes
             .saturating_add((pointer_tables.len() * mem::size_of::<CuDevicePtr>()) as u64)
             .saturating_add((step_buffers.len() * mem::size_of::<CuDevicePtr>()) as u64)
@@ -8147,14 +8594,6 @@ pub(crate) fn train_story_batch_shared_device(
             "GPU shared model block count",
             coordinator.model.config.model.block_count,
         )?;
-        let use_persistent_shared = coordinator.shared_persistent_enabled
-            && learning_trace
-            && !coordinator.full_step_metrics
-            && coordinator.shared.cooperative_launch
-            && (coordinator.shared.shared_persistent_blocks_256 > 0
-                || coordinator.shared.shared_grouped_blocks_256 > 0)
-            && execution_plan.fused_wavefront_blocks > 0
-            && execution_plan.fused_wavefront_threads == SHARED_BATCH_THREADS;
         let mut compute_timing_started = false;
 
         // Pipeline the first wavefront with the lane uploads. This creates real
@@ -8163,16 +8602,18 @@ pub(crate) fn train_story_batch_shared_device(
         // canonical story-batch mean is applied after all wavefronts complete.
         for (group_index, lane_start) in (0..lanes.len()).step_by(physical_lane_chunk).enumerate() {
             let physical_lane_count = physical_lane_chunk.min(lanes.len() - lane_start);
-            for lane_index in lane_start..lane_start + physical_lane_count {
-                let count = step_counts[lane_index] as usize;
-                if count != 0 {
-                    let lane = &lanes[lane_index];
-                    coordinator.copy_pinned_to_device_async_on::<CudaPersistentStep>(
-                        lane.buffers.persistent_steps,
-                        lane.host_steps,
-                        count,
-                        coordinator.transfer_stream,
-                    )?;
+            if !device_story_steps_enabled {
+                for lane_index in lane_start..lane_start + physical_lane_count {
+                    let count = step_counts[lane_index] as usize;
+                    if count != 0 {
+                        let lane = &lanes[lane_index];
+                        coordinator.copy_pinned_to_device_async_on::<CudaPersistentStep>(
+                            lane.buffers.persistent_steps,
+                            lane.host_steps,
+                            count,
+                            coordinator.transfer_stream,
+                        )?;
+                    }
                 }
             }
             let upload_ready = coordinator.events.upload_ready[group_index];
@@ -8193,6 +8634,9 @@ pub(crate) fn train_story_batch_shared_device(
                     "cuEventRecord(compute start)",
                 )?;
                 compute_timing_started = true;
+            }
+            if device_story_steps_enabled && group_index == 0 {
+                launch_device_story_step_builder(coordinator, lanes.len(), strength)?;
             }
             if max_chunk_steps != 0 && use_persistent_shared {
                 let group_max_steps = step_counts[lane_start..lane_start + physical_lane_count]
@@ -8248,10 +8692,12 @@ pub(crate) fn train_story_batch_shared_device(
                             "leo_shared_wavefront_persistent"
                         };
                         eprintln!(
-                            "{{\"event\":\"cuda_debug_launch\",\"scope\":\"shared_story_batch\",\"kernel\":\"{}\",\"grid_blocks\":{},\"blocks_per_lane\":{},\"threads\":{},\"lane_start\":{},\"lane_count\":{},\"step_count\":{}}}",
+                            "{{\"event\":\"cuda_debug_launch\",\"scope\":\"shared_story_batch\",\"kernel\":\"{}\",\"grid_blocks\":{},\"blocks_per_lane_min\":{},\"blocks_per_lane_max\":{},\"extra_lane_blocks\":{},\"threads\":{},\"lane_start\":{},\"lane_count\":{},\"step_count\":{}}}",
                             kernel,
                             persistent_launch.grid_blocks,
                             persistent_launch.blocks_per_lane,
+                            persistent_launch.blocks_per_lane + u32::from(persistent_launch.extra_lane_blocks > 0),
+                            persistent_launch.extra_lane_blocks,
                             SHARED_BATCH_THREADS,
                             lane_start,
                             physical_lane_count,
@@ -8359,6 +8805,10 @@ pub(crate) fn train_story_batch_shared_device(
             }
         }
 
+        if device_postprocess_enabled && use_persistent_shared {
+            launch_device_story_postprocess(coordinator, lanes.len(), replay_range_stride)?;
+        }
+
         if profile_batch {
             coordinator.record_event(
                 coordinator.events.compute_end,
@@ -8386,7 +8836,7 @@ pub(crate) fn train_story_batch_shared_device(
 
         for lane_index in 0..lanes.len() {
             let count = step_counts[lane_index] as usize;
-            if count == 0 {
+            if count == 0 || (device_postprocess_enabled && use_persistent_shared) {
                 continue;
             }
             let lane = &lanes[lane_index];
@@ -8444,6 +8894,31 @@ pub(crate) fn train_story_batch_shared_device(
             telemetry.d2h_bytes = telemetry.d2h_bytes.saturating_add(chunk_d2h_bytes);
         }
 
+        if device_postprocess_enabled && use_persistent_shared {
+            let (summaries, ranges) =
+                read_device_story_postprocess(coordinator, lanes.len(), replay_range_stride)?;
+            device_story_summaries = summaries;
+            device_replay_ranges = ranges;
+            for lane_index in 0..lanes.len() {
+                let summary = device_story_summaries[lane_index];
+                lane_learned_steps[lane_index] = if strength > 0.0 {
+                    summary.training_targets
+                } else {
+                    0
+                };
+                lane_context_learning[lane_index] =
+                    strength > 0.0 && summary.context_applied_steps != 0;
+                let statistics = &mut lane_statistics[lane_index];
+                statistics.processed_bytes = stories[lane_index].len() as u64;
+                statistics.training_loss_sum = summary.training_loss_sum;
+                statistics.training_targets = summary.training_targets;
+                statistics.active_neurons_sum = summary.active_neurons_sum;
+                statistics.active_neurons_peak = summary.active_neurons_peak;
+                statistics.synaptic_events = summary.synaptic_events;
+                statistics.persistent_ticks = summary.training_targets;
+            }
+        }
+
         for lane_index in 0..lanes.len() {
             let lane = &mut lanes[lane_index];
             let count = step_counts[lane_index] as usize;
@@ -8476,6 +8951,11 @@ pub(crate) fn train_story_batch_shared_device(
                 coordinator.refresh_shared_batch_pointer_table_async(lane)?;
             }
             lane.current_tick = lane.current_tick.saturating_add(count as u64);
+
+            if device_postprocess_enabled && use_persistent_shared {
+                metadata[lane_index].clear();
+                continue;
+            }
 
             if use_persistent_shared {
                 let records =
@@ -8570,8 +9050,8 @@ pub(crate) fn train_story_batch_shared_device(
     }
 
     if learning_trace {
-        for (statistics, steps) in lane_statistics.iter_mut().zip(&story_steps) {
-            if !steps.is_empty() {
+        for (statistics, &step_count) in lane_statistics.iter_mut().zip(&story_step_counts_total) {
+            if step_count != 0 {
                 statistics.processed_stories = statistics.processed_stories.saturating_add(1);
             }
         }
@@ -8739,6 +9219,8 @@ pub(crate) fn train_story_batch_shared_device(
 
     Ok(CudaStoryBatchReport {
         story_metrics,
+        story_summaries: device_story_summaries,
+        replay_ranges: device_replay_ranges,
         merge,
         story_deltas: retained_deltas,
         story_changes: retained_changes,
@@ -9012,6 +9494,12 @@ fn load_kernels(driver: &DriverFunctions, module: CuModule) -> LeoResult<KernelF
             driver,
             module,
             "leo_shared_capture_training_step",
+        )?,
+        build_shared_story_steps: get_kernel(driver, module, "leo_build_shared_story_steps")?,
+        postprocess_shared_story_records: get_kernel(
+            driver,
+            module,
+            "leo_postprocess_shared_story_records",
         )?,
         merge_shared_lane_fixed_parameters: get_kernel(
             driver,

@@ -317,9 +317,21 @@ impl DeviceModelLayout {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeviceStorySummary {
+    pub training_loss_sum: f64,
+    pub training_targets: u64,
+    pub active_neurons_sum: u64,
+    pub active_neurons_peak: u64,
+    pub synaptic_events: u64,
+    pub context_applied_steps: u64,
+}
+
 #[derive(Debug)]
 pub struct DeviceStoryBatchReport {
     pub story_metrics: Vec<Vec<StepMetrics>>,
+    pub story_summaries: Vec<DeviceStorySummary>,
+    pub replay_ranges: Vec<Vec<std::ops::Range<usize>>>,
     pub merge: MergeMetrics,
 }
 
@@ -329,6 +341,8 @@ pub struct DeviceStoryBatchReport {
 #[derive(Debug)]
 pub struct DeviceStoryBatchDeltaReport {
     pub story_metrics: Vec<Vec<StepMetrics>>,
+    pub story_summaries: Vec<DeviceStorySummary>,
+    pub replay_ranges: Vec<Vec<std::ops::Range<usize>>>,
     pub merge: MergeMetrics,
     pub story_deltas: Vec<SparseModelDelta>,
     pub story_changes: Vec<ParameterChanges>,
@@ -719,6 +733,19 @@ impl RuntimeBackend for GpuRuntime {
         };
         Ok(Some(DeviceStoryBatchReport {
             story_metrics: report.story_metrics,
+            story_summaries: report
+                .story_summaries
+                .into_iter()
+                .map(|summary| DeviceStorySummary {
+                    training_loss_sum: summary.training_loss_sum,
+                    training_targets: summary.training_targets,
+                    active_neurons_sum: summary.active_neurons_sum,
+                    active_neurons_peak: summary.active_neurons_peak,
+                    synaptic_events: summary.synaptic_events,
+                    context_applied_steps: summary.context_applied_steps,
+                })
+                .collect(),
+            replay_ranges: report.replay_ranges,
             merge: report.merge,
         }))
     }
@@ -733,6 +760,19 @@ impl RuntimeBackend for GpuRuntime {
         };
         Ok(Some(DeviceStoryBatchDeltaReport {
             story_metrics: report.story_metrics,
+            story_summaries: report
+                .story_summaries
+                .into_iter()
+                .map(|summary| DeviceStorySummary {
+                    training_loss_sum: summary.training_loss_sum,
+                    training_targets: summary.training_targets,
+                    active_neurons_sum: summary.active_neurons_sum,
+                    active_neurons_peak: summary.active_neurons_peak,
+                    synaptic_events: summary.synaptic_events,
+                    context_applied_steps: summary.context_applied_steps,
+                })
+                .collect(),
+            replay_ranges: report.replay_ranges,
             merge: report.merge,
             story_deltas: report.story_deltas,
             story_changes: report.story_changes,
