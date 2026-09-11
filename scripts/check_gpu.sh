@@ -547,6 +547,9 @@ if count != 1:
 source, count = re.subn(r"(?m)^block_count = 8$", "block_count = 256", source, count=1)
 if count != 1:
     raise SystemExit("could not widen grouped regression block_count")
+source, count = re.subn(r"(?m)^max_active_global = 8$", "max_active_global = 256", source, count=1)
+if count != 1:
+    raise SystemExit("could not widen grouped regression max_active_global")
 source, count = re.subn(r"(?m)^fraction = 0\.30$", "fraction = 0.0", source, count=1)
 if count != 1:
     raise SystemExit("could not disable replay in grouped regression config")
