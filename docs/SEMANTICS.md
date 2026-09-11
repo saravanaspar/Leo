@@ -6,7 +6,7 @@ Leo separates **what learning means** from **where and how it executes**. A chec
 
 | Contract | Version |
 | --- | ---: |
-| Leo release | 1.0.2 |
+| Leo release | 1.0.3 |
 | Model schema | 1 |
 | Training policy | 1 |
 | Execution semantics | 1 |

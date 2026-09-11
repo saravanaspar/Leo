@@ -4,6 +4,8 @@ All notable project changes should be recorded here.
 
 ## Unreleased
 
+## v1.0.3 - 2026-09-11
+
 - Interleave four independent exact learning-signal output-error dot products per CUDA thread, reusing each error load while preserving every row's FP32 accumulation order; avoid redundant current-tick destination-epoch reads on the bounded worklist.
 - Add an append-only CUDA performance history keyed by Leo version plus exact GitHub commit/PR, capturing the two v1.0.2 P100 evidence rounds and their archive digests.
 - Replace the sparse global winner selector's repeated 128-run linear scan with an exact shared-memory max-heap merge, preserving packed ordering, cutoff behavior, and the dense/non-finite fallback.
