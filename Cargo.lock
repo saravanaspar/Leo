@@ -26,7 +26,7 @@ dependencies = [
 
 [[package]]
 name = "leo-cli"
-version = "1.0.3"
+version = "1.0.31"
 dependencies = [
  "leo-core",
  "leo-data",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "leo-core"
-version = "1.0.3"
+version = "1.0.31"
 dependencies = [
  "serde",
  "toml",
@@ -44,14 +44,14 @@ dependencies = [
 
 [[package]]
 name = "leo-data"
-version = "1.0.3"
+version = "1.0.31"
 dependencies = [
  "leo-core",
 ]
 
 [[package]]
 name = "leo-format"
-version = "1.0.3"
+version = "1.0.31"
 dependencies = [
  "leo-core",
 ]
