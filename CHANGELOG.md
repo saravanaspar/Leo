@@ -2,7 +2,10 @@
 
 All notable project changes should be recorded here.
 
-## Unreleased
+## v1.0.32 - 2026-09-11
+
+- Fix CUDA device-postprocess dispatch so the GPU-native representation with one empty per-step metrics vector per logical story is correctly recognized, preserving device-side story loss/target summaries and exact device-selected replay ranges instead of incorrectly falling back to legacy host metrics.
+- Add focused regression coverage for the multi-lane empty-metrics representation that exposed the P100 mean-loss reporting failure while keeping CUDA training arithmetic, FP32 operation order, logical workers, replay semantics, RNG, and checkpoint/schema formats unchanged.
 
 ## v1.0.31 - 2026-09-11
 
