@@ -4,6 +4,8 @@ All notable project changes should be recorded here.
 
 ## Unreleased
 
+- Revert the four-row CUDA learning-signal interleave after fresh P100 measurement showed a substantial exact-path throughput regression; retain the v1.0.3 result in the CUDA performance ledger as negative evidence.
+
 ## v1.0.3 - 2026-09-11
 
 - Interleave four independent exact learning-signal output-error dot products per CUDA thread, reusing each error load while preserving every row's FP32 accumulation order; avoid redundant current-tick destination-epoch reads on the bounded worklist.
