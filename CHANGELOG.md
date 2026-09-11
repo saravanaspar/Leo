@@ -4,6 +4,8 @@ All notable project changes should be recorded here.
 
 ## Unreleased
 
+## v1.0.2 - 2026-09-11
+
 - Add an automated protected release flow that accepts a SemVer input, rolls `Unreleased` changelog entries into a dated release section, updates release metadata, waits for required CI, squash-merges through the protected `main` branch, creates the immutable release tag, and publishes GitHub Release notes.
 - Make the README and active documentation release-version-neutral so normal software version bumps no longer require broad manual documentation edits.
 - Keep the reference GPU logical batch at 16 workers by default so backend selection cannot silently change the training denominator.
