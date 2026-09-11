@@ -1,0 +1,47 @@
+[1m[32m    Updating[0m crates.io index
+[1m[32m Downloading[0m crates ...
+[1m[32m  Downloaded[0m equivalent v1.0.2
+[1m[32m  Downloaded[0m serde_spanned v0.6.9
+[1m[32m  Downloaded[0m proc-macro2 v1.0.107
+[1m[32m  Downloaded[0m quote v1.0.47
+[1m[32m  Downloaded[0m toml_datetime v0.6.11
+[1m[32m  Downloaded[0m unicode-ident v1.0.24
+[1m[32m  Downloaded[0m toml v0.8.19
+[1m[32m  Downloaded[0m serde v1.0.229
+[1m[32m  Downloaded[0m toml_edit v0.22.22
+[1m[32m  Downloaded[0m indexmap v2.14.2
+[1m[32m  Downloaded[0m winnow v0.6.26
+[1m[32m  Downloaded[0m hashbrown v0.17.1
+[1m[32m  Downloaded[0m memchr v2.8.3
+[1m[32m  Downloaded[0m serde_derive v1.0.229
+[1m[32m  Downloaded[0m serde_core v1.0.229
+[1m[32m  Downloaded[0m syn v3.0.5
+[1m[32m   Compiling[0m proc-macro2 v1.0.107
+[1m[32m   Compiling[0m quote v1.0.47
+[1m[32m   Compiling[0m unicode-ident v1.0.24
+[1m[32m   Compiling[0m serde_core v1.0.229
+[1m[32m   Compiling[0m serde v1.0.229
+[1m[32m   Compiling[0m hashbrown v0.17.1
+[1m[32m   Compiling[0m equivalent v1.0.2
+[1m[32m   Compiling[0m winnow v0.6.26
+[1m[32m   Compiling[0m indexmap v2.14.2
+[1m[32m   Compiling[0m syn v3.0.5
+[1m[32m   Compiling[0m leo-core v1.0.2 (/kaggle/working/Leo/crates/leo-core)
+[1m[32m   Compiling[0m serde_derive v1.0.229
+[1m[32m   Compiling[0m toml_datetime v0.6.11
+[1m[32m   Compiling[0m serde_spanned v0.6.9
+[1m[32m   Compiling[0m toml_edit v0.22.22
+[1m[32m   Compiling[0m toml v0.8.19
+
+[HEARTBEAT] elapsed=11.0s | GPU0: util=0% mem=0/16384 MiB temp=35C
+[1m[32m   Compiling[0m leo-data v1.0.2 (/kaggle/working/Leo/crates/leo-data)
+[1m[32m   Compiling[0m leo-format v1.0.2 (/kaggle/working/Leo/crates/leo-format)
+[1m[32m   Compiling[0m leo-cli v1.0.2 (/kaggle/working/Leo/crates/leo-cli)
+
+[HEARTBEAT] elapsed=22.0s | GPU0: util=0% mem=0/16384 MiB temp=35C
+
+[HEARTBEAT] elapsed=32.0s | GPU0: util=0% mem=0/16384 MiB temp=35C
+[1m[32m    Finished[0m `release` profile [optimized] target(s) in 35.93s
+
+===== RELEASE BINARY =====
+leo: unknown command: --version

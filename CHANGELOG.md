@@ -4,6 +4,8 @@ All notable project changes should be recorded here.
 
 ## Unreleased
 
+- Interleave four independent exact learning-signal output-error dot products per CUDA thread, reusing each error load while preserving every row's FP32 accumulation order; avoid redundant current-tick destination-epoch reads on the bounded worklist.
+- Add an append-only CUDA performance history keyed by Leo version plus exact GitHub commit/PR, capturing the two v1.0.2 P100 evidence rounds and their archive digests.
 - Replace the sparse global winner selector's repeated 128-run linear scan with an exact shared-memory max-heap merge, preserving packed ordering, cutoff behavior, and the dense/non-finite fallback.
 - Make GPU acceptance/scaling helpers ignore inherited semantic/debug/rollback environment switches by default; add `--legacy-execution` for explicit exact legacy A/B runs and report the optimized shared kernel actually observed by the GPU gate.
 - Keep `LEO_CUDA_PHASE_PROFILE` on the grouped persistent production path when comparable profiled occupancy is available, otherwise emit an explicit skip without changing the execution kernel.
