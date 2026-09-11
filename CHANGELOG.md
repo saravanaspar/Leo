@@ -4,6 +4,8 @@ All notable project changes should be recorded here.
 
 ## Unreleased
 
+- Add an automated protected release flow that accepts a SemVer input, rolls `Unreleased` changelog entries into a dated release section, updates release metadata, waits for required CI, squash-merges through the protected `main` branch, creates the immutable release tag, and publishes GitHub Release notes.
+- Make the README and active documentation release-version-neutral so normal software version bumps no longer require broad manual documentation edits.
 - Keep the reference GPU logical batch at 16 workers by default so backend selection cannot silently change the training denominator.
 - Normalize exact GPU story-mean resume identity across physical GPU counts while accepting the two prior exact aliases and continuing to reject experimental device-mean resumes.
 - Require homogeneous CUDA devices for exact multi-GPU runs and reserve visible device 0 for the canonical runtime; use `CUDA_VISIBLE_DEVICES` for selection/reordering.

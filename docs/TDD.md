@@ -1,4 +1,4 @@
-# Leo v1.0.1 technical design
+# Leo technical design
 
 ## 1. Architectural boundary
 

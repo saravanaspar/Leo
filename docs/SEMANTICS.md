@@ -1,4 +1,4 @@
-# Leo v1.0.1 semantics contract
+# Leo semantics contract
 
 Leo separates **what learning means** from **where and how it executes**. A checkpoint records the semantic contract, while CPU and CUDA are implementations of that contract.
 
@@ -14,7 +14,7 @@ Leo separates **what learning means** from **where and how it executes**. A chec
 | CUDA ABI | 1 |
 | Checkpoint schema | 1 |
 
-v1.0.1 is a patch release of the v1 contract. The model schema, training policy, execution semantics, dataset schema, CUDA ABI, checkpoint schema, and `PSCLS100` checkpoint format remain unchanged from v1.0.0. Existing valid v1 artifacts do not require conversion solely because of the software release bump.
+The software release number above is independent from the semantic/schema contract versions below it. A software release does not require artifact conversion unless one of those contract versions or the checkpoint format changes. Existing valid v1 artifacts therefore remain valid across release bumps that preserve the v1 contract.
 
 The canonical constants live in `crates/leo-core/src/semantics.rs`. CUDA's device ABI is defined once in `crates/leo-core/cuda_abi.def`; the build script generates the Rust layout and CUDA header from that definition and checks its ABI version against the semantics contract.
 

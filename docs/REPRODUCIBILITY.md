@@ -1,4 +1,4 @@
-# Leo v1.0.1 reproducibility guide
+# Leo reproducibility guide
 
 ## Goal
 
@@ -12,11 +12,11 @@ Record the exact Git commit:
 git rev-parse HEAD
 ```
 
-Do not describe an experiment only as "v1.0.1" when multiple commits may exist under the same software version during active development.
+Do not describe an experiment only by its software release number when multiple commits may exist under the same version during active development.
 
 ## Dependency identity
 
-`Cargo.lock` should be committed for the v1.0.1 application baseline and retained with reference training environments.
+`Cargo.lock` should be committed for each application release and retained with reference training environments.
 
 Record:
 

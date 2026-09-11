@@ -55,13 +55,15 @@ valid.write_text(
 )
 PY
 
+LEO_RELEASE_VERSION=$(python3 scripts/release.py current)
+
 python3 python/prepare_tinystories.py \
   --train-input "$TMP/train.txt" \
   --valid-input "$TMP/valid.txt" \
   --text-format paragraph \
   --output "$TMP/data" \
   --source-repository leo-gpu-ci \
-  --source-revision v1.0.1
+  --source-revision "v$LEO_RELEASE_VERSION"
 
 "$LEO" init --config configs/test.toml --output "$TMP/model.pscls"
 

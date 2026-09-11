@@ -1,8 +1,8 @@
-# Leo v1.0.1 product requirements
+# Leo product requirements
 
 ## Purpose
 
-Leo is a sparse recurrent byte-learning system with a CPU reference executor and a custom NVIDIA CUDA executor. v1.0.1 is the current patch release of the clean v1 durability baseline established by v1.0.0.
+Leo is a sparse recurrent byte-learning system with a CPU reference executor and a custom NVIDIA CUDA executor. The stable v1 line follows the durability baseline established by v1.0.0; software release numbers advance independently of semantic/schema contract versions.
 
 ## Required properties
 
@@ -33,7 +33,7 @@ Leo is a sparse recurrent byte-learning system with a CPU reference executor and
 - training and frozen-evaluation benchmarks;
 - CPU, single-GPU, and explicitly marked multi-GPU synchronization modes.
 
-## Non-goals for v1.0.1
+## Non-goals for the stable v1 line
 
 - FP16/BF16 or tensor-core semantic rewrites;
 - approximate learning math;
@@ -44,10 +44,10 @@ Leo is a sparse recurrent byte-learning system with a CPU reference executor and
 
 ## Acceptance
 
-A v1.0.1 release is acceptable when repository checks pass, v1 artifacts are self-identifying/strictly validated, replay is not backend-dependent, CUDA ABI duplication is absent, docs match the implementation, and Rust/CUDA conformance is run on a machine with the required toolchain/GPU before a production training run. GPU acceptance includes the real multi-story production path at replay 0 and the standard 30% replay setting; source-string checks alone are not sufficient.
+A public release is acceptable when repository checks pass, v1 artifacts are self-identifying/strictly validated, replay is not backend-dependent, CUDA ABI duplication is absent, docs match the implementation, and Rust/CUDA conformance is run on a machine with the required toolchain/GPU before a production training run. GPU acceptance includes the real multi-story production path at replay 0 and the standard 30% replay setting; source-string checks alone are not sufficient.
 
 ## Open-source release requirements
 
-The v1.0.1 public repository should keep the Apache-2.0 license, contribution/security/community guidance, reproducible dependency metadata, CI status, and a documented test-data provenance path. Current public quality testing is specifically based on the TinyStories dataset pinned by `scripts/data.sh`; TinyStories is external data and is not relicensed by Leo.
+The public repository should keep the Apache-2.0 license, contribution/security/community guidance, reproducible dependency metadata, CI status, and a documented test-data provenance path. Current public quality testing is specifically based on the TinyStories dataset pinned by `scripts/data.sh`; TinyStories is external data and is not relicensed by Leo.
 
 Public performance claims must name the exact source commit, dependency lockfile, dataset identity, configuration, backend/hardware, and benchmark limits. Public model-quality claims must additionally include held-out evaluation conditions.

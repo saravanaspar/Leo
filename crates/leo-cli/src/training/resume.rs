@@ -103,7 +103,7 @@ impl TrainingResumeState {
         let mut lines = text.lines();
         if lines.next() != Some(TRAINING_RESUME_MAGIC) {
             return Err(LeoError::dataset(
-                "invalid or obsolete training resume state header; start a fresh Leo v1.0.1 run",
+                "invalid or obsolete training resume state header; start a fresh Leo v1 run",
             ));
         }
         let mut values = BTreeMap::new();
