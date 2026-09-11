@@ -1478,6 +1478,15 @@ fn apply_batch_replay_ranges(
     Ok(combined)
 }
 
+fn device_story_report_is_postprocessed(
+    report: &leo_core::DeviceStoryBatchReport,
+    story_count: usize,
+) -> bool {
+    report.story_metrics.iter().all(Vec::is_empty)
+        && report.story_summaries.len() == story_count
+        && report.replay_ranges.len() == story_count
+}
+
 pub(crate) fn train_story_batch(
     runtime: &mut BackendRuntime,
     stories: Vec<Vec<u8>>,
@@ -1528,9 +1537,8 @@ pub(crate) fn train_story_batch(
             let mut activity = ActivityDiagnostics::default();
             let mut loss_sum = 0.0f64;
             let mut targets = 0usize;
-            let device_postprocessed = device_report.story_metrics.is_empty()
-                && device_report.story_summaries.len() == stories.len()
-                && device_report.replay_ranges.len() == stories.len();
+            let device_postprocessed =
+                device_story_report_is_postprocessed(&device_report, stories.len());
 
             let mut losses_by_story = Vec::new();
             if device_postprocessed {
@@ -1891,6 +1899,36 @@ fn replay_target_range_impl(
         target_steps,
         timing,
     })
+}
+
+#[cfg(test)]
+mod device_story_postprocess_tests {
+    use super::device_story_report_is_postprocessed;
+    use leo_core::{DeviceStoryBatchReport, DeviceStorySummary, MergeMetrics, StepMetrics};
+
+    #[test]
+    fn one_empty_metrics_vector_per_story_uses_device_postprocess_results() {
+        let story_count = 4;
+        let mut report = DeviceStoryBatchReport {
+            story_metrics: vec![Vec::new(); story_count],
+            story_summaries: vec![DeviceStorySummary::default(); story_count],
+            replay_ranges: vec![Vec::new(); story_count],
+            merge: MergeMetrics::default(),
+        };
+
+        assert!(device_story_report_is_postprocessed(&report, story_count));
+
+        report.story_metrics[2].push(StepMetrics::default());
+        assert!(!device_story_report_is_postprocessed(&report, story_count));
+
+        report.story_metrics[2].clear();
+        report.story_summaries.pop();
+        assert!(!device_story_report_is_postprocessed(&report, story_count));
+
+        report.story_summaries.push(DeviceStorySummary::default());
+        report.replay_ranges.pop();
+        assert!(!device_story_report_is_postprocessed(&report, story_count));
+    }
 }
 
 #[cfg(test)]
