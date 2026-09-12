@@ -4,6 +4,10 @@ All notable project changes should be recorded here.
 
 ## Unreleased
 
+- Start the post-#35 P100 10K program with an exact frozen-prefix specialization: preserve the established packed winner ordering and population-inhibition update, skip the learning-destination worklist during frozen replay because no learning phase consumes it, parallelize only the independent selected-state writes, and avoid loading unused recurrent/input eligibility pointers during frozen pre-processing.
+- Specialize `leo_train_cooperative_fast` for ordinary supervised replay batches so mixed streaming-replay state can compile out of the canonical fast kernel; keep the semantics-changing `LEO_REPLAY_STREAMING` path on the general cooperative kernel.
+- Expose the existing exact one-block-per-story CUDA executor behind `LEO_CUDA_STORY_LOCAL_BLOCKS=1` for controlled P100 A/B testing of cross-story lockstep removal without replacing the production grouped executor before measurement; sanitize the new experiment from acceptance and scaling environments.
+
 ## v1.0.40 - 2026-09-12
 
 - Restore grouped CUDA residency after the cooperative-grid exactness fix by shortening persistent eligibility-pointer lifetimes, avoiding a loop-wide cooperative grid object, and applying a two-CTA-per-SM launch bound; extend the GPU gate to require at least 25% theoretical occupancy while preserving exact training-state hashes.

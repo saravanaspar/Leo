@@ -26,6 +26,7 @@ bash ./scripts/check_gpu.sh
 
 unset LEO_REPLAY_STREAMING
 unset LEO_MULTI_GPU_PARALLEL_REPLAY
+unset LEO_CUDA_STORY_LOCAL_BLOCKS
 unset LEO_CUDA_FULL_STEP_METRICS
 
 CUDA_VISIBLE_DEVICES=0 LEO_MULTI_GPU=0 \
@@ -75,6 +76,15 @@ though FP32 and the configured 30% replay fraction remain unchanged:
 Do not enable either experimental replay mode for a production-quality training
 run until the A/B quality procedure in this guide passes on the intended data,
 hardware, and training budget.
+
+### Experimental exact execution A/B
+
+`LEO_CUDA_STORY_LOCAL_BLOCKS=1` does **not** change the learning algorithm. It
+selects Leo's existing one-block-per-story CUDA executor so independent stories
+can finish without cross-story whole-grid barriers. It is off by default because
+the P100 must prove whether removing lockstep is worth losing grouped intra-story
+CTA parallelism. Keep it unset for canonical acceptance and enable it only for a
+separate exact-hash/throughput A/B.
 
 ## 2. Requirements
 
@@ -135,7 +145,7 @@ git status --short
 For the current P100 optimization work, the branch name used during development is:
 
 ```text
-perf/p100-fp32-throughput
+perf/p100-10k-tranche1
 ```
 
 On an ephemeral GPU runner such as Kaggle, clone the pushed branch directly:
@@ -143,7 +153,7 @@ On an ephemeral GPU runner such as Kaggle, clone the pushed branch directly:
 ```bash
 cd /kaggle/working
 rm -rf Leo
-git clone --branch perf/p100-fp32-throughput --single-branch \
+git clone --branch perf/p100-10k-tranche1 --single-branch \
   https://github.com/saravanaspar/Leo.git Leo
 cd Leo
 git rev-parse HEAD
@@ -967,6 +977,7 @@ mkdir -p "$LEO_CACHE_DIR"
 
 unset LEO_REPLAY_STREAMING
 unset LEO_MULTI_GPU_PARALLEL_REPLAY
+unset LEO_CUDA_STORY_LOCAL_BLOCKS
 unset LEO_CUDA_FULL_STEP_METRICS
 unset LEO_CUDA_PHASE_PROFILE
 unset LEO_CUDA_REPLAY_PROFILE
@@ -1204,6 +1215,7 @@ available, the recommended state is:
 ```bash
 unset LEO_REPLAY_STREAMING
 unset LEO_MULTI_GPU_PARALLEL_REPLAY
+unset LEO_CUDA_STORY_LOCAL_BLOCKS
 unset LEO_CUDA_FULL_STEP_METRICS
 ```
 

@@ -629,28 +629,32 @@ rather than reintroducing the unsafe barrier.
 
 ---
 
-## Unreleased / intended v1.0.4 - PR #35 FP32 overhead reduction
+## v1.0.40 - PR #35 FP32 overhead reduction
 
-### Versioning note before release
+### Release identity
 
-PR #35 is currently open:
+PR #35 was merged and released on 2026-09-12:
 
-- PR: <https://github.com/saravanaspar/Leo/pull/35>
+- PR: <https://github.com/saravanaspar/Leo/pull/35>.
 - Base: `027f9a7b07b796e144dc4a5778dfa593b6000cae`.
-- Current head: `16f705fd2111276bd668803213964964fab71d70`.
-- User-intended release label: `v1.0.4`.
+- Final PR head: `fb77c1980a6617ee78f67edcdf2d42fa0f55ee2b`.
+- Merge commit: `01eabbb3cda5b3420af6e735c9d7c30ed88d048e`.
+- Release commit/tag: `9e393dab554302509532fb6c0c147ad166549744` / `v1.0.40`.
 
-At the time of this measurement the repository source still reports workspace version `1.0.32`, and
-Git history contains release commits for v1.0.31 and v1.0.32. Under ordinary semantic-version
-ordering, `1.0.4` is lower than `1.0.32`. Do not record PR #35 as a released v1.0.4 snapshot until
-release metadata/tagging is intentionally reconciled. After merge/release, append the actual merge
-SHA, release commit, and tag below rather than rewriting these pre-release measurements.
+The P100 measurements in this section were collected immediately before the release automation,
+while the branch still reported workspace version `1.0.32`. The release flow reconciled the public
+software version to `1.0.40` without changing the v1 semantic/schema identifiers. The corrected
+performance measurements correspond to the same shared-error-cache revert that shipped in PR #35,
+but the exact `v1.0.40` release commit was not separately re-benchmarked in that Kaggle session.
+Future acceptance runs should record the exact release/branch commit alongside the existing golden
+hashes.
 
 ### PR #35 commit sequence
 
 1. `7441cb85f3fed3c1cc1702db88d89fa08b80f1c8` - `perf(cuda): reduce FP32 training and replay overhead`.
 2. `3b4677e561c3eca846cc2c3d1f6ebe630b98d2f7` - training-guide update on the same branch.
 3. `16f705fd2111276bd668803213964964fab71d70` - `perf(cuda): remove regressing shared error cache`.
+4. `fb77c1980a6617ee78f67edcdf2d42fa0f55ee2b` - expanded CUDA performance history and lessons before merge.
 
 The third commit is essential: the initial optimization bundle contained a learning-signal
 shared-memory cache that preserved exact state but caused a large P100 throughput regression.
@@ -1162,4 +1166,148 @@ final grouped/replay/frozen kernel resource telemetry:
 
 The next optimization phase should start only after that release snapshot is filled from a clean
 checkout of the exact tagged/merged commit.
+
+---
+
+## Post-#35 10K program - exact execution tranche 1 (unreleased, not yet P100-measured)
+
+**Base release:** `v1.0.40` / `9e393dab554302509532fb6c0c147ad166549744` (release commit after PR #35)
+**Status:** source/static validation only; do not record a throughput win until a fresh P100 A/B proves it.
+**Correctness contract:** FP32 equations/order, workers=16, replay fraction=0.30, replay selection, RNG, merge semantics, checkpoint identity, and the two historical exact-state hashes remain unchanged for the default path.
+
+This tranche starts the six-point plan derived from the corrected 32K profiles.  It deliberately separates default exact-path changes from opt-in architectural experiments so another plausible optimization cannot silently become production before a canonical P100 measurement.
+
+### Six-point plan and current status
+
+| # | Target | This tranche | Reason / next proof |
+| --- | --- | --- | --- |
+| 1 | Frozen-prefix exact global selection | **Implemented, default exact path** | Reuse the existing packed selector, omit frozen-only learning-destination bookkeeping, parallelize only independent selected-state writes. The serial sparse heap itself is intentionally unchanged until this smaller A/B is measured. |
+| 2 | Frozen pre phase | **Partial exact cleanup** | Frozen event delivery/input injection now pass null eligibility worklists instead of loading four pointers that cannot be consumed with `learning_trace=false`. Grid-wide pre restructuring is deferred because changing atomic delivery order would risk exact FP32 state. |
+| 3 | Replay target occupancy/register pressure | **Implemented compiler specialization** | `leo_train_cooperative_fast` is compiled with mixed frozen-schedule handling disabled; experimental streaming replay uses the general kernel. P100 resource telemetry must show whether 144 regs/thread moves toward the <=128 / 2-CTA-per-SM threshold. |
+| 4 | Base learning-signal memory layout | **Not changed yet** | Prior four-row interleave and shared-error cache both regressed badly. An output-major shadow can be exact, but it costs another full output matrix and duplicate update traffic; do not add it until the first three A/Bs quantify remaining headroom. |
+| 5 | Remove cross-story global lockstep | **Opt-in A/B wired** | Reuse the already-existing `leo_train_story_batch` kernel through `LEO_CUDA_STORY_LOCAL_BLOCKS=1`. It gives each story one independent block and zero cross-story grid barriers, but sacrifices intra-story CTA parallelism. Keep off by default until measured. |
+| 6 | Replay algorithm v2 / prefix-amplification removal | **Existing experimental path retained only** | `LEO_REPLAY_STREAMING=1` already changes replay-state semantics. It remains non-canonical; no new golden hash or semantic contract is introduced in this tranche. |
+
+### Exact frozen selector specialization
+
+Measured evidence before this change showed frozen replay-prefix reconstruction spending about:
+
+```text
+select_global    50.23%
+pre              28.58%
+select_blocks    17.85%
+post_emit         3.34%
+```
+
+The old shared selector did two pieces of work that are unnecessary during a frozen prefix:
+
+1. append each selected neuron to `LEARNING_DESTINATION_LIST` through epoch/atomic bookkeeping;
+2. write all selected-state records from thread 0 even though selected neurons are unique and the active-list order is already fixed by the packed records.
+
+The new frozen specialization keeps the same sparse heap merge, cutoff, active count, population inhibition arithmetic, packed-key order, and selected values.  It changes only execution geometry after selection:
+
+- no frozen learning-destination worklist population;
+- `active[index]` / `active_value[index]` preserve their exact ordered indices;
+- per-neuron `activation` and `selected_epoch` stores are distributed across block-0 threads;
+- ordinary supervised selection still uses the historical selector and still populates learning destinations.
+
+This is intentionally narrower than immediately replacing the sparse heap.  The previous shared-error-cache failure proved that a locally plausible CUDA change must first win the real 32K workload.
+
+### Frozen pre cleanup
+
+The cooperative frozen prefix previously reconstructed recurrent/input eligibility-list pointers on every prefix step even though both delivery helpers receive `learning_trace=false`.  Those pointers are only dereferenced inside the learning-trace branch.  The frozen path now passes null worklist/count pointers and retains the established block-0 atomic/event ordering.
+
+A more aggressive whole-grid pre implementation is **not** included yet.  Event delivery and symbol injection contain atomic FP32 accumulation; distributing those operations across CTAs could change accumulation order and therefore the historical hash.  Any future pre redesign must first isolate order-independent clears from order-sensitive event arithmetic.
+
+### Replay fast-kernel specialization
+
+PR #35 reduced `leo_train_cooperative_fast` from the older ~166 registers/thread to 144 registers/thread, still one CTA/SM on the P100.  The canonical target-batch kernel nevertheless still carried logic for the experimental mixed replay schedule (`target_index == -2`) and a separate learning-step parity counter.
+
+This tranche makes mixed-schedule support a compile-time template choice:
+
+```text
+canonical fast replay target kernel: MIXED_SCHEDULE=false
+normal/general cooperative kernel:   MIXED_SCHEDULE=true
+profiled target kernel:              MIXED_SCHEDULE=false
+```
+
+`LEO_REPLAY_STREAMING=1` is routed through the general mixed-schedule kernel.  The expected benefit is reduced live state/register pressure in the canonical fast replay kernel, but only P100 `cuda_kernel_resources` telemetry can prove whether NVRTC actually lowers the register count.
+
+### Story-local executor A/B
+
+The source already contained `leo_train_story_batch`, where one CUDA block owns one story and executes its dependent byte sequence without a whole-grid barrier.  It was not wired into the shared production launch selector.
+
+This tranche exposes it only through:
+
+```text
+LEO_CUDA_STORY_LOCAL_BLOCKS=1
+```
+
+The purpose is to test the central 7-10K architecture hypothesis directly:
+
+```text
+production grouped executor:
+  more intra-story CTAs
+  + whole-grid synchronization
+  + longest-story lockstep
+
+story-local A/B:
+  one CTA per story
+  + no cross-story grid synchronization
+  + independent story completion
+  - much less intra-story parallelism
+```
+
+This is an exact execution A/B, not a new learning algorithm.  The same per-story persistent model replicas and canonical batch-end merge remain in use.  Acceptance/scaling scripts explicitly clear the environment variable so an inherited experiment cannot contaminate canonical results.
+
+### Why this tranche does not claim 7K/8K/10K
+
+The clean post-#35 canonical timing is approximately:
+
+```text
+reported training steps = 14,496
+base/non-replay time     = 3.2318 s
+replay time              = 4.5883 s
+total                    = 7.8201 s
+throughput               = 1,853.69 steps/s
+```
+
+Target total-time budgets are:
+
+```text
+7K  -> 2.071 s
+8K  -> 1.812 s
+10K -> 1.450 s
+```
+
+Even deleting all replay cost leaves only about 4,485 reported steps/s at the current base cost.  Even deleting all base cost leaves only about 3,159 reported steps/s at the current replay cost.  Therefore no single selector, register, cache, or barrier tweak can reach 7-10K by itself.
+
+The canonical replay run also executes 20,235 hidden frozen-prefix steps for only 3,353 replay targets - about 6.03 prefix advances per replay target.  Removing that amplification would require a replay semantic/algorithm change unless an exact state-reconstruction method can preserve sequential parameter visibility.  That is why algorithm-v2 work remains explicitly separated from exact execution optimization.
+
+### Required P100 A/B before accepting this tranche
+
+Use a clean checkout and fresh PTX/tuning cache.  Keep `LEO_REPLAY_STREAMING` off for canonical acceptance.
+
+1. Run `scripts/check_gpu.sh` with all experimental variables cleared.
+2. Record `cuda_kernel_resources` for:
+   - `leo_shared_wavefront_persistent_grouped`;
+   - `leo_train_cooperative_fast`;
+   - `leo_advance_frozen_cooperative`.
+3. Run fresh replay-off 64-story and replay-30 16-story canonical benchmarks and verify both historical hashes.
+4. Run replay profiling and compare frozen `select_global` / `pre` cycles against the post-#35 profile.
+5. A/B story-local execution separately:
+
+```bash
+LEO_CUDA_STORY_LOCAL_BLOCKS=1 \
+CUDA_VISIBLE_DEVICES=0 ./target/release/leo benchmark \
+  --train \
+  --model runs/p100-acceptance/replay0.pscls \
+  --bytes data/prepared/tinystories.train.bytes \
+  --index data/prepared/tinystories.train.idx \
+  --stories 64 \
+  --workers 16 \
+  --backend gpu
+```
+
+Reject the story-local path if the hash differs or if removing cross-story barriers does not compensate for one-CTA-per-story underutilization.  A negative result belongs in this ledger rather than being silently removed.
 

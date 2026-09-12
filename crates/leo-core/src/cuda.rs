@@ -207,6 +207,15 @@ fn cuda_shared_grouped_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Exact A/B executor: one CUDA block owns one story lane and therefore never
+/// participates in cross-story whole-grid barriers.  The kernel already exists
+/// as Leo's story-local execution reference; this switch only exposes it for
+/// controlled P100 measurements.  It is opt-in until canonical benchmarks show
+/// whether removing lockstep outweighs the loss of intra-story CTA parallelism.
+fn cuda_story_local_blocks_enabled() -> bool {
+    env_flag("LEO_CUDA_STORY_LOCAL_BLOCKS")
+}
+
 fn cuda_device_story_steps_enabled() -> bool {
     !env::var("LEO_CUDA_DEVICE_STORY_STEPS")
         .ok()
@@ -912,6 +921,7 @@ struct KernelFunctions {
     train_cooperative: CuFunction,
     train_cooperative_fast: CuFunction,
     train_cooperative_profiled: CuFunction,
+    train_story_batch: CuFunction,
     advance_frozen_persistent: CuFunction,
     advance_frozen_cooperative: CuFunction,
     advance_frozen_cooperative_profiled: CuFunction,
@@ -3493,12 +3503,13 @@ impl CudaRuntime {
         }
 
         let learning_trace = !matches!(permission, Permission::Frozen);
-        let fast_metrics_requested = learning_trace && !self.full_step_metrics;
-        let production_capacity = if fast_metrics_requested {
-            self.shared.replay_fast_grid_blocks
-        } else {
-            self.shared.replay_grid_blocks
-        };
+        // The fast replay kernel is specialized for ordinary supervised target
+        // batches so the compiler can remove mixed frozen-schedule state and
+        // reduce register pressure.  Streaming replay is explicitly semantic-
+        // experimental and therefore uses the general mixed-schedule kernel
+        // and the full training-step record layout.
+        let fast_metrics_requested = false;
+        let production_capacity = self.shared.replay_grid_blocks;
         let cooperative_replay = self.replay_cooperative_enabled
             && self.shared.cooperative_launch
             && production_capacity > 0;
@@ -3633,8 +3644,7 @@ impl CudaRuntime {
 
             if self.debug.launches {
                 eprintln!(
-                    "{{\"event\":\"cuda_debug_launch\",\"scope\":\"streaming_replay_schedule\",\"kernel\":\"{}\",\"grid_blocks\":{},\"threads\":{},\"timeline_steps\":{},\"target_steps\":{},\"base_tick\":{}}}",
-                    if fast_metrics_requested { "leo_train_cooperative_fast" } else { "leo_train_cooperative" },
+                    "{{\"event\":\"cuda_debug_launch\",\"scope\":\"streaming_replay_schedule\",\"kernel\":\"leo_train_cooperative\",\"grid_blocks\":{},\"threads\":{},\"timeline_steps\":{},\"target_steps\":{},\"base_tick\":{}}}",
                     replay_blocks,
                     PERSISTENT_THREADS,
                     chunk.len(),
@@ -3644,11 +3654,7 @@ impl CudaRuntime {
             }
 
             self.launch_cooperative_exact(
-                if fast_metrics_requested {
-                    self.shared.kernels.train_cooperative_fast
-                } else {
-                    self.shared.kernels.train_cooperative
-                },
+                self.shared.kernels.train_cooperative,
                 replay_blocks,
                 PERSISTENT_THREADS,
                 &mut parameters,
@@ -7595,6 +7601,7 @@ struct PersistentWavefrontLaunch {
     blocks_per_lane: u32,
     extra_lane_blocks: u32,
     grouped: bool,
+    story_local: bool,
     phase_profile_sampled: bool,
     phase_profile_geometry_skipped: bool,
     normal_capacity_blocks: u32,
@@ -7659,6 +7666,40 @@ fn launch_shared_wavefront_persistent_chunk(
     let mut raw_strength = strength;
     let mut scale = batch_scale;
     let mut delta_pointers = coordinator.buffers.batch_delta_pointer_table.pointer;
+
+    if cuda_story_local_blocks_enabled() && !phase_profile {
+        // Reuse Leo's existing exact one-block-per-story kernel as an A/B path.
+        // Each lane has its own persistent model replica, so story trajectories
+        // remain independent and the canonical host/device merge that follows
+        // this launch is unchanged.  No cross-story grid barrier is required.
+        let grid_blocks = lane_count.max(1);
+        let mut parameters = [
+            param(&mut pointer_tables_ptr),
+            param(&mut step_buffers_ptr),
+            param(&mut step_counts_ptr),
+            param(&mut base_ticks_ptr),
+            param(&mut lane_count_value),
+            param(&mut learning_value),
+            param(&mut raw_strength),
+        ];
+        coordinator.launch_exact(
+            coordinator.shared.kernels.train_story_batch,
+            grid_blocks,
+            SHARED_BATCH_THREADS,
+            &mut parameters,
+        )?;
+        return Ok(PersistentWavefrontLaunch {
+            grid_blocks,
+            blocks_per_lane: 1,
+            extra_lane_blocks: 0,
+            grouped: false,
+            story_local: true,
+            phase_profile_sampled: false,
+            phase_profile_geometry_skipped: false,
+            normal_capacity_blocks: lane_count,
+            profiled_capacity_blocks: 0,
+        });
+    }
 
     if grouped_blocks_per_lane > 0 {
         // The grouped kernel is one cooperative whole-grid launch. Every CTA
@@ -7735,6 +7776,7 @@ fn launch_shared_wavefront_persistent_chunk(
             blocks_per_lane: grouped_blocks_per_lane,
             extra_lane_blocks,
             grouped: true,
+            story_local: false,
             phase_profile_sampled,
             phase_profile_geometry_skipped,
             normal_capacity_blocks: coordinator.shared.shared_grouped_blocks_256,
@@ -7769,6 +7811,7 @@ fn launch_shared_wavefront_persistent_chunk(
         blocks_per_lane: 1,
         extra_lane_blocks: 0,
         grouped: false,
+        story_local: false,
         phase_profile_sampled: false,
         phase_profile_geometry_skipped: phase_profile,
         normal_capacity_blocks: coordinator.shared.shared_persistent_blocks_256,
@@ -8696,6 +8739,8 @@ pub(crate) fn train_story_batch_shared_device(
                             "leo_shared_wavefront_persistent_grouped_profiled"
                         } else if persistent_launch.grouped {
                             "leo_shared_wavefront_persistent_grouped"
+                        } else if persistent_launch.story_local {
+                            "leo_train_story_batch"
                         } else {
                             "leo_shared_wavefront_persistent"
                         };
@@ -9458,6 +9503,7 @@ fn load_kernels(driver: &DriverFunctions, module: CuModule) -> LeoResult<KernelF
         train_cooperative: get_kernel(driver, module, "leo_train_cooperative")?,
         train_cooperative_fast: get_kernel(driver, module, "leo_train_cooperative_fast")?,
         train_cooperative_profiled: get_kernel(driver, module, "leo_train_cooperative_profiled")?,
+        train_story_batch: get_kernel(driver, module, "leo_train_story_batch")?,
         advance_frozen_persistent: get_kernel(driver, module, "leo_advance_frozen_persistent")?,
         advance_frozen_cooperative: get_kernel(driver, module, "leo_advance_frozen_cooperative")?,
         advance_frozen_cooperative_profiled: get_kernel(

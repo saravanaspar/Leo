@@ -2281,10 +2281,12 @@ __device__ void leo_p_select_blocks_fast(
     }
 }
 
-__device__ void leo_p_select_global(
+template <bool MARK_LEARNING_DESTINATIONS, bool PARALLEL_SELECTED_WRITES>
+__device__ void leo_p_select_global_impl(
     const unsigned long long* p,
     unsigned long long tick,
-    unsigned long long* shared_selection_keys
+    unsigned long long* shared_selection_keys,
+    unsigned int* shared_kept
 ) {
     const LeoConfig* cfg = leo_p_cptr<LeoConfig>(p, LEO_P_CONFIG);
     const unsigned int* block_winner_neuron = leo_p_cptr<unsigned int>(p, LEO_P_BLOCK_WINNER_NEURON);
@@ -2475,7 +2477,35 @@ __device__ void leo_p_select_global(
             *population_inhibition + cfg->population_inhibition_rate * error,
             0.0f, cfg->population_inhibition_max
         );
-        for (unsigned int index = 0U; index < kept; ++index) {
+        if (PARALLEL_SELECTED_WRITES) {
+            *shared_kept = kept;
+        } else {
+            for (unsigned int index = 0U; index < kept; ++index) {
+                const unsigned long long record = shared_selection_keys[index];
+                const unsigned int neuron = leo_selection_record_neuron(
+                    record, rotation, cfg->neuron_count
+                );
+                const float value = leo_selection_record_value(record);
+                active[index] = neuron;
+                active_value[index] = value;
+                activation[neuron] = value;
+                selected_epoch[neuron] = tick + 1ULL;
+                if (MARK_LEARNING_DESTINATIONS) {
+                    leo_p_mark_learning_destination(p, neuron, tick + 1ULL);
+                }
+            }
+        }
+    }
+
+    if (PARALLEL_SELECTED_WRITES) {
+        // Frozen prefix reconstruction consumes the selected active state but
+        // never consumes the learning-destination worklist.  The selected
+        // records are unique and already exactly ordered, so independent state
+        // writes can be spread across block-0 threads without changing FP32
+        // arithmetic or active-list order.
+        __syncthreads();
+        const unsigned int kept = *shared_kept;
+        for (unsigned int index = lane; index < kept; index += blockDim.x) {
             const unsigned long long record = shared_selection_keys[index];
             const unsigned int neuron = leo_selection_record_neuron(
                 record, rotation, cfg->neuron_count
@@ -2485,9 +2515,33 @@ __device__ void leo_p_select_global(
             active_value[index] = value;
             activation[neuron] = value;
             selected_epoch[neuron] = tick + 1ULL;
-            leo_p_mark_learning_destination(p, neuron, tick + 1ULL);
+            if (MARK_LEARNING_DESTINATIONS) {
+                leo_p_mark_learning_destination(p, neuron, tick + 1ULL);
+            }
         }
+        __syncthreads();
     }
+}
+
+__device__ void leo_p_select_global(
+    const unsigned long long* p,
+    unsigned long long tick,
+    unsigned long long* shared_selection_keys
+) {
+    leo_p_select_global_impl<true, false>(
+        p, tick, shared_selection_keys, nullptr
+    );
+}
+
+__device__ void leo_p_select_global_frozen(
+    const unsigned long long* p,
+    unsigned long long tick,
+    unsigned long long* shared_selection_keys,
+    unsigned int* shared_kept
+) {
+    leo_p_select_global_impl<false, true>(
+        p, tick, shared_selection_keys, shared_kept
+    );
 }
 __device__ void leo_p_cache_surrogate_work(const unsigned long long* p, unsigned long long tick,
     unsigned int thread,
@@ -4332,6 +4386,7 @@ __device__ __forceinline__ void leo_advance_frozen_cooperative_body(
     unsigned long long* profile_counters
 ) {
     __shared__ unsigned long long shared_selection_keys[LEO_GLOBAL_SORT];
+    __shared__ unsigned int shared_selected_count;
     const unsigned int model_block_count =
         leo_p_cptr<LeoConfig>(pointers, LEO_P_CONFIG)->block_count;
 
@@ -4344,19 +4399,15 @@ __device__ __forceinline__ void leo_advance_frozen_cooperative_body(
         // atomic/update ordering. Frozen prefix optimization only distributes
         // phases whose rows are independent.
         if (blockIdx.x == 0U) {
-            unsigned int* recurrent_list =
-                leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_LIST);
-            unsigned int* recurrent_count =
-                leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_COUNT);
-            unsigned int* input_list =
-                leo_p_ptr<unsigned int>(pointers, LEO_P_INPUT_ELIGIBLE_LIST);
-            unsigned int* input_count =
-                leo_p_ptr<unsigned int>(pointers, LEO_P_INPUT_ELIGIBLE_COUNT);
             leo_p_start_tick(pointers, tick);
             __syncthreads();
-            leo_p_deliver_events(pointers, tick, false, recurrent_list, recurrent_count);
+            // Frozen reconstruction never advances eligibility traces.  Avoid
+            // loading four unused worklist pointers into the long-lived prefix
+            // kernel solely to pass values that the helpers cannot dereference
+            // when learning_trace=false.
+            leo_p_deliver_events(pointers, tick, false, nullptr, nullptr);
             __syncthreads();
-            leo_p_inject_symbol(pointers, tick, symbol, false, input_list, input_count);
+            leo_p_inject_symbol(pointers, tick, symbol, false, nullptr, nullptr);
             __syncthreads();
             leo_p_context_advance_history(pointers, symbol);
             __syncthreads();
@@ -4378,8 +4429,9 @@ __device__ __forceinline__ void leo_advance_frozen_cooperative_body(
 
         phase_started = leo_profile_phase_start<PROFILE>();
         if (blockIdx.x == 0U) {
-            leo_p_select_global(pointers, tick, shared_selection_keys);
-            __syncthreads();
+            leo_p_select_global_frozen(
+                pointers, tick, shared_selection_keys, &shared_selected_count
+            );
         }
         leo_profile_phase_end<PROFILE>(
             profile_counters, LEO_CUDA_FROZEN_PROFILE_SELECT_GLOBAL, phase_started
@@ -4449,7 +4501,7 @@ enum LeoCudaReplayProfileCounter {
 // cooperative grid. This changes execution geometry only; FP32 equations,
 // target order, and required parameter-visibility boundaries remain unchanged.
 // Independent phase bookkeeping may share an existing visibility barrier.
-template <bool PROFILE, bool FAST_METRICS>
+template <bool PROFILE, bool FAST_METRICS, bool MIXED_SCHEDULE>
 __device__ __forceinline__ void leo_train_cooperative_body(
     const unsigned long long* pointers,
     const LeoPersistentStep* steps,
@@ -4476,10 +4528,12 @@ __device__ __forceinline__ void leo_train_cooperative_body(
     for (unsigned int step_index = 0U; step_index < step_count; ++step_index) {
         const LeoPersistentStep step = steps[step_index];
         const unsigned long long tick = base_tick + (unsigned long long)step_index;
-        const bool frozen_advance = step.target_index == -2;
+        const bool frozen_advance = MIXED_SCHEDULE && step.target_index == -2;
         const bool context_enabled = step.context_enabled != 0U;
         const bool supervised = !frozen_advance && step.target_index >= 0 && strength > 0.0f;
-        const bool even = (learning_step_index & 1U) == 0U;
+        const bool even = MIXED_SCHEDULE
+            ? (learning_step_index & 1U) == 0U
+            : (step_index & 1U) == 0U;
 
         unsigned long long phase_started = leo_profile_phase_start<PROFILE>();
         // Preserve established atomic ordering for event delivery and input
@@ -4783,7 +4837,7 @@ __device__ __forceinline__ void leo_train_cooperative_body(
             profile_counters[LEO_CUDA_REPLAY_PROFILE_SAMPLES] += 1ULL;
         }
         if (PROFILE) cooperative_groups::this_grid().sync();
-        if (learning_trace) {
+        if (MIXED_SCHEDULE && learning_trace) {
             ++learning_step_index;
         }
     }
@@ -4797,7 +4851,7 @@ extern "C" __global__ void leo_train_cooperative(
     unsigned int learning_trace_raw,
     float strength
 ) {
-    leo_train_cooperative_body<false, false>(
+    leo_train_cooperative_body<false, false, true>(
         pointers, steps, step_count, base_tick,
         learning_trace_raw, strength, nullptr
     );
@@ -4811,7 +4865,7 @@ extern "C" __global__ void leo_train_cooperative_fast(
     unsigned int learning_trace_raw,
     float strength
 ) {
-    leo_train_cooperative_body<false, true>(
+    leo_train_cooperative_body<false, true, false>(
         pointers, steps, step_count, base_tick,
         learning_trace_raw, strength, nullptr
     );
@@ -4826,7 +4880,7 @@ extern "C" __global__ void leo_train_cooperative_profiled(
     float strength,
     unsigned long long* profile_counters
 ) {
-    leo_train_cooperative_body<true, false>(
+    leo_train_cooperative_body<true, false, false>(
         pointers, steps, step_count, base_tick,
         learning_trace_raw, strength, profile_counters
     );
