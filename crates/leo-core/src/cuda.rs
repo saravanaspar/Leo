@@ -3259,11 +3259,11 @@ impl CudaRuntime {
                     1.0
                 };
                 let end_document = target_output_index == END_DOCUMENT_OUTPUT_INDEX;
-                let (scheduled_plasticity_scale, next_plasticity_phase) =
-                    self.model
-                        .config
-                        .learning
-                        .plasticity_step(self.plasticity_phase, end_document);
+                let (scheduled_plasticity_scale, next_plasticity_phase) = self
+                    .model
+                    .config
+                    .learning
+                    .plasticity_step(self.plasticity_phase, end_document);
                 let plasticity_scale = self.gate_plasticity_scale_from_device(
                     scheduled_plasticity_scale,
                     target_output_index,
@@ -3874,11 +3874,11 @@ impl CudaRuntime {
                             1.0
                         };
                         let end_document = target_output_index == END_DOCUMENT_OUTPUT_INDEX;
-                        let (scheduled_plasticity_scale, next_plasticity_phase) =
-                            self.model
-                                .config
-                                .learning
-                                .plasticity_step(self.plasticity_phase, end_document);
+                        let (scheduled_plasticity_scale, next_plasticity_phase) = self
+                            .model
+                            .config
+                            .learning
+                            .plasticity_step(self.plasticity_phase, end_document);
                         let plasticity_scale = self.gate_plasticity_scale_from_device(
                             scheduled_plasticity_scale,
                             target_output_index,
@@ -4973,9 +4973,7 @@ impl CudaRuntime {
         end_document: bool,
     ) -> LeoResult<f32> {
         let learning = &self.model.config.learning;
-        if scheduled_scale <= 0.0
-            || end_document
-            || learning.plasticity_confidence_threshold >= 1.0
+        if scheduled_scale <= 0.0 || end_document || learning.plasticity_confidence_threshold >= 1.0
         {
             return Ok(scheduled_scale);
         }
@@ -8314,8 +8312,11 @@ fn launch_device_story_step_builder(
         "plasticity window",
         coordinator.model.config.learning.plasticity_window,
     )?;
-    let mut plasticity_confidence_threshold =
-        coordinator.model.config.learning.plasticity_confidence_threshold;
+    let mut plasticity_confidence_threshold = coordinator
+        .model
+        .config
+        .learning
+        .plasticity_confidence_threshold;
     let mut parameters = [
         param(&mut story_bytes),
         param(&mut story_byte_stride),

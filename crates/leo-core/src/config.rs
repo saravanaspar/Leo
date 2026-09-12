@@ -161,10 +161,7 @@ impl LearningConfig {
         target_probability: f32,
         end_document: bool,
     ) -> f32 {
-        if scheduled_scale <= 0.0
-            || end_document
-            || self.plasticity_confidence_threshold >= 1.0
-        {
+        if scheduled_scale <= 0.0 || end_document || self.plasticity_confidence_threshold >= 1.0 {
             return scheduled_scale;
         }
         if !target_probability.is_finite()
@@ -604,27 +601,12 @@ mod tests {
         let mut config = Config::default();
         config.learning.plasticity_confidence_threshold = 0.5;
 
-        assert_eq!(
-            config.learning.gate_plasticity_scale(8.0, 0.49, false),
-            8.0
-        );
-        assert_eq!(
-            config.learning.gate_plasticity_scale(8.0, 0.75, false),
-            0.0
-        );
-        assert_eq!(
-            config.learning.gate_plasticity_scale(3.0, 0.99, true),
-            3.0
-        );
-        assert_eq!(
-            config.learning.gate_plasticity_scale(0.0, 0.10, false),
-            0.0
-        );
+        assert_eq!(config.learning.gate_plasticity_scale(8.0, 0.49, false), 8.0);
+        assert_eq!(config.learning.gate_plasticity_scale(8.0, 0.75, false), 0.0);
+        assert_eq!(config.learning.gate_plasticity_scale(3.0, 0.99, true), 3.0);
+        assert_eq!(config.learning.gate_plasticity_scale(0.0, 0.10, false), 0.0);
         config.learning.plasticity_confidence_threshold = 1.0;
-        assert_eq!(
-            config.learning.gate_plasticity_scale(8.0, 1.0, false),
-            8.0
-        );
+        assert_eq!(config.learning.gate_plasticity_scale(8.0, 1.0, false), 8.0);
     }
 
     #[test]

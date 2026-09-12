@@ -1206,11 +1206,11 @@ impl Runtime {
         self.errors[target_output_index] -= 1.0;
         let supervised_strength = strength * target_weight;
         let end_document = target_output_index == END_DOCUMENT_OUTPUT_INDEX;
-        let (scheduled_plasticity_scale, next_plasticity_phase) =
-            self.model
-                .config
-                .learning
-                .plasticity_step(self.plasticity_phase, end_document);
+        let (scheduled_plasticity_scale, next_plasticity_phase) = self
+            .model
+            .config
+            .learning
+            .plasticity_step(self.plasticity_phase, end_document);
         let plasticity_scale = self.model.config.learning.gate_plasticity_scale(
             scheduled_plasticity_scale,
             self.probabilities[target_output_index],
