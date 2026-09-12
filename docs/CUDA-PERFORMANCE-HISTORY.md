@@ -1334,3 +1334,123 @@ The canonical replay policy also selected only `3353` replay targets while execu
 ### Acceptance contract for Formula v2
 
 Do **not** compare Formula-v2 state hashes to the historical v1 hashes.  Acceptance requires: repeatable Formula-v2 hashes across repeated runs; CPU/GPU agreement for the same Formula-v2 config where the existing conformance harness applies; no regression in validation bits-per-byte/generation/recurrent-memory probes; and a material P100 throughput gain.  No speed or quality improvement is claimed until those P100 and training-quality measurements exist.
+
+## 2026-09-12 — T4x2 production multi-GPU audit and repair candidate
+
+Source under test: clean `main` / v1.0.41 at
+`0f8be41cad1a01e7086bc92ce3dc676b8bd589c1`, Formula-v2/W4
+(`plasticity_window = 4`, replay fraction `0.30`, `stateful_batch = true`).
+
+Hardware/runtime:
+
+```text
+GPU0/GPU1        Tesla T4, 15,360 MiB each, compute capability 7.5
+CUDA compiler    12.8 / nvcc 12.8.93
+NVIDIA driver    580.159.04 (runtime advertises CUDA 13.0)
+Rust             1.85.0
+Python           3.12.13
+workers          16
+```
+
+Dataset remained the pinned TinyStories artifact:
+
+```text
+source revision  5485261731eaac25dd8e5ebbc3839d0a9870b185
+train bytes SHA  6f9928713c3ffb6285c032c0122ce7192f606974f1895939677aa08624db3d8f
+train dataset ID da4fcc7dfd6d0b3ff8080cb85cb6c2e298d1af109b715c724c049a9ffed189be
+valid bytes SHA  56e7c41c62fc31c92145a9320b45a044b7dc8eda10fcab763cc7c9b28bbe805e
+valid dataset ID bdd64859116c5b062888069413f2d16dc24cc785f6eda0fb470cb506c2323fad
+```
+
+### Warm-cache 1xT4 versus 2xT4 evidence
+
+All required 1-GPU lanes16 and 2-GPU lanes7/8/9 CUDA profiles were complete before
+measurement. Three 256-story replay-on runs were recorded for each GPU count.
+
+```text
+1x T4 SPS              4021.200, 3974.622, 3966.846
+1x T4 median SPS       3974.621832
+1x T4 median seconds   66.831515
+1x T4 unique hashes    2
+
+2x T4 SPS              4904.358, 4901.100, 4887.935
+2x T4 median SPS       4901.099744
+2x T4 median seconds   54.198040
+2x T4 unique hashes    2
+
+2-GPU speedup          1.233098x
+2-GPU efficiency       61.6549%
+wall-time reduction    18.9035%
+```
+
+A representative 2-GPU run executed 265,630 reported training steps, 204,225 base
+targets, 61,405 replay targets and 121,276 replay-prefix steps in 54.1620 s. Replay
+alone consumed 26.9180 s (`49.70%` of wall time). Base story batches used both
+T4s, but every replay phase emitted `multi_gpu_serial_replay` with
+`parallel_replay=false`, leaving the secondary GPU idle through roughly half of
+this replay-heavy workload. Work-balanced base shards also varied between 8/8 and
+7/9 stories; device completion time sometimes diverged enough for one GPU to wait
+at the exact mean barrier.
+
+### Correctness finding: scheduler-dependent FP32 state
+
+Repeated warm-cache runs from the same initialized checkpoint did not always
+produce the same exact training-state SHA-256. The aggregate loss, B/B, replay
+counts and activity counters were unchanged, but 1-GPU and 2-GPU runs each
+produced two exact-state hashes across three repeats. This blocks a production
+exact-state claim.
+
+The persistent CUDA pre phase accumulated recurrent and input contributions into
+`branch_delta` with unconstrained cross-thread FP32 `atomicAdd`. Collisions on one
+(target, branch) therefore had scheduler-dependent addition order. The repair
+candidate keeps the same FP32 contribution values and atomic operations but owns
+persistent branch accumulation with one warp: unique destinations remain
+parallel, while colliding lanes issue atomics in ascending lane order and each
+32-item chunk ends with a warp memory barrier. No learning rate, replay budget,
+selection rule, model size or precision mode is changed.
+
+Benchmark JSON now emits separate `model_state_sha256`,
+`statistics_state_sha256`, and the existing complete `training_state_sha256` so a
+future mismatch can be localized instead of reported as one opaque digest.
+
+### Replay-scaling candidate
+
+Leo already contained an opt-in multi-GPU local-trajectory replay implementation.
+This repair reuses that path rather than creating a second replay engine. The
+candidate now:
+
+1. selects replay ranges once on the host from the canonical base losses;
+2. sends those exact selected ranges to every replay owner thread;
+3. estimates stateful replay execution work from the selected schedule;
+4. repartitions replay stories by replay work rather than reusing the base-pass
+   byte-balanced partition;
+5. reports min/max replay work and device time; and
+6. keeps the historical additive sparse replay merge and configured replay target
+   budget.
+
+`LEO_MULTI_GPU_PARALLEL_REPLAY=1` remains opt-in. It changes cross-story replay
+parameter visibility even though the target budget and FP32 equations are
+unchanged, so it must not become the production default until a held-out quality
+A/B shows no regression. `LEO_MULTI_GPU_PARALLEL_REPLAY=0` retains canonical
+serial replay for the control.
+
+### Acceptance required before merge/default promotion
+
+This candidate has no local CUDA hardware in the packaging environment, so no
+speed or quality gain is claimed here. On the same T4x2 session, acceptance must
+show all of the following:
+
+```text
+1-GPU repeated model/stat/training hashes       identical
+2-GPU repeated model/stat/training hashes       identical
+canonical serial replay quality                 unchanged vs 0f8be41
+parallel replay target/range counts             identical to serial control
+parallel replay held-out B/B and accuracy       no material regression
+2-GPU warm-cache median SPS                     materially above 4901.10
+2-GPU replay wall fraction                      materially below ~49.7%
+```
+
+If deterministic ordered branch accumulation causes a throughput regression that
+exceeds the parallel-replay gain, reject or redesign it rather than weakening the
+exact-state gate. If parallel replay improves speed but degrades held-out quality,
+keep it experimental and retain serial replay as production.

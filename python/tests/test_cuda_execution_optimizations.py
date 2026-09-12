@@ -613,10 +613,14 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("synchronization_modes_equivalent", resume)
         self.assertIn("configured_multi_gpu_devices(backend, limit.max(1))?", validation)
         self.assertIn("training_state_hash(runtime.model())", main)
+        self.assertIn("model_state_sha256", main)
+        self.assertIn("statistics_state_sha256", main)
         self.assertIn("training_state_sha256", main)
         self.assertIn("selectors.DefaultSelector", scaling)
         self.assertIn("gpu_heartbeat", scaling)
         self.assertIn("training_state_sha256", scaling)
+        self.assertIn("model_state_sha256", scaling)
+        self.assertIn("statistics_state_sha256", scaling)
         self.assertIn("benchmark_environment", scaling)
         self.assertIn("LEO_REPLAY_STREAMING", scaling)
         self.assertIn("LEO_MULTI_GPU_PARALLEL_REPLAY", scaling)
@@ -1199,7 +1203,7 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("leo_train_story_block", story_kernel)
         self.assertNotIn("cooperative_groups::this_grid().sync", story_kernel)
 
-    def test_parallel_multi_gpu_replay_is_opt_in_and_keeps_budget_fp32(self):
+    def test_parallel_multi_gpu_replay_is_opt_in_balanced_and_keeps_budget_fp32(self):
         training = (ROOT / "crates/leo-cli/src/training.rs").read_text()
         flag = training.split("fn multi_gpu_parallel_replay_enabled", 1)[1].split(
             "#[derive(Debug, Clone, Copy, Default)]", 1
@@ -1207,10 +1211,33 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("LEO_MULTI_GPU_PARALLEL_REPLAY", flag)
         self.assertIn(".unwrap_or(false)", flag)
         self.assertIn("run_parallel_replay", training)
+        self.assertIn("work_balanced_weight_ranges", training)
+        self.assertIn("replay_execution_work", training)
+        self.assertIn("apply_batch_replay_ranges", training)
         self.assertIn("apply_sum_deltas", training)
         self.assertIn("sum_local_trajectories", training)
         self.assertIn('"fp32\\\":true', training)
         self.assertIn("runtime.model().config.replay.fraction", training)
+
+    def test_persistent_event_accumulation_has_scheduler_stable_fp32_order(self):
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+        self.assertIn("leo_p_ordered_branch_add_warp", kernels)
+        helper = kernels.split("leo_p_ordered_branch_add_warp", 1)[1].split(
+            "// Exact per-tick worklists", 1
+        )[0]
+        self.assertIn("__shfl_sync", helper)
+        self.assertIn("__syncwarp", helper)
+        self.assertIn("atomicAdd(&branch_delta[key], ordered_value)", helper)
+        delivery = kernels.split("__device__ void leo_p_deliver_events", 1)[1].split(
+            "__device__ void leo_p_inject_symbol", 1
+        )[0]
+        injection = kernels.split("__device__ void leo_p_inject_symbol", 1)[1].split(
+            "// Frozen replay-prefix advancement", 1
+        )[0]
+        for body in (delivery, injection):
+            self.assertIn("owner_warp", body)
+            self.assertIn("__syncthreads", body)
+            self.assertIn("leo_p_ordered_branch_add_warp", body)
 
 
 if __name__ == "__main__":

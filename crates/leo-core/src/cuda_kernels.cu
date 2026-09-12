@@ -1614,6 +1614,50 @@ __device__ __forceinline__ unsigned int leo_p_global_stride() {
     return blockDim.x;
 }
 
+// FP32 atomicAdd is numerically correct but the arrival order of colliding
+// threads is not specified by CUDA.  A handful of same-branch collisions are
+// enough to change low FP32 bits and therefore the exact training-state hash.
+// Production event injection keeps CTA-wide loading/trace work, then commits
+// each 32-item warp in fixed warp order. Unique destinations within that warp
+// retain parallel atomics; only lanes that collide on the same branch serialize
+// in ascending lane order. The warp barrier orders collisions within a warp and
+// the caller orders warps with CTA barriers. This keeps the existing
+// FP32 additions while removing scheduler-dependent accumulation order.
+__device__ __forceinline__ void leo_p_ordered_branch_add_warp(
+    float* branch_delta,
+    unsigned int key,
+    float value,
+    bool valid
+) {
+    const unsigned int lane = threadIdx.x & 31U;
+    const unsigned int mask = __activemask();
+    const unsigned int invalid_key = 0xffffffffU;
+    const unsigned int comparable_key = valid ? key : invalid_key;
+    unsigned int peers = 0U;
+
+    #pragma unroll
+    for (unsigned int source_lane = 0U; source_lane < 32U; ++source_lane) {
+        const unsigned int source_key = __shfl_sync(mask, comparable_key, source_lane);
+        if (valid && source_key == key) peers |= 1U << source_lane;
+    }
+
+    if (valid) {
+        const unsigned int leader = (unsigned int)(__ffs((int)peers) - 1);
+        if (__popc(peers) == 1U) {
+            atomicAdd(&branch_delta[key], value);
+        } else {
+            // Every lane in a collision group executes the same shuffle calls;
+            // only the group's first lane performs the ordered FP32 atomics.
+            for (unsigned int source_lane = 0U; source_lane < 32U; ++source_lane) {
+                if ((peers & (1U << source_lane)) == 0U) continue;
+                const float ordered_value = __shfl_sync(peers, value, source_lane);
+                if (lane == leader) atomicAdd(&branch_delta[key], ordered_value);
+            }
+        }
+    }
+    __syncwarp(mask);
+}
+
 
 // Exact per-tick worklists. Epoch arrays remain the source of truth for
 // membership; the lists only materialize the unique touched/destination set so
@@ -1726,8 +1770,10 @@ __device__ void leo_p_deliver_events(
     float* rec_as = leo_p_ptr<float>(p, LEO_P_REC_ADAPTATION_SLOW_SENSITIVITY);
     unsigned long long* rec_last = leo_p_ptr<unsigned long long>(p, LEO_P_REC_LAST_TICK);
     unsigned int* rec_mark = leo_p_ptr<unsigned int>(p, LEO_P_REC_ELIGIBLE_MARK);
-    const unsigned int thread = leo_p_global_thread();
-    const unsigned int stride = leo_p_global_stride();
+
+    const unsigned int warp = threadIdx.x >> 5U;
+    const unsigned int warp_count = (blockDim.x + 31U) >> 5U;
+
     // The per-step fallback launches for max_active_global records at every delay
     // and immediately rejects records beyond ring_count[bucket]. The persistent
     // kernel can read ring_count on-device and iterate only records that exist.
@@ -1736,30 +1782,51 @@ __device__ void leo_p_deliver_events(
         const unsigned int bucket = (unsigned int)((tick + 9ULL - (unsigned long long)delay_value) % 9ULL);
         const unsigned int count = ring_count[bucket];
         const unsigned int total = count * cfg->synapses_per_neuron;
-        for (unsigned int inner = thread; inner < total; inner += stride) {
-            const unsigned int record = inner / cfg->synapses_per_neuron;
-            const unsigned int local_slot = inner - record * cfg->synapses_per_neuron;
-            const unsigned int source_position = bucket * cfg->max_active_global + record;
-            const unsigned int source = ring_source[source_position];
-            const unsigned int slot = source * cfg->synapses_per_neuron + local_slot;
-            if ((unsigned int)recurrent_delay[slot] != delay_value) continue;
-            const float presynaptic = ring_activation[source_position];
-            if (learning_trace) {
-                leo_advance_recurrent_trace(
-                    slot, tick, cfg, rec_bs, rec_ms, rec_fs, rec_af, rec_am, rec_as, rec_last
-                );
-                rec_bs[slot] += presynaptic;
-                if (atomicCAS(&rec_mark[slot], 0U, 1U) == 0U) {
-                    const unsigned int position = atomicAdd(rec_count, 1U);
-                    rec_list[position] = slot;
+        for (unsigned int base = 0U; base < total; base += blockDim.x) {
+            const unsigned int inner = base + threadIdx.x;
+            bool valid = inner < total;
+            unsigned int target = 0U;
+            unsigned int branch = 0U;
+            float contribution = 0.0f;
+
+            if (valid) {
+                const unsigned int record = inner / cfg->synapses_per_neuron;
+                const unsigned int local_slot = inner - record * cfg->synapses_per_neuron;
+                const unsigned int source_position = bucket * cfg->max_active_global + record;
+                const unsigned int source = ring_source[source_position];
+                const unsigned int slot = source * cfg->synapses_per_neuron + local_slot;
+                valid = (unsigned int)recurrent_delay[slot] == delay_value;
+                if (valid) {
+                    const float presynaptic = ring_activation[source_position];
+                    if (learning_trace) {
+                        leo_advance_recurrent_trace(
+                            slot, tick, cfg, rec_bs, rec_ms, rec_fs, rec_af, rec_am, rec_as, rec_last
+                        );
+                        rec_bs[slot] += presynaptic;
+                        if (atomicCAS(&rec_mark[slot], 0U, 1U) == 0U) {
+                            const unsigned int position = atomicAdd(rec_count, 1U);
+                            rec_list[position] = slot;
+                        }
+                    }
+                    target = recurrent_target[slot];
+                    branch = (unsigned int)recurrent_branch[slot];
+                    const unsigned long long snapshot =
+                        ((unsigned long long)source_position * cfg->synapses_per_neuron) + local_slot;
+                    contribution = presynaptic * ring_weight[snapshot];
                 }
             }
-            const unsigned int target = recurrent_target[slot];
-            const unsigned int branch = (unsigned int)recurrent_branch[slot];
-            const unsigned long long snapshot =
-                ((unsigned long long)source_position * cfg->synapses_per_neuron) + local_slot;
-            atomicAdd(&branch_delta[(unsigned long long)target * 4ULL + branch], presynaptic * ring_weight[snapshot]);
-            leo_p_mark_touched(p, target, tick + 1ULL);
+
+            const unsigned int key = target * 4U + branch;
+            // All CTA threads prepare one chunk in parallel. Warps then commit
+            // branch additions in fixed warp order, so the same destination can
+            // never receive racing atomics from different warps.
+            for (unsigned int owner_warp = 0U; owner_warp < warp_count; ++owner_warp) {
+                if (warp == owner_warp) {
+                    leo_p_ordered_branch_add_warp(branch_delta, key, contribution, valid);
+                    if (valid) leo_p_mark_touched(p, target, tick + 1ULL);
+                }
+                __syncthreads();
+            }
         }
     }
 }
@@ -1787,22 +1854,37 @@ __device__ void leo_p_inject_symbol(
     unsigned int* mark = leo_p_ptr<unsigned int>(p, LEO_P_INPUT_ELIGIBLE_MARK);
     unsigned int* list = eligible_list;
     unsigned int* count = eligible_count;
-    const unsigned int thread = leo_p_global_thread();
-    const unsigned int stride = leo_p_global_stride();
-    for (unsigned int local = thread; local < cfg->input_fanout; local += stride) {
-        const unsigned int slot = symbol * cfg->input_fanout + local;
-        if (learning_trace) {
-            leo_advance_recurrent_trace(slot, tick, cfg, bs, ms, fs, af, am, as, last_tick);
-            bs[slot] += 1.0f;
-            if (atomicCAS(&mark[slot], 0U, 1U) == 0U) {
-                const unsigned int position = atomicAdd(count, 1U);
-                list[position] = slot;
+
+    const unsigned int warp = threadIdx.x >> 5U;
+    const unsigned int warp_count = (blockDim.x + 31U) >> 5U;
+    for (unsigned int base = 0U; base < cfg->input_fanout; base += blockDim.x) {
+        const unsigned int local = base + threadIdx.x;
+        const bool valid = local < cfg->input_fanout;
+        unsigned int target = 0U;
+        unsigned int branch = 0U;
+        float contribution = 0.0f;
+        if (valid) {
+            const unsigned int slot = symbol * cfg->input_fanout + local;
+            if (learning_trace) {
+                leo_advance_recurrent_trace(slot, tick, cfg, bs, ms, fs, af, am, as, last_tick);
+                bs[slot] += 1.0f;
+                if (atomicCAS(&mark[slot], 0U, 1U) == 0U) {
+                    const unsigned int position = atomicAdd(count, 1U);
+                    list[position] = slot;
+                }
             }
+            target = input_target[slot];
+            branch = (unsigned int)input_branch[slot];
+            contribution = input_weight[slot];
         }
-        const unsigned int target = input_target[slot];
-        const unsigned int branch = (unsigned int)input_branch[slot];
-        atomicAdd(&branch_delta[(unsigned long long)target * 4ULL + branch], input_weight[slot]);
-        leo_p_mark_touched(p, target, tick + 1ULL);
+        const unsigned int key = target * 4U + branch;
+        for (unsigned int owner_warp = 0U; owner_warp < warp_count; ++owner_warp) {
+            if (warp == owner_warp) {
+                leo_p_ordered_branch_add_warp(branch_delta, key, contribution, valid);
+                if (valid) leo_p_mark_touched(p, target, tick + 1ULL);
+            }
+            __syncthreads();
+        }
     }
 }
 

@@ -244,6 +244,8 @@ def run_case(args, devices, count):
         )
     if not benchmark.get("training_state_sha256"):
         raise RuntimeError("training benchmark emitted no final training_state_sha256")
+    if not benchmark.get("model_state_sha256") or not benchmark.get("statistics_state_sha256"):
+        raise RuntimeError("training benchmark emitted no split model/statistics state hashes")
     if count > 1 and not any(
         event.get("exact_flat_story_mean") is True for event in multi_events
     ):
@@ -316,7 +318,14 @@ def main():
         cases.sort(key=lambda item: float(item["steps_per_second"]))
         hashes = {case.get("training_state_sha256") for case in cases}
         if len(hashes) != 1:
-            raise RuntimeError(f"{count}-GPU repeated runs produced different final state hashes")
+            model_hashes = {case.get("model_state_sha256") for case in cases}
+            statistics_hashes = {case.get("statistics_state_sha256") for case in cases}
+            raise RuntimeError(
+                f"{count}-GPU repeated runs produced different final state hashes; "
+                f"model_hashes={sorted(model_hashes)} "
+                f"statistics_hashes={sorted(statistics_hashes)} "
+                f"training_hashes={sorted(hashes)}"
+            )
         median = cases[len(cases) // 2]
         median["steps_per_second_min"] = float(cases[0]["steps_per_second"])
         median["steps_per_second_max"] = float(cases[-1]["steps_per_second"])
