@@ -1615,39 +1615,58 @@ __device__ __forceinline__ unsigned int leo_p_global_stride() {
 }
 
 // FP32 atomicAdd is numerically correct but the arrival order of colliding
-// threads is not specified by CUDA.  A handful of same-branch collisions are
+// threads is not specified by CUDA. A handful of same-branch collisions are
 // enough to change low FP32 bits and therefore the exact training-state hash.
-// Production event injection keeps CTA-wide loading/trace work, then commits
-// each 32-item warp in fixed warp order. Unique destinations within that warp
-// retain parallel atomics; only lanes that collide on the same branch serialize
-// in ascending lane order. The warp barrier orders collisions within a warp and
-// the caller orders warps with CTA barriers. This keeps the existing
-// FP32 additions while removing scheduler-dependent accumulation order.
-__device__ __forceinline__ void leo_p_ordered_branch_add_warp(
-    float* branch_delta,
+//
+// The first repair serialized every warp in the CTA. That restored exact hashes
+// but cost ~40% on T4. The fast path below reuses selection shared memory as a
+// tiny per-chunk key table: if no branch key is shared by two warps, all warps
+// may commit concurrently because they touch disjoint FP32 destinations. Only a
+// real cross-warp collision falls back to fixed warp order. Within a warp,
+// colliding lanes always issue FP32 additions in ascending lane order.
+//
+// Volta+ has a hardware warp match primitive. Pascal keeps the shuffle fallback
+// so P100 remains supported without changing arithmetic or the deterministic
+// ordering contract.
+constexpr unsigned int LEO_BRANCH_COLLISION_TABLE = 512U;
+constexpr unsigned int LEO_BRANCH_COLLISION_MASK = LEO_BRANCH_COLLISION_TABLE - 1U;
+constexpr unsigned int LEO_BRANCH_COLLISION_FLAG = LEO_BRANCH_COLLISION_TABLE;
+
+__device__ __forceinline__ unsigned int leo_p_branch_peer_mask(
     unsigned int key,
-    float value,
     bool valid
 ) {
-    const unsigned int lane = threadIdx.x & 31U;
     const unsigned int mask = __activemask();
-    const unsigned int invalid_key = 0xffffffffU;
-    const unsigned int comparable_key = valid ? key : invalid_key;
+    const unsigned int comparable_key = valid ? key : 0xffffffffU;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    const unsigned int peers = __match_any_sync(mask, comparable_key);
+    return valid ? peers : 0U;
+#else
     unsigned int peers = 0U;
-
     #pragma unroll
     for (unsigned int source_lane = 0U; source_lane < 32U; ++source_lane) {
         const unsigned int source_key = __shfl_sync(mask, comparable_key, source_lane);
         if (valid && source_key == key) peers |= 1U << source_lane;
     }
+    return peers;
+#endif
+}
+
+__device__ __forceinline__ void leo_p_ordered_branch_add_warp(
+    float* branch_delta,
+    unsigned int key,
+    float value,
+    bool valid,
+    unsigned int peers
+) {
+    const unsigned int lane = threadIdx.x & 31U;
+    const unsigned int mask = __activemask();
 
     if (valid) {
         const unsigned int leader = (unsigned int)(__ffs((int)peers) - 1);
         if (__popc(peers) == 1U) {
             atomicAdd(&branch_delta[key], value);
         } else {
-            // Every lane in a collision group executes the same shuffle calls;
-            // only the group's first lane performs the ordered FP32 atomics.
             for (unsigned int source_lane = 0U; source_lane < 32U; ++source_lane) {
                 if ((peers & (1U << source_lane)) == 0U) continue;
                 const float ordered_value = __shfl_sync(peers, value, source_lane);
@@ -1658,6 +1677,88 @@ __device__ __forceinline__ void leo_p_ordered_branch_add_warp(
     __syncwarp(mask);
 }
 
+__device__ __forceinline__ bool leo_p_cross_warp_branch_collision(
+    unsigned long long* scratch,
+    unsigned int key,
+    bool valid,
+    unsigned int peers
+) {
+    // Reuse the first 513 u32 words of shared selection scratch as an exact
+    // key set plus one collision flag. Intra-warp duplicates elect one lane,
+    // so observing an already-present exact key proves another warp owns the
+    // same FP32 destination. A 32-bit shared atomicCAS is sufficient because
+    // branch keys fit in u32; no owner payload or second table scan is needed.
+    unsigned int* table = reinterpret_cast<unsigned int*>(scratch);
+    for (unsigned int index = threadIdx.x; index <= LEO_BRANCH_COLLISION_FLAG;
+         index += blockDim.x) {
+        table[index] = 0U;
+    }
+    __syncthreads();
+
+    const unsigned int lane = threadIdx.x & 31U;
+    const unsigned int leader = valid ? (unsigned int)(__ffs((int)peers) - 1) : 0U;
+
+    if (valid && lane == leader) {
+        const unsigned int entry = key + 1U;
+        unsigned int slot = (key * 2654435761U) & LEO_BRANCH_COLLISION_MASK;
+        bool inserted = false;
+        #pragma unroll 1
+        for (unsigned int probe = 0U; probe < LEO_BRANCH_COLLISION_TABLE; ++probe) {
+            const unsigned int old = atomicCAS(&table[slot], 0U, entry);
+            if (old == 0U) {
+                inserted = true;
+                break;
+            }
+            if (old == entry) {
+                atomicExch(&table[LEO_BRANCH_COLLISION_FLAG], 1U);
+                inserted = true;
+                break;
+            }
+            slot = (slot + 1U) & LEO_BRANCH_COLLISION_MASK;
+        }
+        // At <=256 leaders in a 512-slot table this should never happen, but a
+        // conservative fallback preserves deterministic ordering if it does.
+        if (!inserted) atomicExch(&table[LEO_BRANCH_COLLISION_FLAG], 1U);
+    }
+    __syncthreads();
+    return table[LEO_BRANCH_COLLISION_FLAG] != 0U;
+}
+
+__device__ __forceinline__ void leo_p_commit_branch_chunk(
+    float* branch_delta,
+    unsigned long long* scratch,
+    unsigned int key,
+    float value,
+    bool valid,
+    unsigned int active_warps
+) {
+    const unsigned int warp = threadIdx.x >> 5U;
+    // Compute the same-key lane mask once and reuse it for collision detection
+    // and the ordered commit. On Pascal this also avoids repeating 32 shuffles.
+    const unsigned int peers = leo_p_branch_peer_mask(key, valid);
+    const bool cross_warp_collision = leo_p_cross_warp_branch_collision(
+        scratch, key, valid, peers
+    );
+
+    if (!cross_warp_collision) {
+        // Different warps own disjoint branch keys, so their atomic arrival
+        // order cannot affect any FP32 destination. Preserve only the required
+        // ascending-lane order for collisions inside each warp.
+        if (warp < active_warps) {
+            leo_p_ordered_branch_add_warp(branch_delta, key, value, valid, peers);
+        }
+        return;
+    }
+
+    // Rare fallback: preserve the exact repair-v1 ordering for a chunk that
+    // really contains the same branch key in more than one warp.
+    for (unsigned int owner_warp = 0U; owner_warp < active_warps; ++owner_warp) {
+        if (warp == owner_warp) {
+            leo_p_ordered_branch_add_warp(branch_delta, key, value, valid, peers);
+        }
+        __syncthreads();
+    }
+}
 
 // Exact per-tick worklists. Epoch arrays remain the source of truth for
 // membership; the lists only materialize the unique touched/destination set so
@@ -1751,7 +1852,8 @@ __device__ void leo_p_deliver_events(
     unsigned long long tick,
     bool learning_trace,
     unsigned int* rec_list,
-    unsigned int* rec_count
+    unsigned int* rec_count,
+    unsigned long long* branch_collision_scratch
 ) {
     const LeoConfig* cfg = leo_p_cptr<LeoConfig>(p, LEO_P_CONFIG);
     const unsigned int* recurrent_target = leo_p_cptr<unsigned int>(p, LEO_P_RECURRENT_TARGET);
@@ -1770,9 +1872,6 @@ __device__ void leo_p_deliver_events(
     float* rec_as = leo_p_ptr<float>(p, LEO_P_REC_ADAPTATION_SLOW_SENSITIVITY);
     unsigned long long* rec_last = leo_p_ptr<unsigned long long>(p, LEO_P_REC_LAST_TICK);
     unsigned int* rec_mark = leo_p_ptr<unsigned int>(p, LEO_P_REC_ELIGIBLE_MARK);
-
-    const unsigned int warp = threadIdx.x >> 5U;
-    const unsigned int warp_count = (blockDim.x + 31U) >> 5U;
 
     // The per-step fallback launches for max_active_global records at every delay
     // and immediately rejects records beyond ring_count[bucket]. The persistent
@@ -1817,16 +1916,13 @@ __device__ void leo_p_deliver_events(
             }
 
             const unsigned int key = target * 4U + branch;
-            // All CTA threads prepare one chunk in parallel. Warps then commit
-            // branch additions in fixed warp order, so the same destination can
-            // never receive racing atomics from different warps.
-            for (unsigned int owner_warp = 0U; owner_warp < warp_count; ++owner_warp) {
-                if (warp == owner_warp) {
-                    leo_p_ordered_branch_add_warp(branch_delta, key, contribution, valid);
-                    if (valid) leo_p_mark_touched(p, target, tick + 1ULL);
-                }
-                __syncthreads();
-            }
+            const unsigned int chunk_items = total - base < blockDim.x
+                ? total - base : blockDim.x;
+            const unsigned int active_warps = (chunk_items + 31U) >> 5U;
+            leo_p_commit_branch_chunk(
+                branch_delta, branch_collision_scratch, key, contribution, valid, active_warps
+            );
+            if (valid) leo_p_mark_touched(p, target, tick + 1ULL);
         }
     }
 }
@@ -1837,7 +1933,8 @@ __device__ void leo_p_inject_symbol(
     unsigned int symbol,
     bool learning_trace,
     unsigned int* eligible_list,
-    unsigned int* eligible_count
+    unsigned int* eligible_count,
+    unsigned long long* branch_collision_scratch
 ) {
     const LeoConfig* cfg = leo_p_cptr<LeoConfig>(p, LEO_P_CONFIG);
     const unsigned int* input_target = leo_p_cptr<unsigned int>(p, LEO_P_INPUT_TARGET);
@@ -1855,8 +1952,6 @@ __device__ void leo_p_inject_symbol(
     unsigned int* list = eligible_list;
     unsigned int* count = eligible_count;
 
-    const unsigned int warp = threadIdx.x >> 5U;
-    const unsigned int warp_count = (blockDim.x + 31U) >> 5U;
     for (unsigned int base = 0U; base < cfg->input_fanout; base += blockDim.x) {
         const unsigned int local = base + threadIdx.x;
         const bool valid = local < cfg->input_fanout;
@@ -1878,13 +1973,13 @@ __device__ void leo_p_inject_symbol(
             contribution = input_weight[slot];
         }
         const unsigned int key = target * 4U + branch;
-        for (unsigned int owner_warp = 0U; owner_warp < warp_count; ++owner_warp) {
-            if (warp == owner_warp) {
-                leo_p_ordered_branch_add_warp(branch_delta, key, contribution, valid);
-                if (valid) leo_p_mark_touched(p, target, tick + 1ULL);
-            }
-            __syncthreads();
-        }
+        const unsigned int chunk_items = cfg->input_fanout - base < blockDim.x
+            ? cfg->input_fanout - base : blockDim.x;
+        const unsigned int active_warps = (chunk_items + 31U) >> 5U;
+        leo_p_commit_branch_chunk(
+            branch_delta, branch_collision_scratch, key, contribution, valid, active_warps
+        );
+        if (valid) leo_p_mark_touched(p, target, tick + 1ULL);
     }
 }
 
@@ -4368,10 +4463,13 @@ __device__ void leo_train_story_block(
 
         leo_p_start_tick(pointers, tick);
         __syncthreads();
-        leo_p_deliver_events(pointers, tick, learning_trace, rec_current_list, rec_current_count);
+        leo_p_deliver_events(
+            pointers, tick, learning_trace, rec_current_list, rec_current_count, shared_selection_keys
+        );
         __syncthreads();
         leo_p_inject_symbol(
-            pointers, tick, step.symbol, learning_trace, input_current_list, input_current_count
+            pointers, tick, step.symbol, learning_trace, input_current_list, input_current_count,
+            shared_selection_keys
         );
         __syncthreads();
         leo_p_context_resolve(pointers, step.symbol, context_enabled, learning_trace && context_enabled);
@@ -4462,11 +4560,11 @@ __device__ void leo_advance_frozen_story_block(
         leo_p_start_tick(pointers, tick);
         __syncthreads();
         leo_p_deliver_events(
-            pointers, tick, false, recurrent_list, recurrent_count
+            pointers, tick, false, recurrent_list, recurrent_count, shared_selection_keys
         );
         __syncthreads();
         leo_p_inject_symbol(
-            pointers, tick, symbol, false, input_list, input_count
+            pointers, tick, symbol, false, input_list, input_count, shared_selection_keys
         );
         __syncthreads();
         leo_p_context_advance_history(pointers, symbol);
@@ -4563,9 +4661,13 @@ __device__ __forceinline__ void leo_advance_frozen_cooperative_body(
             // loading four unused worklist pointers into the long-lived prefix
             // kernel solely to pass values that the helpers cannot dereference
             // when learning_trace=false.
-            leo_p_deliver_events(pointers, tick, false, nullptr, nullptr);
+            leo_p_deliver_events(
+                pointers, tick, false, nullptr, nullptr, shared_selection_keys
+            );
             __syncthreads();
-            leo_p_inject_symbol(pointers, tick, symbol, false, nullptr, nullptr);
+            leo_p_inject_symbol(
+                pointers, tick, symbol, false, nullptr, nullptr, shared_selection_keys
+            );
             __syncthreads();
             leo_p_context_advance_history(pointers, symbol);
             __syncthreads();
@@ -4715,12 +4817,12 @@ __device__ __forceinline__ void leo_train_cooperative_body(
             __syncthreads();
             leo_p_deliver_events(
                 pointers, tick, learning_trace && !frozen_advance,
-                rec_current_list, rec_current_count
+                rec_current_list, rec_current_count, shared_selection_keys
             );
             __syncthreads();
             leo_p_inject_symbol(
                 pointers, tick, step.symbol, learning_trace && !frozen_advance,
-                input_current_list, input_current_count
+                input_current_list, input_current_count, shared_selection_keys
             );
             __syncthreads();
             if (frozen_advance) {
@@ -5092,7 +5194,8 @@ __device__ __forceinline__ void leo_shared_phase_pre_lane(
     unsigned int lane_count,
     unsigned int step_index,
     unsigned int learning_trace_raw,
-    unsigned int lane
+    unsigned int lane,
+    unsigned long long* branch_collision_scratch
 ) {
     if (lane >= lane_count || step_index >= step_counts[lane]) return;
     const unsigned long long* p = reinterpret_cast<const unsigned long long*>(
@@ -5122,9 +5225,14 @@ __device__ __forceinline__ void leo_shared_phase_pre_lane(
 
     leo_p_start_tick(p, tick);
     __syncthreads();
-    leo_p_deliver_events(p, tick, learning_trace, rec_current_list, rec_current_count);
+    leo_p_deliver_events(
+        p, tick, learning_trace, rec_current_list, rec_current_count, branch_collision_scratch
+    );
     __syncthreads();
-    leo_p_inject_symbol(p, tick, step.symbol, learning_trace, input_current_list, input_current_count);
+    leo_p_inject_symbol(
+        p, tick, step.symbol, learning_trace, input_current_list, input_current_count,
+        branch_collision_scratch
+    );
     __syncthreads();
     // Context tables are lane-private in the exact logical-batch path, so use
     // the ordinary single-story resolver including deterministic weakest-slot
@@ -5560,8 +5668,10 @@ extern "C" __global__ void leo_shared_wavefront_pre(
     unsigned int step_index,
     unsigned int learning_trace_raw
 ) {
+    __shared__ unsigned long long branch_collision_scratch[LEO_GLOBAL_SORT];
     leo_shared_phase_pre_lane(pointer_table_addresses, step_buffer_addresses, step_counts,
-        base_ticks, lane_count, step_index, learning_trace_raw, blockIdx.x);
+        base_ticks, lane_count, step_index, learning_trace_raw, blockIdx.x,
+        branch_collision_scratch);
 }
 
 extern "C" __global__ void leo_shared_select_blocks(
@@ -5695,7 +5805,7 @@ extern "C" __global__ void leo_shared_wavefront_fused(
 
     for (unsigned int lane = blockIdx.x; lane < lane_count; lane += gridDim.x) {
         leo_shared_phase_pre_lane(pointer_table_addresses, step_buffer_addresses, step_counts,
-            base_ticks, lane_count, step_index, learning_trace_raw, lane);
+            base_ticks, lane_count, step_index, learning_trace_raw, lane, shared_selection_keys);
     }
     grid.sync();
 
@@ -5785,7 +5895,7 @@ extern "C" __global__ void leo_shared_wavefront_persistent(
     for (unsigned int step_index = 0U; step_index < max_step_count; ++step_index) {
         for (unsigned int lane = blockIdx.x; lane < lane_count; lane += gridDim.x) {
             leo_shared_phase_pre_lane(pointer_table_addresses, step_buffer_addresses, step_counts,
-                base_ticks, lane_count, step_index, learning_trace_raw, lane);
+                base_ticks, lane_count, step_index, learning_trace_raw, lane, shared_selection_keys);
         }
         grid.sync();
 
@@ -5959,7 +6069,7 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
         if (active && lane_leader) {
             leo_shared_phase_pre_lane(
                 pointer_table_addresses, step_buffer_addresses, step_counts, base_ticks,
-                lane_count, step_index, learning_trace_raw, lane
+                lane_count, step_index, learning_trace_raw, lane, shared_selection_keys
             );
         }
         cooperative_groups::this_grid().sync();
@@ -6250,7 +6360,7 @@ extern "C" __global__ void leo_shared_wavefront_fused_profiled(
 
     for (unsigned int lane = blockIdx.x; lane < lane_count; lane += gridDim.x) {
         leo_shared_phase_pre_lane(pointer_table_addresses, step_buffer_addresses, step_counts,
-            base_ticks, lane_count, step_index, learning_trace_raw, lane);
+            base_ticks, lane_count, step_index, learning_trace_raw, lane, shared_selection_keys);
     }
     grid.sync();
     if (profile_thread) {

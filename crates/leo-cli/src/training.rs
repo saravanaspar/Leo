@@ -26,6 +26,16 @@ use std::time::Instant;
 
 pub(crate) const GPU_REFERENCE_WORKERS: usize = 16;
 
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ReplayDebugOptions {
     summary: bool,
@@ -38,22 +48,13 @@ struct ReplayDebugOptions {
 
 impl ReplayDebugOptions {
     fn from_env() -> Self {
-        let flag = |name: &str| {
-            std::env::var(name)
-                .ok()
-                .map(|value| {
-                    let value = value.trim().to_ascii_lowercase();
-                    !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
-                })
-                .unwrap_or(false)
-        };
-        let general = flag("LEO_REPLAY_DEBUG");
-        let timing_only = flag("LEO_REPLAY_DEBUG_TIMING");
-        let ranges = flag("LEO_REPLAY_DEBUG_RANGES");
-        let segments = flag("LEO_REPLAY_DEBUG_SEGMENTS");
+        let general = env_flag_enabled("LEO_REPLAY_DEBUG");
+        let timing_only = env_flag_enabled("LEO_REPLAY_DEBUG_TIMING");
+        let ranges = env_flag_enabled("LEO_REPLAY_DEBUG_RANGES");
+        let segments = env_flag_enabled("LEO_REPLAY_DEBUG_SEGMENTS");
         Self {
             summary: general || timing_only,
-            selection: general || flag("LEO_REPLAY_DEBUG_SELECTION") || ranges,
+            selection: general || env_flag_enabled("LEO_REPLAY_DEBUG_SELECTION") || ranges,
             segments,
             ranges,
             timing: general || timing_only || segments,
@@ -80,29 +81,18 @@ fn replay_streaming_enabled(runtime: &BackendRuntime) -> bool {
     if runtime.model().config.replay.stateful_batch {
         return true;
     }
-    std::env::var("LEO_REPLAY_STREAMING")
-        .ok()
-        .map(|value| {
-            let value = value.trim().to_ascii_lowercase();
-            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
-        })
-        .unwrap_or(false)
+    env_flag_enabled("LEO_REPLAY_STREAMING")
 }
 
-/// Multi-GPU replay can use the already-established local-trajectory reducer so
-/// replay occupies every selected device instead of leaving secondary GPUs idle
-/// for roughly half of a replay-heavy batch. The replay target budget, selected
-/// ranges, FP32 learning equations, and final additive merge are unchanged.
-/// Cross-story replay parameter visibility differs from the canonical serial
-/// fallback, so this remains opt-in until the held-out quality gate passes.
+/// The local-trajectory replay reducer is useful for performance research, but
+/// the T4x2 acceptance run proved that it changes cross-story parameter
+/// visibility and therefore the learned brain. Keep the implementation for
+/// diagnostics, but require an explicit second acknowledgement before it can
+/// replace canonical serial replay. Production speed work must optimize the
+/// exact replay path instead of silently trading quality for utilization.
 fn multi_gpu_parallel_replay_enabled() -> bool {
-    std::env::var("LEO_MULTI_GPU_PARALLEL_REPLAY")
-        .ok()
-        .map(|value| {
-            let value = value.trim().to_ascii_lowercase();
-            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
-        })
-        .unwrap_or(false)
+    env_flag_enabled("LEO_MULTI_GPU_PARALLEL_REPLAY")
+        && env_flag_enabled("LEO_MULTI_GPU_ALLOW_NONCANONICAL_REPLAY")
 }
 
 #[derive(Debug, Clone, Copy, Default)]

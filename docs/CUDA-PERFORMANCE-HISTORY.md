@@ -1454,3 +1454,133 @@ If deterministic ordered branch accumulation causes a throughput regression that
 exceeds the parallel-replay gain, reject or redesign it rather than weakening the
 exact-state gate. If parallel replay improves speed but degrades held-out quality,
 keep it experimental and retain serial replay as production.
+
+## 2026-09-12 — T4x2 repair-v1 result: determinism fixed, throughput regression rejected
+
+Measured branch/SHA: `perf/t4x2-multigpu-repair` at
+`caab3cb3ca5b8f15794146acb1bf626535239ca6`, based directly on production
+`0f8be41cad1a01e7086bc92ce3dc676b8bd589c1`.
+
+The same Kaggle T4x2 environment and pinned TinyStories dataset from the audit
+above were reused. The repair-v1 scheduler-stable branch accumulation did fix
+the correctness failure: three 256-story 1-GPU runs and three 256-story 2-GPU
+serial-replay runs each produced exactly one model hash, one statistics hash and
+one complete training-state hash. The serial 1-GPU and 2-GPU runs also converged
+to the same final hashes:
+
+```text
+model_state_sha256       49d48d26a809e90ea0fe2d92f4a61cd260b71fbc4fa58ef68a53450d082379db
+statistics_state_sha256  78f1abb9ec8c7e5c2fb6352bd967c4b9e364211d14e94a37927bf2a493e52250
+training_state_sha256    b14efdc2a50c127345e1d9833717d602b19d70c03ae4022d0f54b83c3f0cd800
+```
+
+However, serializing every CTA warp around recurrent/input FP32 branch
+accumulation was too expensive:
+
+```text
+repair-v1 warm 1xT4 SPS       2377.909, 2512.715, 2521.409
+repair-v1 warm 1xT4 best      2521.409 SPS
+old production median 1xT4    3974.622 SPS
+best repair-v1 delta           -36.56%
+
+repair-v1 2xT4 serial SPS      2930.951, 2882.261, 2999.574
+repair-v1 median 2xT4 serial   2930.951 SPS
+repair-v1 median wall          90.629 s
+repair-v1 median replay        56.099 s
+old production median 2xT4     4901.100 SPS
+repair-v1 delta                -40.20%
+```
+
+This implementation is rejected as a production default despite its exact-state
+success. The lesson is durable: deterministic FP32 ordering must not be
+implemented by making every warp wait for every other warp on every branch
+accumulation chunk.
+
+### Parallel local-trajectory replay experiment — speed win, semantic/quality rejection
+
+The opt-in local-trajectory replay path was also measured three times on T4x2.
+It kept both GPUs active through replay and materially reduced replay wall time:
+
+```text
+2xT4 serial median SPS         2930.951
+2xT4 parallel median SPS       4077.542
+parallel vs repaired serial    +39.12%
+serial median replay           56.099 s
+parallel median replay         28.854 s
+parallel median wall           65.145 s
+```
+
+The path was deterministic across repeats, but it did not preserve the canonical
+serial replay trajectory. The learned state and aggregate training metrics
+changed:
+
+```text
+serial mean loss               4.094500997896833
+parallel mean loss             4.105961577525147   (+0.2799%)
+serial bits/byte               5.907116284580673
+parallel bits/byte             5.923650405976154   (+0.2799%)
+serial active fraction         0.0005520168379551091
+parallel active fraction       0.0004956948282811735 (-10.20%)
+serial recurrent events/step   868.2474118134247
+parallel recurrent events/step 779.6605503896398   (-10.20%)
+serial output MAdds/step        2154.803689342318
+parallel output MAdds/step      2027.2402815946994  (-5.92%)
+```
+
+The parallel model hash was
+`b67ea2ffd8ab790c986c1e4d012babdfffaa77f4ef0a47e74e586223433743b7`,
+not the canonical serial hash. Even its `4077.542` median SPS remained about
+`16.80%` below the old `4901.100` 2xT4 production median. Therefore
+`sum_local_trajectories` replay is rejected for the no-quality-loss production
+path. It remains research-only and must require explicit non-canonical opt-in.
+
+## 2026-09-12 — T4x2 repair-v2 candidate: collision-aware deterministic accumulation
+
+Base: rejected repair-v1 SHA
+`caab3cb3ca5b8f15794146acb1bf626535239ca6`.
+
+Repair-v2 keeps the exact serial replay path as production behavior and targets
+the actual repair-v1 regression rather than accepting approximate replay.
+
+The persistent recurrent/input accumulation now reuses each CTA's existing
+`shared_selection_keys` buffer as a 512-entry temporary exact branch-key set.
+Each warp first collapses same-key lanes to one leader, then only those leaders
+insert `(target, branch)` keys with 32-bit shared-memory `atomicCAS`. Seeing an
+already-present exact key therefore proves a cross-warp collision. If no key is
+shared by two warps, all warps commit in parallel because their FP32
+destinations are disjoint. If a real cross-warp collision exists, only that
+chunk falls back to the repair-v1 fixed warp order. No owner payload, table
+scan, or 64-bit shared atomic is required. Within a warp, colliding lanes still
+issue FP32 additions in ascending lane order. Volta/Turing/Ampere+ uses
+`__match_any_sync`; Pascal/P100 retains the shuffle fallback.
+
+This design deliberately reuses existing shared selection scratch instead of
+allocating a second per-CTA table, so static shared-memory occupancy should not
+increase on the production grouped/replay kernels. The arithmetic and serial
+replay visibility contract are unchanged from repair-v1; the optimization only
+removes unnecessary serialization when warps provably own disjoint branch keys.
+
+The rejected local-trajectory replay implementation is now double-gated:
+`LEO_MULTI_GPU_PARALLEL_REPLAY=1` is insufficient by itself;
+`LEO_MULTI_GPU_ALLOW_NONCANONICAL_REPLAY=1` is also required. Benchmark scripts
+clear both variables so production scaling runs cannot inherit the rejected
+approximate path accidentally.
+
+### Repair-v2 acceptance gate
+
+No speed claim is made until a GPU run completes. On the same T4x2 session:
+
+```text
+1-GPU repeated model/stat/training hashes       exactly one each
+2-GPU repeated model/stat/training hashes       exactly one each
+1-GPU and 2-GPU serial model/stat/training      identical
+serial mean loss / B/B                          unchanged from repair-v1 control
+1xT4 median SPS                                 recover toward >= 3974.62
+2xT4 serial median SPS                          recover toward >= 4901.10
+parallel local-trajectory replay                disabled for production
+```
+
+If collision-aware accumulation loses exact hashes, reject it. If exact hashes
+hold but throughput remains materially below the old production baseline, the
+next exact optimization target is single-GPU replay execution itself; do not
+promote `sum_local_trajectories` merely to hide serial replay cost.

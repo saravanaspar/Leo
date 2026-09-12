@@ -123,6 +123,7 @@ def benchmark_environment(base_env, legacy_execution=False):
         "LEO_CUDA_DEVICE",
         "LEO_REPLAY_STREAMING",
         "LEO_MULTI_GPU_PARALLEL_REPLAY",
+        "LEO_MULTI_GPU_ALLOW_NONCANONICAL_REPLAY",
         "LEO_CUDA_REPLAY_COOPERATIVE",
         "LEO_CUDA_SHARED_PERSISTENT",
         "LEO_CUDA_SHARED_GROUPED",

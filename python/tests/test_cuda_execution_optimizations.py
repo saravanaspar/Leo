@@ -761,7 +761,7 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         )[0]
         self.assertIn("runtime.model().config.replay.stateful_batch", flag)
         self.assertIn("LEO_REPLAY_STREAMING", flag)
-        self.assertIn(".unwrap_or(false)", flag)
+        self.assertIn('env_flag_enabled("LEO_REPLAY_STREAMING")', flag)
 
         streaming = training.split("fn replay_ranges_streaming", 1)[1].split(
             "fn apply_replay_policy", 1
@@ -1166,8 +1166,11 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("for (unsigned int index = lane; index < kept; index += blockDim.x)", kernels)
         self.assertIn("leo_p_select_global_frozen", frozen_kernel)
         self.assertIn("__shared__ unsigned int shared_selected_count", frozen_kernel)
-        self.assertIn("leo_p_deliver_events(pointers, tick, false, nullptr, nullptr)", frozen_kernel)
-        self.assertIn("leo_p_inject_symbol(pointers, tick, symbol, false, nullptr, nullptr)", frozen_kernel)
+        self.assertIn("pointers, tick, false, nullptr, nullptr, shared_selection_keys", frozen_kernel)
+        self.assertIn(
+            "pointers, tick, symbol, false, nullptr, nullptr, shared_selection_keys",
+            frozen_kernel,
+        )
 
     def test_fast_replay_kernel_specializes_away_mixed_streaming_schedule(self):
         rust = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
@@ -1203,13 +1206,14 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("leo_train_story_block", story_kernel)
         self.assertNotIn("cooperative_groups::this_grid().sync", story_kernel)
 
-    def test_parallel_multi_gpu_replay_is_opt_in_balanced_and_keeps_budget_fp32(self):
+    def test_parallel_multi_gpu_replay_is_double_gated_after_quality_rejection(self):
         training = (ROOT / "crates/leo-cli/src/training.rs").read_text()
         flag = training.split("fn multi_gpu_parallel_replay_enabled", 1)[1].split(
             "#[derive(Debug, Clone, Copy, Default)]", 1
         )[0]
         self.assertIn("LEO_MULTI_GPU_PARALLEL_REPLAY", flag)
-        self.assertIn(".unwrap_or(false)", flag)
+        self.assertIn("LEO_MULTI_GPU_ALLOW_NONCANONICAL_REPLAY", flag)
+        self.assertIn("&&", flag)
         self.assertIn("run_parallel_replay", training)
         self.assertIn("work_balanced_weight_ranges", training)
         self.assertIn("replay_execution_work", training)
@@ -1219,15 +1223,37 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn('"fp32\\\":true', training)
         self.assertIn("runtime.model().config.replay.fraction", training)
 
-    def test_persistent_event_accumulation_has_scheduler_stable_fp32_order(self):
+        scaling = (ROOT / "scripts/benchmark_multi_gpu.py").read_text()
+        self.assertIn("LEO_MULTI_GPU_ALLOW_NONCANONICAL_REPLAY", scaling)
+
+    def test_persistent_event_accumulation_has_collision_aware_deterministic_fast_path(self):
         kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+        self.assertIn("leo_p_branch_peer_mask", kernels)
         self.assertIn("leo_p_ordered_branch_add_warp", kernels)
-        helper = kernels.split("leo_p_ordered_branch_add_warp", 1)[1].split(
+        self.assertIn("leo_p_cross_warp_branch_collision", kernels)
+        self.assertIn("leo_p_commit_branch_chunk", kernels)
+        self.assertIn("LEO_BRANCH_COLLISION_TABLE = 512U", kernels)
+
+        peer_helper = kernels.split("leo_p_branch_peer_mask", 1)[1].split(
+            "leo_p_ordered_branch_add_warp", 1
+        )[0]
+        self.assertIn("__match_any_sync", peer_helper)
+        self.assertIn("__CUDA_ARCH__ >= 700", peer_helper)
+        self.assertIn("__shfl_sync", peer_helper)
+
+        ordered = kernels.split("leo_p_ordered_branch_add_warp", 1)[1].split(
+            "leo_p_cross_warp_branch_collision", 1
+        )[0]
+        self.assertIn("__syncwarp", ordered)
+        self.assertIn("atomicAdd(&branch_delta[key], ordered_value)", ordered)
+
+        commit = kernels.split("leo_p_commit_branch_chunk", 1)[1].split(
             "// Exact per-tick worklists", 1
         )[0]
-        self.assertIn("__shfl_sync", helper)
-        self.assertIn("__syncwarp", helper)
-        self.assertIn("atomicAdd(&branch_delta[key], ordered_value)", helper)
+        self.assertIn("if (!cross_warp_collision)", commit)
+        self.assertIn("owner_warp", commit)
+        self.assertIn("__syncthreads", commit)
+
         delivery = kernels.split("__device__ void leo_p_deliver_events", 1)[1].split(
             "__device__ void leo_p_inject_symbol", 1
         )[0]
@@ -1235,9 +1261,16 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
             "// Frozen replay-prefix advancement", 1
         )[0]
         for body in (delivery, injection):
-            self.assertIn("owner_warp", body)
-            self.assertIn("__syncthreads", body)
-            self.assertIn("leo_p_ordered_branch_add_warp", body)
+            self.assertIn("branch_collision_scratch", body)
+            self.assertIn("active_warps", body)
+            self.assertIn("leo_p_commit_branch_chunk", body)
+
+        grouped = kernels.split("leo_shared_wavefront_persistent_grouped_body", 1)[1].split(
+            'extern "C" __global__ void\n__launch_bounds__(256, 2)\nleo_shared_wavefront_persistent_grouped',
+            1,
+        )[0]
+        self.assertIn("shared_selection_keys", grouped)
+        self.assertIn("branch_collision_scratch", kernels)
 
 
 if __name__ == "__main__":
