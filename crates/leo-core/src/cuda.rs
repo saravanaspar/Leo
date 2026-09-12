@@ -402,6 +402,7 @@ struct CudaPersistentStep {
     target_index: i32,
     context_enabled: u32,
     supervised_strength: f32,
+    plasticity_scale: f32,
 }
 
 type CuDevice = c_int;
@@ -1557,6 +1558,7 @@ pub(crate) struct CudaRuntime {
     events: CudaRuntimeEvents,
     buffers: Buffers,
     current_tick: u64,
+    plasticity_phase: usize,
     probabilities: Vec<f32>,
     neural_logits: Vec<f32>,
     active: Vec<usize>,
@@ -2205,6 +2207,7 @@ impl CudaRuntime {
             events,
             buffers: Buffers::default(),
             current_tick: 0,
+            plasticity_phase: 0,
             probabilities: vec![0.0; OUTPUT_CLASSES],
             neural_logits: vec![0.0; OUTPUT_CLASSES],
             active: Vec::new(),
@@ -3209,6 +3212,7 @@ impl CudaRuntime {
         self.active.clear();
         self.activation.fill(0.0);
         self.persistent_document_activity = false;
+        self.plasticity_phase = 0;
         Ok(())
     }
 
@@ -3253,7 +3257,18 @@ impl CudaRuntime {
                 } else {
                     1.0
                 };
-                self.launch_learning(strength, strength * target_weight, context_enabled)?;
+                let (plasticity_scale, next_plasticity_phase) =
+                    self.model.config.learning.plasticity_step(
+                        self.plasticity_phase,
+                        target_output_index == END_DOCUMENT_OUTPUT_INDEX,
+                    );
+                self.launch_learning(
+                    strength,
+                    strength * target_weight,
+                    plasticity_scale,
+                    context_enabled,
+                )?;
+                self.plasticity_phase = next_plasticity_phase;
                 self.model.parameter_revision = self.model.parameter_revision.saturating_add(1);
                 self.output_bias_dirty_since_sync = true;
                 if context_enabled {
@@ -3332,6 +3347,7 @@ impl CudaRuntime {
                     target_index: -1,
                     context_enabled: 0,
                     supervised_strength: 0.0,
+                    plasticity_scale: 0.0,
                 });
             }
             let build_ms = build_started
@@ -3546,6 +3562,7 @@ impl CudaRuntime {
             Vec::with_capacity(steps.iter().filter(|step| step.1.is_some()).count());
         let debug_chunks =
             self.debug.chunks || self.debug.sync || self.debug.transfers || self.debug.state;
+        let mut plasticity_phase = self.plasticity_phase;
 
         for (chunk_index, chunk) in steps.chunks(TRAINING_STEP_BATCH_CAPACITY).enumerate() {
             let chunk_started = debug_chunks.then(Instant::now);
@@ -3590,11 +3607,18 @@ impl CudaRuntime {
                         learned_steps = learned_steps.saturating_add(1);
                         context_learning |= context_enabled;
                     }
+                    let (plasticity_scale, next_plasticity_phase) =
+                        self.model.config.learning.plasticity_step(
+                            plasticity_phase,
+                            target_output_index == END_DOCUMENT_OUTPUT_INDEX,
+                        );
+                    plasticity_phase = next_plasticity_phase;
                     device_steps.push(CudaPersistentStep {
                         symbol,
                         target_index: target_output_index as i32,
                         context_enabled: u32::from(context_enabled),
                         supervised_strength: strength * target_weight,
+                        plasticity_scale,
                     });
                     metadata.push(Some((
                         symbol,
@@ -3608,6 +3632,7 @@ impl CudaRuntime {
                         target_index: -2,
                         context_enabled: 1,
                         supervised_strength: 0.0,
+                        plasticity_scale: 0.0,
                     });
                     metadata.push(None);
                 }
@@ -3696,6 +3721,7 @@ impl CudaRuntime {
             }
 
             self.current_tick = self.current_tick.saturating_add(chunk.len() as u64);
+            self.plasticity_phase = plasticity_phase;
             self.model.parameter_revision =
                 self.model.parameter_revision.saturating_add(learned_steps);
             if learned_steps > 0 {
@@ -3825,7 +3851,18 @@ impl CudaRuntime {
                         } else {
                             1.0
                         };
-                        self.launch_learning(strength, strength * target_weight, context_enabled)?;
+                        let (plasticity_scale, next_plasticity_phase) =
+                            self.model.config.learning.plasticity_step(
+                                self.plasticity_phase,
+                                target_output_index == END_DOCUMENT_OUTPUT_INDEX,
+                            );
+                        self.launch_learning(
+                            strength,
+                            strength * target_weight,
+                            plasticity_scale,
+                            context_enabled,
+                        )?;
+                        self.plasticity_phase = next_plasticity_phase;
                         self.model.parameter_revision =
                             self.model.parameter_revision.saturating_add(1);
                         self.output_bias_dirty_since_sync = true;
@@ -3894,6 +3931,7 @@ impl CudaRuntime {
         let mut all_metrics = Vec::with_capacity(steps.len());
         let debug_chunks =
             self.debug.chunks || self.debug.sync || self.debug.transfers || self.debug.state;
+        let mut plasticity_phase = self.plasticity_phase;
 
         for (chunk_index, chunk) in steps.chunks(TRAINING_STEP_BATCH_CAPACITY).enumerate() {
             let chunk_started = debug_chunks.then(Instant::now);
@@ -3936,11 +3974,20 @@ impl CudaRuntime {
                     learned_steps = learned_steps.saturating_add(1);
                     context_learning |= context_enabled;
                 }
+                let plasticity_scale = target_index.map_or(0.0, |target_output_index| {
+                    let (scale, next_phase) = self.model.config.learning.plasticity_step(
+                        plasticity_phase,
+                        target_output_index == END_DOCUMENT_OUTPUT_INDEX,
+                    );
+                    plasticity_phase = next_phase;
+                    scale
+                });
                 device_steps.push(CudaPersistentStep {
                     symbol,
                     target_index: target_index.map(|index| index as i32).unwrap_or(-1),
                     context_enabled: u32::from(context_enabled),
                     supervised_strength,
+                    plasticity_scale,
                 });
                 metadata.push((symbol, target_index, context_enabled, learned));
             }
@@ -4121,6 +4168,7 @@ impl CudaRuntime {
                 );
             }
             self.current_tick = self.current_tick.saturating_add(chunk.len() as u64);
+            self.plasticity_phase = plasticity_phase;
             self.model.parameter_revision =
                 self.model.parameter_revision.saturating_add(learned_steps);
             if learned_steps > 0 {
@@ -4889,6 +4937,7 @@ impl CudaRuntime {
         &mut self,
         strength: f32,
         supervised_strength: f32,
+        plasticity_scale: f32,
         context_enabled: bool,
     ) -> LeoResult<()> {
         let b = self.buffers;
@@ -4901,26 +4950,29 @@ impl CudaRuntime {
         let mut errors = b.errors.pointer;
         let mut destination_epoch = b.learning_destination_epoch.pointer;
         let mut learning_signal = b.learning_signal.pointer;
-        let mut signal_params = [
-            param(&mut cfg),
-            param(&mut tick),
-            param(&mut output_weight),
-            param(&mut errors),
-            param(&mut destination_epoch),
-            param(&mut learning_signal),
-        ];
-        self.launch(
-            self.shared.kernels.learning_signals,
-            neuron_count,
-            THREADS,
-            &mut signal_params,
-        )?;
+        if plasticity_scale > 0.0 {
+            let mut signal_params = [
+                param(&mut cfg),
+                param(&mut tick),
+                param(&mut output_weight),
+                param(&mut errors),
+                param(&mut destination_epoch),
+                param(&mut learning_signal),
+            ];
+            self.launch(
+                self.shared.kernels.learning_signals,
+                neuron_count,
+                THREADS,
+                &mut signal_params,
+            )?;
+        }
 
         let mut output_bias = b.output_bias.pointer;
         let mut active = b.active.pointer;
         let mut active_value = b.active_value.pointer;
         let mut active_count = b.active_count.pointer;
         let mut supervised = supervised_strength;
+        let mut plasticity_strength = supervised_strength * plasticity_scale;
         let mut changed_output_marks = b.changed_output_marks.pointer;
         let mut changed_output_list = b.changed_output_list.pointer;
         let mut changed_output_count = b.changed_output_count.pointer;
@@ -5018,19 +5070,21 @@ impl CudaRuntime {
             param(&mut rec_eligible_list),
             param(&mut rec_eligible_count),
             param(&mut learning_signal),
-            param(&mut supervised),
+            param(&mut plasticity_strength),
             param(&mut changed_rec_marks),
             param(&mut changed_rec_list),
             param(&mut changed_rec_count),
             param(&mut counters),
             param(&mut error_flag),
         ];
-        self.launch(
-            self.shared.kernels.update_recurrent_weights,
-            recurrent_count.min(SPARSE_LIST_WORK_ITEMS),
-            THREADS,
-            &mut recurrent_params,
-        )?;
+        if plasticity_scale > 0.0 {
+            self.launch(
+                self.shared.kernels.update_recurrent_weights,
+                recurrent_count.min(SPARSE_LIST_WORK_ITEMS),
+                THREADS,
+                &mut recurrent_params,
+            )?;
+        }
 
         let mut input_target = b.input_target.pointer;
         let mut input_weight = b.input_weight.pointer;
@@ -5048,19 +5102,21 @@ impl CudaRuntime {
             param(&mut input_eligible_list),
             param(&mut input_eligible_count),
             param(&mut learning_signal),
-            param(&mut supervised),
+            param(&mut plasticity_strength),
             param(&mut changed_input_marks),
             param(&mut changed_input_list),
             param(&mut changed_input_count),
             param(&mut counters),
             param(&mut error_flag),
         ];
-        self.launch(
-            self.shared.kernels.update_input_weights,
-            input_count.min(SPARSE_LIST_WORK_ITEMS),
-            THREADS,
-            &mut input_params,
-        )?;
+        if plasticity_scale > 0.0 {
+            self.launch(
+                self.shared.kernels.update_input_weights,
+                input_count.min(SPARSE_LIST_WORK_ITEMS),
+                THREADS,
+                &mut input_params,
+            )?;
+        }
 
         let mut activation = b.activation.pointer;
         let active_capacity = self.model.config.model.max_active_global;
@@ -8199,6 +8255,10 @@ fn launch_device_story_step_builder(
     let mut context_dropout_rate = coordinator.model.config.context.dropout_rate;
     let mut strength_value = strength;
     let mut end_document_weight = coordinator.model.config.learning.end_document_weight;
+    let mut plasticity_window = as_u32(
+        "plasticity window",
+        coordinator.model.config.learning.plasticity_window,
+    )?;
     let mut parameters = [
         param(&mut story_bytes),
         param(&mut story_byte_stride),
@@ -8210,6 +8270,7 @@ fn launch_device_story_step_builder(
         param(&mut context_dropout_rate),
         param(&mut strength_value),
         param(&mut end_document_weight),
+        param(&mut plasticity_window),
     ];
     coordinator.launch_exact(
         coordinator.shared.kernels.build_shared_story_steps,
@@ -8563,11 +8624,24 @@ pub(crate) fn train_story_batch_shared_device(
                             lane_learned_steps[lane_index].saturating_add(1);
                         lane_context_learning[lane_index] |= context_enabled;
                     }
+                    let plasticity_scale = target_index.map_or(0.0, |target_output_index| {
+                        coordinator
+                            .model
+                            .config
+                            .learning
+                            .plasticity_step(
+                                start.saturating_add(record_index)
+                                    % coordinator.model.config.learning.plasticity_window.max(1),
+                                target_output_index == END_DOCUMENT_OUTPUT_INDEX,
+                            )
+                            .0
+                    });
                     device_steps.push(CudaPersistentStep {
                         symbol,
                         target_index: target_index.map(|index| index as i32).unwrap_or(-1),
                         context_enabled: u32::from(context_enabled),
                         supervised_strength,
+                        plasticity_scale,
                     });
                     lane_metadata.push((symbol, target_index, context_enabled, learned));
                 }

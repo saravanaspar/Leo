@@ -71,13 +71,15 @@ fn replay_debug_options() -> ReplayDebugOptions {
     *OPTIONS.get_or_init(ReplayDebugOptions::from_env)
 }
 
-/// Experimental replay executor that preserves the configured replay target
-/// budget (30% in the reference configuration) but carries recurrent state
-/// forward between selected ranges instead of rebuilding every range from byte
-/// zero. This is intentionally opt-in until full TinyStories quality parity is
-/// established because it changes replay-state semantics while keeping FP32 and
-/// the supervised replay fraction unchanged.
-fn replay_streaming_enabled() -> bool {
+/// Formula-v2 replay executor that preserves the configured replay target
+/// budget but carries recurrent state forward between selected ranges instead
+/// of rebuilding every range from byte zero. The model config enables this for
+/// v2 training; the legacy environment switch remains as an explicit A/B
+/// override for older configs.
+fn replay_streaming_enabled(runtime: &BackendRuntime) -> bool {
+    if runtime.model().config.replay.stateful_batch {
+        return true;
+    }
     std::env::var("LEO_REPLAY_STREAMING")
         .ok()
         .map(|value| {
@@ -404,7 +406,7 @@ fn execute_replay_ranges(
     let mut replay_steps = 0u64;
     let mut prefix_steps = 0u64;
     let mut timing = ReplayTiming::default();
-    if replay_streaming_enabled() && !ranges.is_empty() {
+    if replay_streaming_enabled(runtime) && !ranges.is_empty() {
         let execution = replay_ranges_streaming(runtime, story, ranges, permission, debug.timing)?;
         replay_steps = execution.target_steps;
         prefix_steps = execution.prefix_steps;

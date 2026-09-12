@@ -88,6 +88,10 @@ pub struct LearningConfig {
     pub provisional_strength: f32,
     pub training_strength: f32,
     pub verified_strength: f32,
+    /// Number of supervised learning steps between recurrent/input plasticity consolidation events.
+    /// A value of 1 preserves the v1 immediate-plasticity rule.
+    #[serde(default = "default_plasticity_window")]
+    pub plasticity_window: usize,
     /// Extra supervised weight for the rare end-of-document target.
     pub end_document_weight: f32,
 }
@@ -112,10 +116,33 @@ pub struct ReplayConfig {
     pub fraction: f32,
     /// Preferred number of contiguous supervised targets in one replay segment.
     pub segment_bytes: usize,
+    /// Formula-v2 replay carries one transient trajectory through selected ranges instead of
+    /// rebuilding every selected segment from byte zero. Disabled by default for v1 models.
+    #[serde(default)]
+    pub stateful_batch: bool,
     /// Number of full-document repeats used by the explicit `teach` command.
     pub teaching_replays: usize,
     /// Number of full-document repeats used by `teach --permission verified`.
     pub max_verified_replays: usize,
+}
+
+fn default_plasticity_window() -> usize {
+    1
+}
+
+impl LearningConfig {
+    /// Return the recurrent/input consolidation scale and next transient phase.
+    /// `phase` counts supervised learning steps since the last consolidation or
+    /// document reset; frozen replay advances do not consume the window.
+    pub(crate) fn plasticity_step(&self, phase: usize, end_document: bool) -> (f32, usize) {
+        let window = self.plasticity_window.max(1);
+        let step = phase.min(window - 1) + 1;
+        if step == window || end_document {
+            (step as f32, 0)
+        } else {
+            (0.0, step)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +203,7 @@ impl Default for Config {
                 provisional_strength: 0.20,
                 training_strength: 1.00,
                 verified_strength: 1.00,
+                plasticity_window: 1,
                 end_document_weight: 4.0,
             },
             context: ContextConfig {
@@ -190,6 +218,7 @@ impl Default for Config {
             replay: ReplayConfig {
                 fraction: 0.30,
                 segment_bytes: 64,
+                stateful_batch: false,
                 teaching_replays: 1,
                 max_verified_replays: 4,
             },
@@ -379,6 +408,12 @@ impl Config {
                 "weight_min must be negative and weight_max must be positive",
             ));
         }
+        if self.learning.plasticity_window == 0 || self.learning.plasticity_window > 64 {
+            return Err(LeoError::configuration(
+                "learning.plasticity_window must be in 1..=64",
+            ));
+        }
+
         if !self.learning.end_document_weight.is_finite()
             || !(1.0..=16.0).contains(&self.learning.end_document_weight)
         {
@@ -503,7 +538,9 @@ mod tests {
         config.context.probe_limit = 3;
         config.context.dropout_rate = 0.25;
         config.learning.end_document_weight = 6.0;
+        config.learning.plasticity_window = 4;
         config.replay.segment_bytes = 32;
+        config.replay.stateful_batch = true;
 
         let decoded = Config::from_toml(&config.to_toml()).expect("config should round trip");
         assert_eq!(decoded.dynamics.membrane_reset_fraction, 0.2);
@@ -514,7 +551,9 @@ mod tests {
         assert_eq!(decoded.context.probe_limit, 3);
         assert_eq!(decoded.context.dropout_rate, 0.25);
         assert_eq!(decoded.learning.end_document_weight, 6.0);
+        assert_eq!(decoded.learning.plasticity_window, 4);
         assert_eq!(decoded.replay.segment_bytes, 32);
+        assert!(decoded.replay.stateful_batch);
     }
 
     #[test]

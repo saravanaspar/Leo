@@ -1311,3 +1311,26 @@ CUDA_VISIBLE_DEVICES=0 ./target/release/leo benchmark \
 
 Reject the story-local path if the hash differs or if removing cross-story barriers does not compensate for one-CTA-per-story underutilization.  A negative result belongs in this ledger rather than being silently removed.
 
+## Formula-v2 experiment — reduce required work per token
+
+Base: `perf/p100-10k-tranche1` at `4b8ae914cb942da315c269cbed5f547d1a3db972`.
+
+This experiment intentionally moves beyond the historical v1 exact-state hashes.  The v1.0.40/tranche-1 results remain the reference implementation; Formula v2 must establish its own deterministic hashes and must pass quality gates before it can replace the v1 formula.
+
+### Evidence motivating a formula change
+
+The first P100 tranche improved the clean 32K replay-off path only marginally, from roughly `3406.245` to `3413.783` steps/s, while the best clean canonical replay run improved from `1853.689` to `1938.301` steps/s with a 56-CTA replay grid.  The canonical run still spent about `4.2514 s` of `7.4787 s` in replay.  A 112-CTA replay grid was slower (`1919.132` steps/s), despite the replay kernel falling from 144 to 128 registers/thread and becoming capable of two resident CTAs/SM.  This is evidence that synchronization/serial work, not raw occupancy, dominates the current ceiling.
+
+The full 32K frozen replay-prefix profile remained dominated by global selection: approximately `44.49% select_global`, `31.86% pre`, `19.90% select_blocks`, and `3.75% post_emit`.  TinyStories has `128` blocks, `8` local winners per block, and `max_active_global = 1024`; therefore `128 * 8 == 1024`.  After local block competition the global cap cannot remove a winner, so globally ranking those local winners is algorithmically redundant for this geometry.
+
+The canonical replay policy also selected only `3353` replay targets while executing `20235` hidden prefix steps.  The repeated reconstruction cost is part of the formula, not host overhead, and cannot be eliminated by occupancy tuning alone.
+
+### Formula-v2 changes in this experiment
+
+1. **Non-binding global TopK elision.**  When `max_active_global >= block_count * max_active_per_block`, CPU and CUDA keep the exact per-block winner sets and deterministic local rank order, set global clipped count/cutoff to zero, and skip the global heap/bitonic winner ranking.  Binding-cap geometries retain the established global selector.
+2. **Stateful batched replay.**  `replay.stateful_batch = true` reuses Leo's existing mixed frozen/supervised replay trajectory: reset once, advance recurrent/context state through gaps, supervise selected ranges, then reset once.  This preserves the configured replay target budget but changes state/parameter visibility compared with rebuilding every range from byte zero.  It is a batched/stateful replay implementation, not serialized snapshot restoration.
+3. **Four-step delayed recurrent/input plasticity.**  `learning.plasticity_window = 4` keeps local eligibility traces active every learning tick and keeps output/context supervision immediate.  Recurrent/input learning-signal construction and weight commits occur only on the fourth supervised learning step; frozen replay gaps do not consume the window, and end-document forces a partial-window commit.  The commit strength is scaled by the number of ticks represented by the consolidation pulse.  Inhibitory and threshold/population homeostasis remain per-step.
+
+### Acceptance contract for Formula v2
+
+Do **not** compare Formula-v2 state hashes to the historical v1 hashes.  Acceptance requires: repeatable Formula-v2 hashes across repeated runs; CPU/GPU agreement for the same Formula-v2 config where the existing conformance harness applies; no regression in validation bits-per-byte/generation/recurrent-memory probes; and a material P100 throughput gain.  No speed or quality improvement is claimed until those P100 and training-quality measurements exist.

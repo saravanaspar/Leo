@@ -1589,6 +1589,7 @@ struct LeoPersistentStep {
     int target_index;
     unsigned int context_enabled;
     float supervised_strength;
+    float plasticity_scale;
 };
 
 
@@ -2315,8 +2316,69 @@ __device__ void leo_p_select_global_impl(
     }
     const bool nonfinite = __syncthreads_or(saw_nonfinite ? 1 : 0) != 0;
     const unsigned int sparse_total = counters->block_selected;
-    const bool sparse_merge = !nonfinite
-        && presorted_runs
+
+    // Formula v2: when local winner capacity cannot exceed the configured
+    // global cap, global ranking cannot remove any neuron. Compact the already
+    // exact per-block sorted runs in deterministic block/local-rank order and
+    // skip the serial heap/global sorting phase entirely. Retain the legacy
+    // path for non-finite values so numerical-error behavior stays diagnosable.
+    const bool redundant_global_topk = !nonfinite
+        && cfg->max_active_global >= available;
+    if (redundant_global_topk) {
+        for (unsigned int model_block = lane; model_block < cfg->block_count;
+             model_block += blockDim.x) {
+            const unsigned int base = model_block * run;
+            unsigned int count = 0U;
+            while (count < run && block_winner_value[base + count] > 0.0f) {
+                count += 1U;
+            }
+            shared_selection_keys[model_block] = (unsigned long long)count;
+        }
+        __syncthreads();
+
+        if (lane == 0U) {
+            unsigned int compact_total = 0U;
+            for (unsigned int model_block = 0U; model_block < cfg->block_count; ++model_block) {
+                const unsigned int count = (unsigned int)shared_selection_keys[model_block];
+                shared_selection_keys[model_block] = (unsigned long long)compact_total;
+                compact_total += count;
+            }
+            *active_count = compact_total;
+            *population_cutoff = 0.0f;
+            counters->global_clipped = 0U;
+            const float activity = (float)compact_total
+                / (float)(cfg->neuron_count == 0U ? 1U : cfg->neuron_count);
+            const float error = activity - cfg->target_activity;
+            *population_inhibition = leo_clamp(
+                *population_inhibition + cfg->population_inhibition_rate * error,
+                0.0f, cfg->population_inhibition_max
+            );
+        }
+        __syncthreads();
+
+        for (unsigned int model_block = lane; model_block < cfg->block_count;
+             model_block += blockDim.x) {
+            const unsigned int base = model_block * run;
+            const unsigned int output_base = (unsigned int)shared_selection_keys[model_block];
+            for (unsigned int position = 0U; position < run; ++position) {
+                const float value = block_winner_value[base + position];
+                if (value <= 0.0f) break;
+                const unsigned int neuron = block_winner_neuron[base + position];
+                const unsigned int output = output_base + position;
+                active[output] = neuron;
+                active_value[output] = value;
+                activation[neuron] = value;
+                selected_epoch[neuron] = tick + 1ULL;
+                if (MARK_LEARNING_DESTINATIONS) {
+                    leo_p_mark_learning_destination(p, neuron, tick + 1ULL);
+                }
+            }
+        }
+        __syncthreads();
+        return;
+    }
+
+    const bool sparse_merge = presorted_runs
         && cfg->block_count <= LEO_SPARSE_GLOBAL_RUNS
         && sparse_total <= LEO_SPARSE_GLOBAL_THRESHOLD;
 
@@ -4006,7 +4068,7 @@ __device__ __forceinline__ bool leo_context_survives_dropout_exact(
 // Production single-GPU batches upload raw story bytes once and derive the
 // exact persistent step schedule on-device. This preserves BEGIN/END mapping,
 // dropout RNG, target order and supervised-strength arithmetic while avoiding
-// a per-step host descriptor build and 16-byte H2D record stream.
+// a per-step host descriptor build and 20-byte H2D record stream.
 extern "C" __global__ void leo_build_shared_story_steps(
     const unsigned char* story_bytes,
     unsigned int story_byte_stride,
@@ -4017,7 +4079,8 @@ extern "C" __global__ void leo_build_shared_story_steps(
     unsigned long long model_seed,
     float context_dropout_rate,
     float strength,
-    float end_document_weight
+    float end_document_weight,
+    unsigned int plasticity_window
 ) {
     const unsigned int lane = blockIdx.x;
     if (lane >= lane_count) return;
@@ -4045,11 +4108,17 @@ extern "C" __global__ void leo_build_shared_story_steps(
             model_seed, tick, symbol, context_dropout_rate
         ) ? 1U : 0U;
         const float target_weight = target_index == 256 ? end_document_weight : 1.0f;
+        const unsigned int window = plasticity_window == 0U ? 1U : plasticity_window;
+        const unsigned int phase = (index % window) + 1U;
+        const float plasticity_scale = (window == 1U || phase == window || target_index == 256)
+            ? (float)phase
+            : 0.0f;
         steps[index] = LeoPersistentStep {
             symbol,
             target_index,
             context_enabled,
             strength * target_weight,
+            plasticity_scale,
         };
     }
 }
@@ -4195,6 +4264,8 @@ __device__ void leo_train_story_block(
         const LeoPersistentStep step = steps[step_index];
         const unsigned long long tick = base_tick + (unsigned long long)step_index;
         const bool context_enabled = step.context_enabled != 0U;
+        const bool plasticity_commit = step.plasticity_scale > 0.0f;
+        const float plasticity_strength = step.supervised_strength * step.plasticity_scale;
         unsigned int* rec_a_list = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_LIST);
         unsigned int* rec_a_count = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_COUNT);
         unsigned int* rec_b_list = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_NEXT_ELIGIBLE_LIST);
@@ -4252,26 +4323,31 @@ __device__ void leo_train_story_block(
         __syncthreads();
 
         if (step.target_index >= 0 && strength > 0.0f) {
-            leo_p_learning_signals(pointers, tick);
-            __syncthreads();
+            if (plasticity_commit) {
+                leo_p_learning_signals(pointers, tick);
+                __syncthreads();
+            }
+            // Readout/context supervision remains immediate every target.
             leo_p_update_output(pointers, step.supervised_strength);
             __syncthreads();
             if (context_enabled) {
                 leo_p_update_context(pointers, step.supervised_strength);
                 __syncthreads();
             }
-            const unsigned int* learning_rec_list = learning_trace ? rec_next_list : rec_current_list;
-            const unsigned int* learning_rec_count = learning_trace ? rec_next_count : rec_current_count;
-            const unsigned int* learning_input_list = learning_trace ? input_next_list : input_current_list;
-            const unsigned int* learning_input_count = learning_trace ? input_next_count : input_current_count;
-            leo_p_update_recurrent_weights(
-                pointers, learning_rec_list, learning_rec_count, step.supervised_strength
-            );
-            __syncthreads();
-            leo_p_update_input_weights(
-                pointers, learning_input_list, learning_input_count, step.supervised_strength
-            );
-            __syncthreads();
+            if (plasticity_commit) {
+                const unsigned int* learning_rec_list = learning_trace ? rec_next_list : rec_current_list;
+                const unsigned int* learning_rec_count = learning_trace ? rec_next_count : rec_current_count;
+                const unsigned int* learning_input_list = learning_trace ? input_next_list : input_current_list;
+                const unsigned int* learning_input_count = learning_trace ? input_next_count : input_current_count;
+                leo_p_update_recurrent_weights(
+                    pointers, learning_rec_list, learning_rec_count, plasticity_strength
+                );
+                __syncthreads();
+                leo_p_update_input_weights(
+                    pointers, learning_input_list, learning_input_count, plasticity_strength
+                );
+                __syncthreads();
+            }
             leo_p_inhibitory_homeostasis(pointers, strength);
             __syncthreads();
         }
@@ -4531,6 +4607,8 @@ __device__ __forceinline__ void leo_train_cooperative_body(
         const bool frozen_advance = MIXED_SCHEDULE && step.target_index == -2;
         const bool context_enabled = step.context_enabled != 0U;
         const bool supervised = !frozen_advance && step.target_index >= 0 && strength > 0.0f;
+        const bool plasticity_commit = supervised && step.plasticity_scale > 0.0f;
+        const float plasticity_strength = step.supervised_strength * step.plasticity_scale;
         const bool even = MIXED_SCHEDULE
             ? (learning_step_index & 1U) == 0U
             : (step_index & 1U) == 0U;
@@ -4719,9 +4797,11 @@ __device__ __forceinline__ void leo_train_cooperative_body(
 
         if (supervised) {
             phase_started = leo_profile_phase_start<PROFILE>();
-            leo_p_learning_signals_work(
-                pointers, tick, grid_thread, grid_stride
-            );
+            if (plasticity_commit) {
+                leo_p_learning_signals_work(
+                    pointers, tick, grid_thread, grid_stride
+                );
+            }
             leo_profile_phase_end<PROFILE>(
                 profile_counters,
                 LEO_CUDA_REPLAY_PROFILE_LEARNING_SIGNALS, phase_started
@@ -4758,16 +4838,18 @@ __device__ __forceinline__ void leo_train_cooperative_body(
                     ? (even ? LEO_P_REC_NEXT_ELIGIBLE_COUNT : LEO_P_REC_ELIGIBLE_COUNT)
                     : (even ? LEO_P_REC_ELIGIBLE_COUNT : LEO_P_REC_NEXT_ELIGIBLE_COUNT)
             );
-            if (FAST_METRICS) {
-                leo_p_update_recurrent_weights_work_fast(
-                    pointers, learning_rec_list, learning_rec_count,
-                    step.supervised_strength, grid_thread, grid_stride
-                );
-            } else {
-                leo_p_update_recurrent_weights_work(
-                    pointers, learning_rec_list, learning_rec_count,
-                    step.supervised_strength, grid_thread, grid_stride
-                );
+            if (plasticity_commit) {
+                if (FAST_METRICS) {
+                    leo_p_update_recurrent_weights_work_fast(
+                        pointers, learning_rec_list, learning_rec_count,
+                        plasticity_strength, grid_thread, grid_stride
+                    );
+                } else {
+                    leo_p_update_recurrent_weights_work(
+                        pointers, learning_rec_list, learning_rec_count,
+                        plasticity_strength, grid_thread, grid_stride
+                    );
+                }
             }
             leo_profile_phase_end<PROFILE>(
                 profile_counters, LEO_CUDA_REPLAY_PROFILE_RECURRENT_UPDATE, phase_started
@@ -4786,16 +4868,18 @@ __device__ __forceinline__ void leo_train_cooperative_body(
                     ? (even ? LEO_P_INPUT_NEXT_ELIGIBLE_COUNT : LEO_P_INPUT_ELIGIBLE_COUNT)
                     : (even ? LEO_P_INPUT_ELIGIBLE_COUNT : LEO_P_INPUT_NEXT_ELIGIBLE_COUNT)
             );
-            if (FAST_METRICS) {
-                leo_p_update_input_weights_work_fast(
-                    pointers, learning_input_list, learning_input_count,
-                    step.supervised_strength, grid_thread, grid_stride
-                );
-            } else {
-                leo_p_update_input_weights_work(
-                    pointers, learning_input_list, learning_input_count,
-                    step.supervised_strength, grid_thread, grid_stride
-                );
+            if (plasticity_commit) {
+                if (FAST_METRICS) {
+                    leo_p_update_input_weights_work_fast(
+                        pointers, learning_input_list, learning_input_count,
+                        plasticity_strength, grid_thread, grid_stride
+                    );
+                } else {
+                    leo_p_update_input_weights_work(
+                        pointers, learning_input_list, learning_input_count,
+                        plasticity_strength, grid_thread, grid_stride
+                    );
+                }
             }
             leo_profile_phase_end<PROFILE>(
                 profile_counters, LEO_CUDA_REPLAY_PROFILE_INPUT_UPDATE, phase_started
@@ -5192,7 +5276,9 @@ __device__ __forceinline__ void leo_shared_phase_learning_signals_lane(
     const LeoPersistentStep* steps = reinterpret_cast<const LeoPersistentStep*>(
         step_buffer_addresses[lane]
     );
-    if (steps[step_index].target_index < 0 || strength <= 0.0f) return;
+    if (steps[step_index].target_index < 0
+        || steps[step_index].plasticity_scale <= 0.0f
+        || strength <= 0.0f) return;
     const unsigned long long* p = reinterpret_cast<const unsigned long long*>(
         pointer_table_addresses[lane]
     );
@@ -5224,6 +5310,8 @@ __device__ __forceinline__ void leo_shared_phase_post_deltas_lane_impl(
     if (step.target_index < 0 || strength <= 0.0f) return;
     const bool learning_trace = learning_trace_raw != 0U;
     const bool context_enabled = step.context_enabled != 0U;
+    const bool plasticity_commit = step.plasticity_scale > 0.0f;
+    const float plasticity_strength = step.supervised_strength * step.plasticity_scale;
 
     unsigned int* rec_a_list = leo_p_ptr<unsigned int>(p, LEO_P_REC_ELIGIBLE_LIST);
     unsigned int* rec_a_count = leo_p_ptr<unsigned int>(p, LEO_P_REC_ELIGIBLE_COUNT);
@@ -5255,30 +5343,32 @@ __device__ __forceinline__ void leo_shared_phase_post_deltas_lane_impl(
         leo_p_update_context(p, step.supervised_strength);
         __syncthreads();
     }
-    const unsigned int* learning_rec_list = learning_trace ? rec_next_list : rec_current_list;
-    const unsigned int* learning_rec_count = learning_trace ? rec_next_count : rec_current_count;
-    const unsigned int* learning_input_list = learning_trace ? input_next_list : input_current_list;
-    const unsigned int* learning_input_count = learning_trace ? input_next_count : input_current_count;
-    if (FAST_METRICS) {
-        leo_p_update_recurrent_weights_fast(
-            p, learning_rec_list, learning_rec_count, step.supervised_strength
-        );
-    } else {
-        leo_p_update_recurrent_weights(
-            p, learning_rec_list, learning_rec_count, step.supervised_strength
-        );
+    if (plasticity_commit) {
+        const unsigned int* learning_rec_list = learning_trace ? rec_next_list : rec_current_list;
+        const unsigned int* learning_rec_count = learning_trace ? rec_next_count : rec_current_count;
+        const unsigned int* learning_input_list = learning_trace ? input_next_list : input_current_list;
+        const unsigned int* learning_input_count = learning_trace ? input_next_count : input_current_count;
+        if (FAST_METRICS) {
+            leo_p_update_recurrent_weights_fast(
+                p, learning_rec_list, learning_rec_count, plasticity_strength
+            );
+        } else {
+            leo_p_update_recurrent_weights(
+                p, learning_rec_list, learning_rec_count, plasticity_strength
+            );
+        }
+        __syncthreads();
+        if (FAST_METRICS) {
+            leo_p_update_input_weights_fast(
+                p, learning_input_list, learning_input_count, plasticity_strength
+            );
+        } else {
+            leo_p_update_input_weights(
+                p, learning_input_list, learning_input_count, plasticity_strength
+            );
+        }
+        __syncthreads();
     }
-    __syncthreads();
-    if (FAST_METRICS) {
-        leo_p_update_input_weights_fast(
-            p, learning_input_list, learning_input_count, step.supervised_strength
-        );
-    } else {
-        leo_p_update_input_weights(
-            p, learning_input_list, learning_input_count, step.supervised_strength
-        );
-    }
-    __syncthreads();
     leo_p_inhibitory_homeostasis(p, strength);
 }
 
@@ -5777,6 +5867,8 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
         }
         const bool learning_trace = active && learning_trace_raw != 0U;
         const bool supervised = active && step.target_index >= 0 && strength > 0.0f;
+        const bool plasticity_commit = supervised && step.plasticity_scale > 0.0f;
+        const float plasticity_strength = step.supervised_strength * step.plasticity_scale;
         const bool context_enabled = active && step.context_enabled != 0U;
 
         // Keep event delivery, symbol injection and context table mutation on
@@ -5901,7 +5993,7 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
             phase_profile_counters, LEO_CUDA_PHASE_PROFILE_POST_CORE, profile_step_thread, &phase_start
         );
 
-        if (supervised) {
+        if (plasticity_commit) {
             leo_p_learning_signals_work(
                 p, tick, lane_thread, lane_stride
             );
@@ -5921,7 +6013,7 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
         }
         cooperative_groups::this_grid().sync();
 
-        if (supervised) {
+        if (plasticity_commit) {
             const bool even = (step_index & 1U) == 0U;
             const unsigned int* rec_a_list = leo_p_ptr<unsigned int>(p, LEO_P_REC_ELIGIBLE_LIST);
             const unsigned int* rec_a_count = leo_p_ptr<unsigned int>(p, LEO_P_REC_ELIGIBLE_COUNT);
@@ -5934,13 +6026,13 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
                 ? (even ? rec_b_count : rec_a_count)
                 : (even ? rec_a_count : rec_b_count);
             leo_p_update_recurrent_weights_work_fast(
-                p, learning_rec_list, learning_rec_count, step.supervised_strength,
+                p, learning_rec_list, learning_rec_count, plasticity_strength,
                 lane_thread, lane_stride
             );
         }
         cooperative_groups::this_grid().sync();
 
-        if (supervised) {
+        if (plasticity_commit) {
             const bool even = (step_index & 1U) == 0U;
             const unsigned int* input_a_list = leo_p_ptr<unsigned int>(p, LEO_P_INPUT_ELIGIBLE_LIST);
             const unsigned int* input_a_count = leo_p_ptr<unsigned int>(p, LEO_P_INPUT_ELIGIBLE_COUNT);
@@ -5953,7 +6045,7 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
                 ? (even ? input_b_count : input_a_count)
                 : (even ? input_a_count : input_b_count);
             leo_p_update_input_weights_work_fast(
-                p, learning_input_list, learning_input_count, step.supervised_strength,
+                p, learning_input_list, learning_input_count, plasticity_strength,
                 lane_thread, lane_stride
             );
         }

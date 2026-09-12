@@ -1225,3 +1225,23 @@ story-batch path and have a homogeneous visible GPU group.
 
 The experimental replay flags should graduate to production only after measured
 throughput gains and held-out quality both satisfy the project acceptance bar.
+
+## Experimental Formula v2 (TinyStories)
+
+The current Formula-v2 performance experiment is enabled explicitly by the TinyStories config:
+
+```toml
+[learning]
+plasticity_window = 4
+
+[replay]
+stateful_batch = true
+```
+
+`plasticity_window = 1` preserves per-target recurrent/input plasticity; test and probe configs use that value.  With a larger window, forward eligibility traces still advance every learning tick and readout/context supervision remains immediate, but recurrent/input credit is consolidated only at the supervised-step window boundary (or at end-document); frozen replay gaps do not consume the window.  This changes training semantics and requires a new deterministic-hash and quality baseline.
+
+`stateful_batch = true` uses one mixed frozen/supervised replay trajectory per story instead of resetting and reconstructing each selected range independently.  It preserves the replay target budget, but it intentionally changes parameter/state visibility between selected replay ranges.  `LEO_REPLAY_STREAMING=1` remains an execution A/B override for configs that leave `stateful_batch = false`.
+
+For TinyStories geometry, `128 blocks * 8 local winners == max_active_global 1024`.  Formula v2 therefore skips the redundant global winner TopK after local block competition.  Configurations whose global cap is binding continue to use the established exact global selector.
+
+Formula v2 is experimental: historical v1 training-state SHA-256 values are not acceptance hashes for this mode.  Before release, record repeatable new hashes and compare validation bits/byte, recurrent probes, and generation quality against the v1.0.40 reference in addition to throughput.
