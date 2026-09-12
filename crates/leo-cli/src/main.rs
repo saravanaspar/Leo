@@ -736,11 +736,13 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
         }
         let elapsed = started.elapsed().as_secs_f64();
         runtime.synchronize_model()?;
+        let model_state_sha256 = model_state_hash(runtime.model());
+        let statistics_state_sha256 = statistics_state_hash(runtime.model());
         let training_state_sha256 = training_state_hash(runtime.model());
         let projected_input_bytes = 2_000_000_000f64;
         let projected_seconds = elapsed / input_bytes.max(1) as f64 * projected_input_bytes;
         println!(
-            "{{\"event\":\"training_benchmark\",\"model\":\"{}\",\"neurons\":{},\"fixed_synapses\":{},\"context_slots\":{},\"context_embedding_dim\":{},\"workers\":{},\"gpu_devices\":{},\"stories\":{},\"input_bytes\":{},\"training_steps\":{},\"base_training_targets\":{},\"replay_fraction\":{},\"replay_segments\":{},\"replay_steps\":{},\"replay_prefix_steps\":{},\"replay_execution_steps\":{},\"replay_step_fraction\":{},\"replay_prefix_step_fraction\":{},\"replay_seconds\":{},\"replay_sync_seconds\":{},\"replay_wall_fraction\":{},\"serial_replay_speedup_ceiling\":{},\"execution_steps_with_prefix\":{},\"seconds\":{},\"input_bytes_per_second\":{},\"steps_per_second\":{},\"execution_steps_per_second\":{},\"mean_loss\":{},\"bits_per_byte\":{},\"active_fraction\":{},\"recurrent_events_per_step\":{},\"context_cells_per_step\":{},\"context_probes_per_step\":{},\"output_madds_per_step\":{},\"training_state_sha256\":\"{}\",\"projected_seconds_1gb_2_epochs\":{},\"projected_days_1gb_2_epochs\":{}}}",
+            "{{\"event\":\"training_benchmark\",\"model\":\"{}\",\"neurons\":{},\"fixed_synapses\":{},\"context_slots\":{},\"context_embedding_dim\":{},\"workers\":{},\"gpu_devices\":{},\"stories\":{},\"input_bytes\":{},\"training_steps\":{},\"base_training_targets\":{},\"replay_fraction\":{},\"replay_segments\":{},\"replay_steps\":{},\"replay_prefix_steps\":{},\"replay_execution_steps\":{},\"replay_step_fraction\":{},\"replay_prefix_step_fraction\":{},\"replay_seconds\":{},\"replay_sync_seconds\":{},\"replay_wall_fraction\":{},\"serial_replay_speedup_ceiling\":{},\"execution_steps_with_prefix\":{},\"seconds\":{},\"input_bytes_per_second\":{},\"steps_per_second\":{},\"execution_steps_per_second\":{},\"mean_loss\":{},\"bits_per_byte\":{},\"active_fraction\":{},\"recurrent_events_per_step\":{},\"context_cells_per_step\":{},\"context_probes_per_step\":{},\"output_madds_per_step\":{},\"model_state_sha256\":\"{}\",\"statistics_state_sha256\":\"{}\",\"training_state_sha256\":\"{}\",\"projected_seconds_1gb_2_epochs\":{},\"projected_days_1gb_2_epochs\":{}}}",
             json_escape(&runtime.model().config.model.name),
             runtime.model().neuron_count(),
             runtime.model().recurrent.weight.len(),
@@ -775,6 +777,8 @@ fn command_benchmark(arguments: &Arguments) -> LeoResult<()> {
             activity.context_cells_per_step(),
             activity.context_probes_per_step(),
             activity.output_madds_per_step(),
+            model_state_sha256,
+            statistics_state_sha256,
             training_state_sha256,
             projected_seconds,
             projected_seconds / 86_400.0,
@@ -1181,6 +1185,20 @@ fn model_state_hash(model: &Model) -> ArtifactDigest {
     for value in &model.context.observations {
         hash.update(&value.to_le_bytes());
     }
+    hash.finalize()
+}
+
+fn statistics_state_hash(model: &Model) -> ArtifactDigest {
+    let mut hash = Sha256::new();
+    hash.update(&model.statistics.processed_bytes.to_le_bytes());
+    hash.update(&model.statistics.processed_stories.to_le_bytes());
+    hash.update(&model.statistics.training_loss_sum.to_bits().to_le_bytes());
+    hash.update(&model.statistics.training_targets.to_le_bytes());
+    hash.update(&model.statistics.active_neurons_sum.to_le_bytes());
+    hash.update(&model.statistics.active_neurons_peak.to_le_bytes());
+    hash.update(&model.statistics.synaptic_events.to_le_bytes());
+    hash.update(&model.statistics.numerical_rejections.to_le_bytes());
+    hash.update(&model.statistics.persistent_ticks.to_le_bytes());
     hash.finalize()
 }
 

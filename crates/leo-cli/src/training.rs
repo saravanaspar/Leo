@@ -26,6 +26,16 @@ use std::time::Instant;
 
 pub(crate) const GPU_REFERENCE_WORKERS: usize = 16;
 
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ReplayDebugOptions {
     summary: bool,
@@ -38,22 +48,13 @@ struct ReplayDebugOptions {
 
 impl ReplayDebugOptions {
     fn from_env() -> Self {
-        let flag = |name: &str| {
-            std::env::var(name)
-                .ok()
-                .map(|value| {
-                    let value = value.trim().to_ascii_lowercase();
-                    !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
-                })
-                .unwrap_or(false)
-        };
-        let general = flag("LEO_REPLAY_DEBUG");
-        let timing_only = flag("LEO_REPLAY_DEBUG_TIMING");
-        let ranges = flag("LEO_REPLAY_DEBUG_RANGES");
-        let segments = flag("LEO_REPLAY_DEBUG_SEGMENTS");
+        let general = env_flag_enabled("LEO_REPLAY_DEBUG");
+        let timing_only = env_flag_enabled("LEO_REPLAY_DEBUG_TIMING");
+        let ranges = env_flag_enabled("LEO_REPLAY_DEBUG_RANGES");
+        let segments = env_flag_enabled("LEO_REPLAY_DEBUG_SEGMENTS");
         Self {
             summary: general || timing_only,
-            selection: general || flag("LEO_REPLAY_DEBUG_SELECTION") || ranges,
+            selection: general || env_flag_enabled("LEO_REPLAY_DEBUG_SELECTION") || ranges,
             segments,
             ranges,
             timing: general || timing_only || segments,
@@ -80,27 +81,18 @@ fn replay_streaming_enabled(runtime: &BackendRuntime) -> bool {
     if runtime.model().config.replay.stateful_batch {
         return true;
     }
-    std::env::var("LEO_REPLAY_STREAMING")
-        .ok()
-        .map(|value| {
-            let value = value.trim().to_ascii_lowercase();
-            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
-        })
-        .unwrap_or(false)
+    env_flag_enabled("LEO_REPLAY_STREAMING")
 }
 
-/// Multi-GPU replay may change cross-story parameter visibility while never
-/// changing the configured replay budget or FP32 arithmetic. Keep it opt-in
-/// until a real training-quality A/B establishes equivalence or improvement;
-/// LEO_MULTI_GPU_PARALLEL_REPLAY=1 enables the local-trajectory strategy.
+/// The local-trajectory replay reducer is useful for performance research, but
+/// the T4x2 acceptance run proved that it changes cross-story parameter
+/// visibility and therefore the learned brain. Keep the implementation for
+/// diagnostics, but require an explicit second acknowledgement before it can
+/// replace canonical serial replay. Production speed work must optimize the
+/// exact replay path instead of silently trading quality for utilization.
 fn multi_gpu_parallel_replay_enabled() -> bool {
-    std::env::var("LEO_MULTI_GPU_PARALLEL_REPLAY")
-        .ok()
-        .map(|value| {
-            let value = value.trim().to_ascii_lowercase();
-            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
-        })
-        .unwrap_or(false)
+    env_flag_enabled("LEO_MULTI_GPU_PARALLEL_REPLAY")
+        && env_flag_enabled("LEO_MULTI_GPU_ALLOW_NONCANONICAL_REPLAY")
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -666,7 +658,7 @@ enum ReplicaCommand {
     },
     Replay {
         stories: Arc<Vec<Vec<u8>>>,
-        losses: Arc<Vec<Vec<f32>>>,
+        replay_ranges: Arc<Vec<Vec<std::ops::Range<usize>>>>,
         range: std::ops::Range<usize>,
         permission: Permission,
         expected_revision: u64,
@@ -738,7 +730,7 @@ impl MultiGpuReplicaWorker {
                         }
                         ReplicaCommand::Replay {
                             stories,
-                            losses,
+                            replay_ranges,
                             range,
                             permission,
                             expected_revision,
@@ -756,7 +748,7 @@ impl MultiGpuReplicaWorker {
                                 run_multi_gpu_replay_shard(
                                     &mut runtime,
                                     &stories[range.clone()],
-                                    &losses[range.clone()],
+                                    &replay_ranges[range.clone()],
                                     range.start,
                                     permission,
                                     &base_model,
@@ -830,7 +822,7 @@ impl MultiGpuReplicaWorker {
     fn dispatch_replay(
         &self,
         stories: Arc<Vec<Vec<u8>>>,
-        losses: Arc<Vec<Vec<f32>>>,
+        replay_ranges: Arc<Vec<Vec<std::ops::Range<usize>>>>,
         range: std::ops::Range<usize>,
         permission: Permission,
         expected_revision: u64,
@@ -840,7 +832,7 @@ impl MultiGpuReplicaWorker {
         self.sender
             .send(ReplicaCommand::Replay {
                 stories,
-                losses,
+                replay_ranges,
                 range,
                 permission,
                 expected_revision,
@@ -923,29 +915,29 @@ fn story_work(story: &[u8]) -> usize {
     }
 }
 
-fn work_balanced_story_ranges(stories: &[Vec<u8>], shards: usize) -> Vec<std::ops::Range<usize>> {
-    let shard_count = shards.min(stories.len());
+fn work_balanced_weight_ranges(weights: &[usize], shards: usize) -> Vec<std::ops::Range<usize>> {
+    let shard_count = shards.min(weights.len());
     if shard_count == 0 {
         return Vec::new();
     }
 
     let mut ranges = Vec::with_capacity(shard_count);
     let mut start = 0usize;
-    let mut remaining_work = stories.iter().map(|story| story_work(story)).sum::<usize>();
+    let mut remaining_work = weights.iter().copied().sum::<usize>();
 
     for shard_index in 0..shard_count {
         let remaining_shards = shard_count - shard_index;
         if remaining_shards == 1 {
-            ranges.push(start..stories.len());
+            ranges.push(start..weights.len());
             break;
         }
 
-        let max_end = stories.len() - (remaining_shards - 1);
+        let max_end = weights.len() - (remaining_shards - 1);
         let target = remaining_work.div_ceil(remaining_shards);
         let mut end = start;
         let mut assigned_work = 0usize;
         while end < max_end {
-            let next_work = story_work(&stories[end]);
+            let next_work = weights[end];
             if end > start && assigned_work >= target {
                 break;
             }
@@ -954,13 +946,32 @@ fn work_balanced_story_ranges(stories: &[Vec<u8>], shards: usize) -> Vec<std::op
         }
         if end == start {
             end += 1;
-            assigned_work = story_work(&stories[start]);
+            assigned_work = weights[start];
         }
         ranges.push(start..end);
         start = end;
         remaining_work = remaining_work.saturating_sub(assigned_work);
     }
     ranges
+}
+
+fn work_balanced_story_ranges(stories: &[Vec<u8>], shards: usize) -> Vec<std::ops::Range<usize>> {
+    let weights = stories
+        .iter()
+        .map(|story| story_work(story))
+        .collect::<Vec<_>>();
+    work_balanced_weight_ranges(&weights, shards)
+}
+
+fn replay_execution_work(ranges: &[std::ops::Range<usize>], stateful_batch: bool) -> usize {
+    if stateful_batch {
+        ranges.last().map(|range| range.end).unwrap_or(0)
+    } else {
+        ranges
+            .iter()
+            .map(|range| range.start.saturating_add(range.len()))
+            .sum()
+    }
 }
 
 fn aggregate_device_story_metrics(
@@ -1021,14 +1032,14 @@ fn run_multi_gpu_shard(
 fn run_multi_gpu_replay_shard(
     worker: &mut BackendRuntime,
     stories: &[Vec<u8>],
-    losses_by_story: &[Vec<f32>],
+    ranges_by_story: &[Vec<std::ops::Range<usize>>],
     story_start: usize,
     permission: Permission,
     base_model: &Model,
 ) -> LeoResult<MultiGpuReplayShardResult> {
-    if stories.len() != losses_by_story.len() {
+    if stories.len() != ranges_by_story.len() {
         return Err(LeoError::internal(
-            "multi-GPU replay shard story/loss length mismatch",
+            "multi-GPU replay shard story/range length mismatch",
         ));
     }
     if worker.model().parameter_revision != base_model.parameter_revision {
@@ -1038,7 +1049,7 @@ fn run_multi_gpu_replay_shard(
     }
     let started = Instant::now();
     worker.enable_parameter_tracking();
-    let report = apply_batch_replay_policy(worker, stories, losses_by_story, permission)?;
+    let report = apply_batch_replay_ranges(worker, stories, ranges_by_story, permission)?;
     let changes = worker.parameter_changes()?;
     let delta = SparseModelDelta::between_tracked(base_model, worker.model(), &changes)?;
     Ok(MultiGpuReplayShardResult {
@@ -1098,22 +1109,40 @@ impl MultiGpuBatchTrainer {
         canonical: &mut BackendRuntime,
         stories: Arc<Vec<Vec<u8>>>,
         losses_by_story: Vec<Vec<f32>>,
-        ranges: &[std::ops::Range<usize>],
         device_count: usize,
         permission: Permission,
     ) -> LeoResult<MultiGpuReplayOutcome> {
-        if stories.len() != losses_by_story.len() || ranges.len() < device_count {
+        if stories.len() != losses_by_story.len() || stories.len() < device_count {
             return Err(LeoError::internal(
                 "multi-GPU parallel replay inputs do not match device partition",
             ));
         }
         let active_replica_count = device_count.saturating_sub(1);
         let base_revision = canonical.model().parameter_revision;
+        let replay_fraction = canonical.model().config.replay.fraction;
+        let segment_targets = canonical.model().config.replay.segment_bytes;
+        let stateful_batch = replay_streaming_enabled(canonical);
+        let replay_ranges = Arc::new(
+            losses_by_story
+                .iter()
+                .map(|losses| select_replay_ranges(losses, replay_fraction, segment_targets))
+                .collect::<Vec<_>>(),
+        );
+        let replay_work = replay_ranges
+            .iter()
+            .map(|selected| replay_execution_work(selected, stateful_batch))
+            .collect::<Vec<_>>();
+        let replay_shards = work_balanced_weight_ranges(&replay_work, device_count);
+        if replay_shards.len() != device_count {
+            return Err(LeoError::internal(
+                "multi-GPU replay work partition does not match active device count",
+            ));
+        }
+
         // One immutable host snapshot is shared by every owner thread when
         // constructing sparse local-replay deltas. This replaces N full model
         // clones and gives every replay shard exactly the same starting point.
         let base_model = Arc::new(canonical.model().clone());
-        let losses = Arc::new(losses_by_story);
         let replay_started = Instant::now();
 
         let mut replica_receivers = Vec::with_capacity(active_replica_count);
@@ -1121,19 +1150,19 @@ impl MultiGpuBatchTrainer {
             let device_index = replica_index + 1;
             replica_receivers.push(worker.dispatch_replay(
                 Arc::clone(&stories),
-                Arc::clone(&losses),
-                ranges[device_index].clone(),
+                Arc::clone(&replay_ranges),
+                replay_shards[device_index].clone(),
                 permission,
                 base_revision,
                 Arc::clone(&base_model),
             )?);
         }
 
-        let canonical_range = ranges[0].clone();
+        let canonical_range = replay_shards[0].clone();
         let canonical_result = run_multi_gpu_replay_shard(
             canonical,
             &stories[canonical_range.clone()],
-            &losses[canonical_range.clone()],
+            &replay_ranges[canonical_range.clone()],
             canonical_range.start,
             permission,
             &base_model,
@@ -1157,6 +1186,13 @@ impl MultiGpuBatchTrainer {
         let mut raw_changes = Vec::with_capacity(results.len());
         let mut min_device_seconds = f64::INFINITY;
         let mut max_device_seconds = 0.0f64;
+        let mut min_device_work = usize::MAX;
+        let mut max_device_work = 0usize;
+        for shard in &replay_shards {
+            let shard_work = replay_work[shard.clone()].iter().copied().sum::<usize>();
+            min_device_work = min_device_work.min(shard_work);
+            max_device_work = max_device_work.max(shard_work);
+        }
         for result in results {
             min_device_seconds = min_device_seconds.min(result.elapsed_seconds);
             max_device_seconds = max_device_seconds.max(result.elapsed_seconds);
@@ -1187,11 +1223,13 @@ impl MultiGpuBatchTrainer {
             canonical.reset_transient_state()?;
             self.synchronize_replicas(Arc::clone(&replay_update))?;
             eprintln!(
-                "{{\"event\":\"multi_gpu_parallel_replay\",\"devices\":{},\"replay_steps\":{},\"prefix_steps\":{},\"replay_seconds\":{:.6},\"device_seconds_min\":{:.6},\"device_seconds_max\":{:.6},\"reduction\":\"sum_local_trajectories\",\"fixed_parameter_updates\":{},\"context_keys\":{},\"fp32\":true}}",
+                "{{\"event\":\"multi_gpu_parallel_replay\",\"devices\":{},\"replay_steps\":{},\"prefix_steps\":{},\"replay_seconds\":{:.6},\"work_per_device_min\":{},\"work_per_device_max\":{},\"device_seconds_min\":{:.6},\"device_seconds_max\":{:.6},\"reduction\":\"sum_local_trajectories\",\"fixed_parameter_updates\":{},\"context_keys\":{},\"fp32\":true}}",
                 device_count,
                 report.replay_steps,
                 report.prefix_steps,
                 replay_seconds,
+                min_device_work,
+                max_device_work,
                 min_device_seconds,
                 max_device_seconds,
                 replay_merge.fixed_parameter_updates,
@@ -1387,7 +1425,6 @@ impl MultiGpuBatchTrainer {
                 canonical,
                 Arc::clone(&stories),
                 losses_by_story,
-                &ranges,
                 device_count,
                 permission,
             )?;
@@ -1985,7 +2022,10 @@ mod device_story_postprocess_tests {
 
 #[cfg(test)]
 mod multi_gpu_partition_tests {
-    use super::{balanced_story_range, story_work, work_balanced_story_ranges};
+    use super::{
+        balanced_story_range, replay_execution_work, story_work, work_balanced_story_ranges,
+        work_balanced_weight_ranges,
+    };
 
     #[test]
     fn balanced_story_ranges_cover_logical_batch_in_order() {
@@ -2046,6 +2086,34 @@ mod multi_gpu_partition_tests {
             })
             .collect::<Vec<_>>();
         assert!(work.iter().max() <= count_work.iter().max());
+    }
+
+    #[test]
+    fn replay_work_balancing_uses_execution_cost_not_story_count() {
+        let weights = vec![100usize, 1, 1, 1, 1, 1];
+        let ranges = work_balanced_weight_ranges(&weights, 2);
+        assert_eq!(ranges.first().expect("range").start, 0);
+        assert_eq!(ranges.last().expect("range").end, weights.len());
+        assert_eq!(ranges[0].end, ranges[1].start);
+        let balanced_max = ranges
+            .iter()
+            .map(|range| weights[range.clone()].iter().sum::<usize>())
+            .max()
+            .expect("work");
+        let count_split_max = [0..3, 3..6]
+            .iter()
+            .map(|range| weights[range.clone()].iter().sum::<usize>())
+            .max()
+            .expect("work");
+        assert!(balanced_max <= count_split_max);
+    }
+
+    #[test]
+    fn stateful_replay_work_counts_one_streaming_prefix() {
+        let ranges = vec![10..20, 40..50, 90..100];
+        assert_eq!(replay_execution_work(&ranges, true), 100);
+        assert_eq!(replay_execution_work(&ranges, false), 20 + 50 + 100);
+        assert_eq!(replay_execution_work(&[], true), 0);
     }
 
     #[test]
