@@ -4,6 +4,8 @@ All notable project changes should be recorded here.
 
 ## Unreleased
 
+## v1.0.40 - 2026-09-12
+
 - Restore grouped CUDA residency after the cooperative-grid exactness fix by shortening persistent eligibility-pointer lifetimes, avoiding a loop-wide cooperative grid object, and applying a two-CTA-per-SM launch bound; extend the GPU gate to require at least 25% theoretical occupancy while preserving exact training-state hashes.
 - Restore replay diagnostics for GPU-native replay selection by reporting device-selected range summaries and shared batch timing without downloading per-step losses, and make the P100 GPU gate require the device-native diagnostic path instead of the legacy host selector event.
 - Fix the grouped persistent CUDA executor's high-occupancy cross-CTA race by reusing CUDA cooperative whole-grid barriers for every shared-story phase, keeping all CTAs on the same max-step schedule, and adding a full-capacity repeated exact-state GPU regression against the legacy compatibility path.
