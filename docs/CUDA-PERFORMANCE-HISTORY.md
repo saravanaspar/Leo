@@ -247,8 +247,919 @@ execution time itself remained approximately unchanged at 4.57 seconds.
 
 The implementation is therefore reverted rather than used as the basis for further optimization.
 
-## Next snapshot
+## Historical reconstruction - CUDA optimization phases after the original ledger
 
-Append the next merged optimization here. Record the version reported by the GitHub source at that
-commit even when it remains `1.0.2`, and always include the exact commit SHA/PR so same-version
-performance snapshots stay distinguishable.
+This section is an append-only reconstruction from the GitHub commit/PR history plus the P100
+progress report. It exists because several important optimizations, correctness failures, test-harness
+failures, and reverted experiments happened after the original v1.0.3 snapshot but were never added
+to this ledger.
+
+When a phase below does not have an isolated P100 before/after measurement, this document says so
+rather than inventing one. Later measurements are used only when they can be tied to a known commit
+or exact code state.
+
+### Phase 0 - replay-prefix specialization and measurement infrastructure
+
+#### PR #8 - frozen replay prefix fast path
+
+- Merge commit: `476bb6b8ee821f75432df90241ad3c613ee2f0d2`.
+- PR: #8, `Optimize bounded-surprise replay prefix execution`.
+- GitHub: <https://github.com/saravanaspar/Leo/pull/8>.
+
+What changed:
+
+- replay prefixes stopped using the normal supervised `training_step_batch` path;
+- a dedicated `advance_frozen_batch` backend operation was introduced;
+- the CUDA backend gained a persistent frozen-prefix kernel;
+- output-only work that cannot influence the next recurrent state was skipped during frozen prefix
+  reconstruction;
+- replay cleanup was deferred until the last selected range where possible.
+
+Why this was expected to help:
+
+- canonical replay contains far more hidden prefix steps than replay target steps;
+- frozen prefix reconstruction does not need loss/output-update work;
+- avoiding output-only work and repeated cleanup reduces work without changing the recurrent state.
+
+Result/lesson:
+
+- Git history preserves the structural optimization but not an isolated P100 before/after number for
+  this commit alone.
+- The architectural direction was retained and later profiling confirmed that hidden prefix work is
+  a dominant part of replay cost.
+
+#### PR #9 - cooperative frozen-prefix selection
+
+- Merge commit: `03ead2ef3e42e4e0d555532c9104cce6a9a7a896`.
+- PR: #9, `Parallelize frozen replay prefix selection`.
+- GitHub: <https://github.com/saravanaspar/Leo/pull/9>.
+
+What changed:
+
+- the one-block frozen prefix path gained a cooperative multi-CTA implementation;
+- model-block selection work was distributed across the cooperative grid;
+- the legacy single-block persistent path remained as a fallback;
+- the implementation preserved the exact phase/reduction ordering required by the v1 semantics.
+
+Why this was expected to help:
+
+- per-block selection is independent across model blocks until the exact global-selection boundary;
+- P100 exposes enough cooperative capacity to spread this work across many CTAs.
+
+Result/lesson:
+
+- no isolated accepted P100 throughput number is preserved for this exact commit;
+- later profiles show frozen prefix selection is still dominated by the exact global selection step,
+  so parallelizing only block-local work cannot remove the entire prefix bottleneck.
+
+#### PRs #10 and #11 - CUDA phase profiling
+
+- #10 merge: `4c36d27e49b326e9a6053d7e6a1cc4149494ed1f`.
+- #11 merge: `c6c1fac35a7cfbff2163ac1d0e27654ba456eae1`.
+
+These changes were measurement infrastructure, not throughput claims. They made it possible to
+separate `pre`, block/global selection, post-core, learning-signal, update, homeostasis, capture,
+and replay-prefix phases without relying on unavailable Nsight hardware counters in Kaggle.
+
+Permanent lesson:
+
+> Measurement instrumentation is part of the optimization stack. Do not replace a measured
+> bottleneck with an assumed bottleneck.
+
+#### PR #12 - cooperative supervised replay path and replay diagnostics
+
+- Merge commit: `8ddc6fe61c383d2b751efc053688454c28c3cdf3`.
+- PR: #12, `Optimize replay CUDA path and add detailed diagnostics`.
+
+What changed:
+
+- supervised replay gained cooperative whole-grid execution;
+- the legacy replay kernel was retained for A/B debugging;
+- hidden replay-prefix steps were counted explicitly;
+- replay timing, launch, transfer, synchronization, selection and sampled phase diagnostics were
+  added.
+
+Permanent lesson:
+
+- reported replay targets are not the true replay workload;
+- hidden prefix reconstruction must always be measured separately.
+
+#### PR #13 - exact packed winner selection
+
+- Merge commit: `a3f8f45480f69fbda12d00d8c04208f61b6583b5`.
+- PR: #13, `Optimize exact CUDA winner selection`.
+
+What changed:
+
+- per-block and global winner comparison moved to packed exact comparison keys;
+- already-sorted block winner runs were reused;
+- activation ordering, rotated tie-break behavior, and historical block-cutoff behavior were
+  preserved;
+- unsupported/non-finite cases retained the legacy fallback.
+
+This improved the selection foundation, but later profiling still found the sparse global merge to
+be the dominant replay cost. That led to PR #20's heap merge rather than further arithmetic changes.
+
+### Phase 1 - multi-GPU and persistent/grouped execution foundation
+
+#### PRs #14-#16 - scaling and synchronization discipline
+
+- PR #14 introduced the multi-GPU scaling path.
+- PR #15 fixed scaling barriers/synchronization.
+- PR #16 added repeated clean-run measurements and required repeated final-state hashes to agree.
+
+The main durable lesson for single-GPU work is the same one that later mattered on the P100 grouped
+kernel:
+
+> Synchronization correctness and repeatability must be proven under the maximum intended
+> concurrency, not only under a small grid.
+
+A second durable lesson from PR #16 is that a single performance run is insufficient for small
+changes. Repeated min/median/max measurements are required when differences are near noise.
+
+#### PR #17 - persistent/grouped CUDA acceleration foundation
+
+- Merge commit: `c5dfade3b8ba378704ea195bcaed5431b6dafd41`.
+- PR: #17, `perf(cuda): accelerate training and replay`.
+
+This was the broad architecture phase that added/combined:
+
+- persistent/grouped CUDA execution;
+- device-side merge paths;
+- replay acceleration experiments;
+- correctness gates;
+- training/performance documentation.
+
+The later v1.0.2 pre-heap snapshot in this ledger is the durable measured baseline for the resulting
+architecture: 2,403.340 replay-off optimized steps/s and 453.437 canonical replay-30 steps/s before
+the exact sparse heap selector.
+
+### Phase 2 - exact sparse heap selector: the major accepted breakthrough
+
+PR #20 (`e23d2bdf587cee7520d9d80e429949fdc159ef80`) replaced repeated linear sparse-global winner
+scans with an exact shared-memory heap merge. The full accepted results are already recorded above,
+but the engineering conclusion deserves to be permanent:
+
+- replay-off: 2,403.340 -> 3,628.031 steps/s (`1.510x`);
+- canonical replay-30: 453.437 -> 1,897.610 steps/s (`4.185x`);
+- replay time: 27.3133 -> 4.58293 seconds (`5.960x` faster);
+- both historical state hashes remained exact.
+
+Why this worked:
+
+- the profiler had identified `select_global` as approximately 93-94% of long frozen-prefix cycles;
+- the optimization attacked the measured dominant algorithm rather than only changing memory
+  placement or occupancy.
+
+Permanent lesson:
+
+> Large wins came from changing the complexity of the dominant exact algorithm, not from cosmetic
+> occupancy or cache changes.
+
+### Phase 3 - learning-signal interleave regression and revert
+
+PR #21 / v1.0.3 interleaved four independent learning-signal rows per thread so each loaded error
+could be reused across four destination rows. It preserved the FP32 accumulation order within each
+row and preserved exact hashes, but it was a severe P100 regression.
+
+Measured regression:
+
+| Workload | Exact heap baseline | Four-row interleave | Change |
+| --- | ---: | ---: | ---: |
+| Replay-off optimized | 3,628.031 | 2,408.681 | -33.6% |
+| Replay-off legacy | 2,000.709 | 791.037 | -60.5% |
+| Canonical replay-30 | 1,897.610 | 1,559.470 | -17.8% |
+
+The production learning-signal share increased from 42.02% to 55.45%.
+
+Why the hypothesis looked reasonable:
+
+- output errors are reused across many neuron rows;
+- interleaving independent rows appeared to increase instruction-level parallelism and reuse each
+  error load.
+
+Why it failed in practice:
+
+- extra live accumulators/state increased pressure on the P100 execution pipeline;
+- the shared helper also hurt the legacy path, proving the regression was in the learning-signal
+  implementation itself rather than the grouped scheduler;
+- exactness tests alone could not reveal the regression.
+
+PR #23 (`c31b3b5f9e97e282d820efed95399dac9d73fe15`) reverted the experiment.
+
+Permanent rule:
+
+> Never accept a learning-signal micro-optimization from static reasoning alone. It must beat the
+> canonical 32K P100 benchmark and preserve the historical hashes.
+
+### Phase 4 - PR #24 hardware-adaptive shared-story execution
+
+- Merge commit: `420ba89bfca029c679679a47ee94dc05bce28237`.
+- PR: #24, `perf(cuda): make story execution hardware-adaptive`.
+
+The phase attempted to remove host and lockstep overhead by:
+
+- consuming the tuner-approved cooperative CTA budget;
+- using grouped shared-story execution;
+- allowing story lanes to advance through their own story lengths;
+- moving normal story-step descriptor generation onto the GPU;
+- reducing per-step records into per-story summaries on-device;
+- selecting exact bounded-surprise replay ranges on-device;
+- retaining GPU fixed-parameter batch merge while keeping order-sensitive keyed context merge at the
+  exact host safe point.
+
+This was directionally important because it moved orchestration and postprocessing off the host.
+However, the custom cross-CTA lane synchronization used by the high-occupancy grouped path was later
+shown to be unsafe at full occupancy.
+
+Permanent lesson:
+
+> A synchronization scheme that is exact at 16 or 32 CTAs is not proven exact at 112 CTAs.
+
+### Phase 5 - optimized representation/reporting failures were not arithmetic failures
+
+#### PR #26 - device-postprocess result dispatch bug
+
+- Commit: `656e85332be562acfc147e1c44a620bcb39fc454`.
+- PR: #26, `fix(cuda): recognize device-postprocessed story metrics`.
+
+P100 diagnosis showed:
+
+- max parameter delta: `9.313226e-10`;
+- training loss sum delta: `4.959106e-5`;
+- mean loss delta: `5.547651448`.
+
+The learned state and accumulated loss were effectively matching. The bug was host report dispatch:
+GPU postprocessing returned one empty per-step metrics vector per logical story, so testing only
+`story_metrics.is_empty()` incorrectly selected the legacy host-metrics path.
+
+Fix:
+
+- require the expected per-story empty-vector representation together with one device summary and
+  replay-range vector per story.
+
+Permanent lesson:
+
+> When an optimized path changes the shape of host-visible data, validate the full representation
+> contract. Do not infer the execution path from one container's outer emptiness.
+
+#### PR #30 - diagnostics accidentally coupled to the host replay selector
+
+- Commit: `7d5afc282791e82176856cea3d4dcad8707296cd`.
+- PR: #30, `fix(cuda): restore device-native replay diagnostics`.
+
+Root cause:
+
+- GPU replay selection correctly bypassed the historical host `apply_replay_policy` path;
+- the old debug event emitter lived inside that bypassed host path;
+- the GPU gate therefore failed despite valid GPU execution.
+
+Fix:
+
+- emit device-native replay-selection and batch-summary diagnostics from already selected compact
+  device ranges without downloading per-step losses.
+
+Permanent lesson:
+
+> Correctness/diagnostic gates must observe the optimized path directly; they must not require a
+> fallback path merely to generate telemetry.
+
+### Phase 6 - full-capacity grouped race, exact synchronization, and residency recovery
+
+#### PR #31 - high-occupancy race diagnosis and correctness fix
+
+- Commit: `b58c4d50e922adf9a399f899028de264cae0f636`.
+- PR: #31, `fix(cuda): synchronize grouped story phases cooperatively`.
+
+Isolation result:
+
+- 16 CTAs: exact;
+- 32 CTAs: exact;
+- 112 CTAs run A: non-exact;
+- 112 CTAs run B: non-exact with a different state hash.
+
+The two 112-CTA executions disagreeing with each other proved a real cross-CTA synchronization race,
+not deterministic FP32 arithmetic drift. The 112-block grid was evenly divisible by 16 logical
+lanes, eliminating remainder distribution as the cause.
+
+Fix:
+
+- retire the unsafe custom cross-CTA lane barrier;
+- use CUDA cooperative whole-grid `grid.sync()` boundaries;
+- force every CTA to follow the same `max_step_count` schedule so no CTA can leave a cooperative
+  barrier early.
+
+Tradeoff:
+
+- exactness returned at full occupancy;
+- whole-grid synchronization and increased live state reduced practical residency/performance.
+
+Permanent rule:
+
+> Never replace a cooperative grid barrier with a hand-rolled cross-CTA barrier unless forward
+> progress and memory ordering are proven for the full launch geometry and repeated full-capacity
+> hashes agree.
+
+#### PR #32 - stress-fixture failure was configuration, not CUDA
+
+- Commit: `247d7cdb0cb227007d65ec69900813bf2e62a7b4`.
+
+The new 4K grouped stress model increased `neuron_count` but left `max_active_global = 8`. Leo
+correctly rejected the generated configuration because `target_activity` required 164 active
+neurons. The fixture was changed to `max_active_global = 256` and the intended full-capacity CUDA
+regression then ran.
+
+Permanent lesson:
+
+> Before diagnosing a GPU failure, prove the stress fixture itself satisfies model invariants.
+
+#### PR #34 - recover grouped-kernel residency without weakening synchronization
+
+- Commit: `027f9a7b07b796e144dc4a5778dfa593b6000cae`.
+- PR: #34, `perf(cuda): restore grouped kernel residency`.
+
+The fix shortened long-lived eligibility-pointer/config/grid-object state while preserving
+cooperative whole-grid synchronization.
+
+Grouped kernel capability improved from approximately:
+
+```text
+134 registers/thread
+1 block/SM
+56 cooperative blocks
+12.5% theoretical occupancy
+```
+
+to:
+
+```text
+128 registers/thread
+2 blocks/SM
+112 cooperative blocks
+25% theoretical occupancy
+```
+
+The repeated full-capacity gate exercised all 112 cooperative CTAs and still matched the legacy
+state exactly.
+
+However, the real 32K tuner continued to prefer 56 blocks because 112-block whole-grid barrier cost
+outweighed the extra resident work. Therefore higher occupancy was a capability improvement, not an
+end-to-end speed win by itself.
+
+### Accepted main baseline before PR #35
+
+At `027f9a7b07b796e144dc4a5778dfa593b6000cae`:
+
+| Measurement | Result |
+| --- | ---: |
+| 32K replay-off optimized, 64 stories | 3,393.453279 steps/s |
+| 32K replay-off legacy, 64 stories | 1,993.958446 steps/s |
+| Canonical replay-30, 16 stories | 1,853.697928 steps/s |
+| Canonical replay execution incl. prefixes | 4,441.279162 steps/s |
+| Canonical replay time | 4.586416353 s |
+| Canonical total time | 7.820044346 s |
+| Replay wall fraction | 58.6495% |
+
+Compared with the best accepted exact sparse-heap measurement (3,628.031 replay-off and 1,897.610
+canonical replay), the correctness/synchronization line was approximately 6.47% lower replay-off and
+2.31% lower on canonical replay.
+
+The project accepted that correctness cost and made further work start from this exact mainline
+rather than reintroducing the unsafe barrier.
+
+---
+
+## Unreleased / intended v1.0.4 - PR #35 FP32 overhead reduction
+
+### Versioning note before release
+
+PR #35 is currently open:
+
+- PR: <https://github.com/saravanaspar/Leo/pull/35>
+- Base: `027f9a7b07b796e144dc4a5778dfa593b6000cae`.
+- Current head: `16f705fd2111276bd668803213964964fab71d70`.
+- User-intended release label: `v1.0.4`.
+
+At the time of this measurement the repository source still reports workspace version `1.0.32`, and
+Git history contains release commits for v1.0.31 and v1.0.32. Under ordinary semantic-version
+ordering, `1.0.4` is lower than `1.0.32`. Do not record PR #35 as a released v1.0.4 snapshot until
+release metadata/tagging is intentionally reconciled. After merge/release, append the actual merge
+SHA, release commit, and tag below rather than rewriting these pre-release measurements.
+
+### PR #35 commit sequence
+
+1. `7441cb85f3fed3c1cc1702db88d89fa08b80f1c8` - `perf(cuda): reduce FP32 training and replay overhead`.
+2. `3b4677e561c3eca846cc2c3d1f6ebe630b98d2f7` - training-guide update on the same branch.
+3. `16f705fd2111276bd668803213964964fab71d70` - `perf(cuda): remove regressing shared error cache`.
+
+The third commit is essential: the initial optimization bundle contained a learning-signal
+shared-memory cache that preserved exact state but caused a large P100 throughput regression.
+
+### 2026-09-12 Kaggle P100 environment
+
+```text
+GPU:             Tesla P100-PCIE-16GB
+SM count:        56
+Compute cap.:    6.0
+Driver:          580.159.04
+CUDA toolkit:    12.8 / nvcc 12.8.93
+Rust:            1.85.0
+Python:          3.12.13
+Logical workers: 16
+FP32:            unchanged
+Canonical replay: 0.30
+```
+
+The Kaggle session cloned branch head `3b4677e...` for the initial tests, then manually A/B removed
+the shared-error cache. That manual revert was subsequently committed on Kubuntu as `16f705f...`.
+Therefore the corrected performance numbers below correspond to the same `cuda_kernels.cu` revert
+that became `16f705f`, but the performance session itself was not recloned to the exact
+`16f705f` commit before measurement. Re-run the acceptance commands on the exact released commit
+for the final post-release snapshot.
+
+### Dataset identity in this Kaggle session
+
+Repository-pinned TinyStories source revision remained:
+
+`5485261731eaac25dd8e5ebbc3839d0a9870b185`
+
+The full prepared dataset manifest reported:
+
+| Artifact | Value |
+| --- | --- |
+| Train stories | 2,119,489 |
+| Train bytes | 1,891,291,909 |
+| Train bytes SHA-256 | `6f9928713c3ffb6285c032c0122ce7192f606974f1895939677aa08624db3d8f` |
+| Train index-records SHA-256 | `d8ce3ec224d05c5d576d909f365eaaa1e6e4134a4b97cc49b459c1a2df720bce` |
+| Train dataset id | `da4fcc7dfd6d0b3ff8080cb85cb6c2e298d1af109b715c724c049a9ffed189be` |
+| Validation stories | 21,990 |
+| Validation bytes | 19,105,764 |
+| Validation bytes SHA-256 | `56e7c41c62fc31c92145a9320b45a044b7dc8eda10fcab763cc7c9b28bbe805e` |
+| Validation index-records SHA-256 | `78350a079698f3a969f0049e15d14c57919bd225104f066159b280799bb051a6` |
+| Validation dataset id | `bdd64859116c5b062888069413f2d16dc24cc785f6eda0fb470cb506c2323fad` |
+
+The canonical 64-story replay-off benchmark consumed 45,937 input bytes. The canonical 16-story
+replay-30 benchmark consumed 11,127 input bytes and generated exactly the historical 3,353 replay
+targets plus 20,235 hidden prefix steps.
+
+### What PR #35 attempted
+
+The reviewed bundle deliberately kept FP32 and canonical semantics. It included:
+
+- autotuner schema bump plus intermediate P100 candidate widths `64, 72, 80, 84, 96`;
+- replay/frozen kernel pointer/config/grid-object lifetime shortening to reduce register pressure;
+- grouped production barrier fusion only where dependencies were proven independent;
+- replay reset cleanup that stops clearing payload arrays hidden by zeroed counts;
+- a replay-only deferred document-reset path while preserving the public synchronous
+  `begin_document()` contract;
+- target-zero replay fusion so `BEGIN_DOCUMENT -> first target` and remaining ordered targets share
+  one supervised batch;
+- the now-rejected shared-memory error cache for learning signals.
+
+The grouped production source was reduced from about 19 whole-grid synchronization sites per
+supervised step to 17 by fusing only boundaries where the touched arrays are independent. The
+recurrent-vs-input eligibility barrier and other order-sensitive boundaries were intentionally kept.
+
+### Autotuner expansion result
+
+The new candidate widths were actually exercised on the 32K P100 warmup. With the initial
+shared-error-cache build, approximate per-candidate measured wall throughput was:
+
+| Lane chunk | Fused blocks | Approx. mean work/s |
+| ---: | ---: | ---: |
+| 16 | 28 | 1,539.9 |
+| 16 | 56 | 2,723.4 |
+| 16 | 64 | 2,088.5 |
+| 16 | 72 | 2,267.5 |
+| 16 | 80 | 2,323.1 |
+| 16 | 84 | 2,427.0 |
+| 16 | 96 | 2,474.5 |
+| 16 | 112 | 2,461.2 |
+| 8 | 56 | 2,726.0 |
+| 8 | 112 | 2,251.8 |
+
+The tuner chose 56 blocks with lane chunk 8. The 56-block lane-8/lane-16 difference was below
+0.1% in this noisy warmup and therefore not meaningful.
+
+A forced lane-chunk-16 A/B later proved that this near-tie was not the regression root cause.
+
+Permanent lesson:
+
+> Intermediate grid candidates are useful, but a larger grid is not automatically faster. On the
+> current cooperative kernel, barrier cost still makes 56 blocks faster than 64-112 on the measured
+> 32K workload.
+
+### Regression incident - shared-memory `errors[257]` cache
+
+#### Hypothesis
+
+The base production profile showed learning signals at roughly 40-42% of cycles. Each destination
+neuron computes an FP32 dot product against the same 257-element output-error vector. It appeared
+reasonable to copy that approximately 1 KiB error vector into CTA shared memory and reuse it across
+rows.
+
+The implementation preserved the exact output accumulation order, so historical hashes still
+matched.
+
+#### Initial result with the cache enabled
+
+| Measurement | Main baseline | Shared-error-cache build | Change |
+| --- | ---: | ---: | ---: |
+| Replay-off, 64 stories | 3,393.453279 | 2,653.625324 | -21.80% |
+| Canonical replay-30 | 1,853.697928 | 1,612.802738 | -13.00% |
+| Replay time | 4.586416 s | 4.762070 s | +3.83% |
+| Total canonical time | 7.820044 s | 8.988080 s | +14.94% |
+
+The replay-off historical hash remained:
+
+`14894f9039c59359a81ebed48d71b563617636348fb4347f2accefc5bfcd50e9`
+
+The replay-30 historical hash remained:
+
+`5b30b3f442f3aecf17a6a41e1b98b21b802cd27aa70fbe0c79cb1f9257527e6e`
+
+The timing split was diagnostic:
+
+```text
+baseline non-replay time = 7.820044 - 4.586416 = 3.233628 s
+bad-cache non-replay     = 8.988080 - 4.762070 = 4.226010 s
+non-replay regression    = +30.69%
+```
+
+Replay itself regressed only 3.83%, so the main damage was clearly in the base grouped path.
+
+#### False lead tested - lane chunk 8 versus 16
+
+The warmup selected lane chunk 8 by a negligible margin. To rule out tuner noise, the saved plan was
+forced to:
+
+```text
+physical_lane_chunk = 16
+fused_wavefront_blocks = 56
+fused_wavefront_threads = 256
+```
+
+Result:
+
+| Measurement | Cache build, auto plan | Cache build, forced lane-16 |
+| --- | ---: | ---: |
+| Replay-off | 2,653.625 | 2,634.227 steps/s |
+| Canonical replay-30 | 1,612.803 | 1,624.635 steps/s |
+| Canonical replay time | 4.762070 | 4.763044 s |
+
+Forcing lane chunk 16 did not recover performance. Therefore the tuner near-tie was not the root
+cause.
+
+#### Isolation test - remove only shared-error caching
+
+Only the following experiment was reverted:
+
+- remove the two `__shared__ float shared_errors[LEO_OUTPUTS]` arrays;
+- replace cached learning-signal calls with the original exact global-read helper;
+- remove the now-unused cached helper.
+
+Everything else in PR #35 remained.
+
+Result:
+
+| Measurement | Main baseline | No-error-cache PR #35 state | Change |
+| --- | ---: | ---: | ---: |
+| Replay-off, 64 stories | 3,393.453279 | 3,406.244907 | +0.38% |
+| Canonical replay-30 | 1,853.697928 | 1,853.689440 | -0.0005% |
+| Replay execution incl. prefix | 4,441.279162 | 4,441.258827 | -0.0005% |
+| Replay time | 4.586416 | 4.588256 s | +0.04% |
+| Total canonical time | 7.820044 | 7.820080 s | +0.0005% |
+
+Both historical hashes remained exact.
+
+Interpretation:
+
+- the shared-error cache caused essentially the entire observed regression;
+- the corrected PR #35 bundle is end-to-end performance-neutral within measurement noise on the
+  canonical replay workload and slightly above the current-main replay-off measurement;
+- the remaining low-risk barrier/reset/launch/register changes therefore stay, but they must not be
+  advertised as an 8K breakthrough.
+
+Why the cache likely failed on P100:
+
+- the error vector is tiny (~1 KiB) and read-only, so normal cache/broadcast behavior is already
+  favorable;
+- every participating CTA paid to copy all 257 values;
+- every CTA paid a `__syncthreads()` before useful learning-signal work;
+- sparse/imbalanced CTAs can pay that fixed overhead even when they have little learning-signal work;
+- the optimization attacked placement of a tiny shared input instead of the much larger
+  neuron-major output-weight traffic.
+
+Permanent rule:
+
+> Do not reintroduce a CTA-wide shared-memory copy of the 257-element error vector on P100 without a
+> fresh isolated A/B that beats the original global-read implementation. The previous attempt was
+> exact but approximately 22% slower replay-off.
+
+### Resource telemetry during PR #35 validation
+
+Before the shared-error cache was removed, the P100 GPU gate reported:
+
+| Kernel | Registers/thread | Blocks/SM | Theoretical thread occupancy |
+| --- | ---: | ---: | ---: |
+| `leo_shared_wavefront_persistent_grouped` | 128 | 2 | 25% |
+| `leo_train_cooperative_fast` | 144 | 1 | 12.5% |
+| `leo_advance_frozen_cooperative` | 104 | 2 | 25% |
+
+The important replay-kernel change is the register direction: the earlier roadmap measured roughly
+166 registers/thread for `leo_train_cooperative_fast`; PR #35's pointer-lifetime cleanup reached 144
+in this gate. That is progress, but the replay kernel is still one CTA/SM. The <=128-register target
+remains open.
+
+Because this resource snapshot was emitted before the error-cache revert, rerun the resource gate on
+the exact released commit before recording final static-shared-memory numbers.
+
+### Corrected 32K base-path phase profile
+
+After removing shared-error caching, `LEO_CUDA_PHASE_PROFILE=1` on the 16-story replay-off workload
+reported:
+
+| Phase | Share |
+| --- | ---: |
+| learning signals | 40.6503% |
+| post core | 21.1919% |
+| selection | 18.1701% |
+| pre | 9.0710% |
+| post select | 4.9933% |
+| post deltas | 3.0425% |
+| homeostasis | 2.2538% |
+| cache surrogate | 0.5518% |
+| capture | 0.0755% |
+
+The instrumented benchmark itself reported 3,606.818 steps/s, but profiling changes timing and that
+number is not an acceptance throughput result. The phase shares are the useful evidence.
+
+Compared with the earlier exact heap profile, learning signals remain the largest base-kernel phase.
+The failed shared-error cache proves that the next learning-signal optimization must target the real
+weight-access/computation structure rather than blindly staging the tiny error vector.
+
+### Corrected canonical replay profile
+
+The full 16-story replay profile accounted for every canonical replay step:
+
+```text
+replay targets:       3,353
+hidden prefix steps: 20,235
+```
+
+Aggregating all 73 frozen-prefix profile records and all 77 replay-target profile records gives:
+
+#### Frozen prefix - 20,235 sampled steps
+
+| Phase | Weighted share of prefix cycles |
+| --- | ---: |
+| global selection | 50.2311% |
+| pre | 28.5779% |
+| block selection | 17.8542% |
+| post/emit | 3.3368% |
+
+#### Supervised replay targets - 3,353 sampled steps
+
+| Phase | Weighted share of replay-target cycles |
+| --- | ---: |
+| pre | 32.2254% |
+| learning signals | 16.3662% |
+| global selection | 12.8814% |
+| block selection | 9.1565% |
+| forward | 7.6793% |
+| capture | 4.8798% |
+| recurrent update | 3.8852% |
+| recurrent eligibility | 3.3647% |
+| input eligibility | 2.8851% |
+| homeostasis | 1.7839% |
+| input update | 1.5166% |
+| cache surrogate | 1.0821% |
+| post/emit | 0.9118% |
+| output update | 0.7720% |
+| context update | 0.6099% |
+
+The instrumented replay-profile benchmark reported 1,756.904 steps/s and 5.01979 seconds of replay,
+but this slowdown is profiling overhead; the exact canonical hash remained unchanged.
+
+Across profiled replay kernel cycles:
+
+- frozen-prefix reconstruction contributed 64.68%;
+- supervised replay-target execution contributed 35.32%.
+
+Largest contributors to all profiled replay cycles were:
+
+| Combined replay component | Share of all profiled replay cycles |
+| --- | ---: |
+| prefix global selection | 32.49% |
+| prefix pre | 18.48% |
+| prefix block selection | 11.55% |
+| target pre | 11.38% |
+| target learning signals | 5.78% |
+| target global selection | 4.55% |
+| target block selection | 3.23% |
+| target forward | 2.71% |
+
+This makes the next replay target unambiguous: exact frozen-prefix global selection is the single
+largest replay kernel cost.
+
+### What did and did not improve in PR #35
+
+Accepted/retained engineering changes:
+
+- replay target-zero launch fusion: removes one supervised launch/sync for replay ranges beginning at
+  zero while keeping the exact ordered target sequence;
+- replay-only deferred reset: overlaps reset enqueue with CPU preparation without weakening the
+  public synchronous `begin_document()` contract;
+- reset payload-clear reduction: stale payload arrays are hidden by zeroed counts or overwritten
+  before use;
+- replay/frozen pointer-lifetime cleanup: reduced observed replay kernel register pressure;
+- grouped barrier fusion at proven-independent boundaries;
+- wider autotuner candidate search space.
+
+Not demonstrated as an end-to-end canonical speedup yet:
+
+- the corrected PR as a whole is essentially equal to current main on canonical replay;
+- expanded 64-96 block tuner candidates did not beat 56 blocks in this run;
+- reduced replay register pressure has not yet crossed the 2-CTA/SM threshold;
+- replay remains host-orchestrated per selected segment;
+- frozen-prefix global selection remains approximately 50% of prefix cycles.
+
+Rejected:
+
+- shared-memory `errors[257]` cache: exact but strongly slower on P100.
+
+### Reproduction commands for final release acceptance
+
+Use a clean P100 environment and a fresh CUDA tuning cache.
+
+Replay-off exact control:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./target/release/leo benchmark \
+  --train \
+  --model runs/p100-acceptance/replay0.pscls \
+  --bytes data/prepared/tinystories.train.bytes \
+  --index data/prepared/tinystories.train.idx \
+  --stories 64 \
+  --workers 16 \
+  --backend gpu
+```
+
+Required hash:
+
+`14894f9039c59359a81ebed48d71b563617636348fb4347f2accefc5bfcd50e9`
+
+Canonical replay-30:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./target/release/leo benchmark \
+  --train \
+  --model runs/p100-acceptance/replay30.pscls \
+  --bytes data/prepared/tinystories.train.bytes \
+  --index data/prepared/tinystories.train.idx \
+  --stories 16 \
+  --workers 16 \
+  --backend gpu
+```
+
+Required hash:
+
+`5b30b3f442f3aecf17a6a41e1b98b21b802cd27aa70fbe0c79cb1f9257527e6e`
+
+Do not enable `LEO_REPLAY_STREAMING` for canonical acceptance.
+
+---
+
+## Rejected or conditional ideas - do not repeat blindly
+
+This table is intentionally explicit so future optimization rounds do not rediscover the same
+failures.
+
+| Idea | Why it looked useful | Actual result / danger | Rule going forward |
+| --- | --- | --- | --- |
+| Four-row learning-signal interleave | Reuse each error load across independent rows | Exact hashes, but replay-off -33.6%; learning-signal share rose to 55.45% | Rejected on P100; require isolated canonical A/B before any similar multi-row interleave |
+| Shared-memory `errors[257]` cache | Error vector is reused by all rows | Exact hashes, but replay-off about -22%; fixed CTA copy + barrier dominated | Do not reintroduce without new measured evidence |
+| Force higher CTA occupancy | 112 CTAs gives 25% theoretical occupancy | 112-block production candidate is slower than 56 because `grid.sync()` cost grows | Optimize steps/s, not occupancy percentage |
+| Hand-rolled per-lane cross-CTA barrier | Let stories advance independently without whole-grid waiting | Nondeterministic wrong state at 112 CTAs | Use cooperative synchronization unless a replacement is proven at full capacity |
+| Treat exactness as sufficient | Both failed learning-signal experiments preserved hashes | Large real throughput regressions were still possible | Every exact patch must also beat canonical throughput |
+| Diagnose from one tuner choice | Lane chunk 8 barely beat 16 in a noisy warmup | Forced lane 16 did not fix the regression | A/B suspected scheduler choices before blaming them |
+| Use one performance run for small deltas | Faster iteration | 1-3% can be noise; <0.1% definitely is not a decision-quality margin | Warm up and repeat; report median/range |
+| Couple diagnostics to host fallback | Existing debug emitter already worked | Device-native replay bypassed it and the GPU gate falsely failed | Diagnostics must follow the optimized data path |
+| Infer device-postprocess mode from outer vector emptiness | Simple predicate | One empty vector per lane was misclassified and mean-loss reporting broke | Validate the complete host-visible representation |
+| Assume a GPU test fixture is valid | Kernel failure seemed likely | 4K fixture violated `max_active_global` before CUDA ran | Validate model invariants before GPU diagnosis |
+| Streaming replay as canonical speedup | It was faster in early experiments | State digest differs from classic replay | Diagnostic/experimental only unless semantics are explicitly changed in a new contract |
+
+---
+
+## Performance experiment protocol after PR #35
+
+Every future performance PR should record all of the following in this ledger.
+
+### 1. Correctness wall
+
+- `scripts/check.sh` passes;
+- `scripts/check_gpu.sh` passes;
+- repeated full-capacity grouped run is deterministic;
+- replay-off 32K hash equals the historical replay-off hash;
+- canonical replay-30 hash equals the historical replay hash;
+- optimized and legacy/reference paths match where the gate requires them.
+
+### 2. Fresh-state rule
+
+- start benchmark comparisons from the same model file/state;
+- use a fresh tuning cache after kernel-source or tuning-schema changes;
+- do not compare a candidate after another candidate has mutated the same in-memory model unless the
+  benchmark harness explicitly resets/restores it.
+
+### 3. Noise rule
+
+- warm up first;
+- repeat measurements for small deltas;
+- treat approximately 1-3% differences cautiously;
+- never redesign around a sub-1% tuner difference without a forced A/B.
+
+### 4. Required identity fields
+
+Record:
+
+```text
+GPU + SM count
+CUDA toolkit + driver
+Rust/Python versions when relevant
+commit SHA + PR
+software version/tag
+TinyStories source revision
+prepared artifact hashes/dataset id
+model config
+workers
+replay fraction
+selected tuner plan
+kernel resource telemetry
+training-state hash
+steps/s
+replay seconds + replay wall fraction
+phase profile when the patch targets a kernel phase
+```
+
+### 5. Negative-result rule
+
+If an optimization is exact but slower, keep the negative measurement in this ledger and revert the
+implementation. The four-row interleave and shared-error-cache incidents are examples. Negative
+results are valuable because they prevent future contributors from repeating plausible but harmful
+micro-optimizations.
+
+---
+
+## Current optimization frontier after PR #35
+
+The corrected PR #35 does not materially change the canonical 1,853.7 steps/s baseline. The next
+round should therefore target the measured dominant costs rather than additional tiny cache changes.
+
+Priority order from current evidence:
+
+1. **Frozen-prefix exact global selection** - 50.23% of prefix cycles and 32.49% of all profiled
+   replay cycles.
+2. **Base learning signals** - 40.65% of the corrected replay-off production profile.
+3. **Base post-core + selection** - together another ~39% of base profiled cycles.
+4. **Replay-target pre phase** - 32.23% of replay-target cycles.
+5. **Replay kernel register pressure** - continue from the observed 144 registers/thread toward a
+   profitable 2-CTA/SM point if compiler/resource evidence supports it.
+6. **Device-resident exact replay segment orchestration** - eliminate per-segment host reset/prefix/
+   target orchestration while preserving sequential parameter visibility and exact replay semantics.
+
+For the current canonical 14,496-step run:
+
+```text
+current total time ~= 7.8201 s
+current replay     ~= 4.5883 s
+current non-replay ~= 3.2318 s
+8K target time      = 1.8120 s
+```
+
+Even infinitely fast replay would leave only about 4,485 reported steps/s at the current non-replay
+cost. Even infinitely fast base work would leave only about 3,159 reported steps/s at the current
+replay cost. Reaching 8K therefore requires major improvements on both sides.
+
+---
+
+## Post-merge release fill-in
+
+After PR #35 is merged and release metadata is finalized, append - do not rewrite the pre-release
+A/B history above - the following:
+
+```text
+actual merge SHA:
+actual release commit SHA:
+actual tag/version:
+exact source version:
+final P100 check_gpu.sh result:
+final replay0 steps/s + hash:
+final replay30 steps/s + hash:
+final replay seconds / total seconds:
+final selected tuner plan:
+final grouped/replay/frozen kernel resource telemetry:
+```
+
+The next optimization phase should start only after that release snapshot is filled from a clean
+checkout of the exact tagged/merged commit.
+
