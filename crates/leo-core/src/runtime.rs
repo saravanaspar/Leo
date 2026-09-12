@@ -121,6 +121,7 @@ pub struct Runtime {
     delay_ring: Vec<Vec<Event>>,
     due_events: Vec<Event>,
     current_tick: u64,
+    plasticity_phase: usize,
     touched: Vec<usize>,
     touched_mark: Vec<bool>,
     active: Vec<usize>,
@@ -217,6 +218,7 @@ impl Runtime {
             delay_ring: (0..ring_size).map(|_| Vec::new()).collect(),
             due_events: Vec::new(),
             current_tick: 0,
+            plasticity_phase: 0,
             touched: Vec::with_capacity(neuron_count.min(4096)),
             touched_mark: vec![false; neuron_count],
             active: Vec::with_capacity(neuron_count.min(4096)),
@@ -419,6 +421,7 @@ impl Runtime {
         self.population_inhibition = 0.0;
         self.persistent_document_activity = false;
         self.learning_trace_enabled = false;
+        self.plasticity_phase = 0;
     }
 
     pub fn step(
@@ -993,37 +996,65 @@ impl Runtime {
                 self.block_selection_cutoff[block_index] = block[block_limit].1;
                 block.truncate(block_limit);
             }
+            // Formula v2 keeps the exact local competition order even when the
+            // global cap is provably non-binding and global ranking is skipped.
+            block.sort_unstable_by(|left, right| {
+                right.1.total_cmp(&left.1).then_with(|| {
+                    rotated_tie_key(left.0, tick_rotation, neuron_count).cmp(&rotated_tie_key(
+                        right.0,
+                        tick_rotation,
+                        neuron_count,
+                    ))
+                })
+            });
             self.active.extend(block.iter().map(|(neuron, _)| *neuron));
         }
 
         let block_selected_neurons = self.active.len();
-        self.active.sort_unstable_by(|left, right| {
-            let right_activation = (self.state.membrane[*right]
-                - self.model.neurons.threshold[*right])
-                .clamp(0.0, 1.0);
-            let left_activation =
-                (self.state.membrane[*left] - self.model.neurons.threshold[*left]).clamp(0.0, 1.0);
-            right_activation.total_cmp(&left_activation).then_with(|| {
-                rotated_tie_key(*left, tick_rotation, neuron_count).cmp(&rotated_tie_key(
-                    *right,
-                    tick_rotation,
-                    neuron_count,
-                ))
-            })
-        });
-
         let global_cap = self.model.config.model.max_active_global;
-        self.population_selection_cutoff = if self.active.len() > global_cap {
-            let cutoff_neuron = self.active[global_cap];
-            (self.state.membrane[cutoff_neuron] - self.model.neurons.threshold[cutoff_neuron])
-                .clamp(0.0, self.model.config.dynamics.population_inhibition_max)
+        let block_capacity = self
+            .model
+            .config
+            .model
+            .block_count
+            .saturating_mul(block_limit);
+        let redundant_global_topk = global_cap >= block_capacity;
+        let global_cap_clipped_neurons = if redundant_global_topk {
+            // No set member can be removed when the sum of all local winner
+            // capacities is already <= the global cap. Preserve the same winner
+            // set and deterministic block/local-rank order without an O(K log K)
+            // global ranking pass.
+            self.population_selection_cutoff = 0.0;
+            0
         } else {
-            0.0
+            self.active.sort_unstable_by(|left, right| {
+                let right_activation = (self.state.membrane[*right]
+                    - self.model.neurons.threshold[*right])
+                    .clamp(0.0, 1.0);
+                let left_activation = (self.state.membrane[*left]
+                    - self.model.neurons.threshold[*left])
+                    .clamp(0.0, 1.0);
+                right_activation.total_cmp(&left_activation).then_with(|| {
+                    rotated_tie_key(*left, tick_rotation, neuron_count).cmp(&rotated_tie_key(
+                        *right,
+                        tick_rotation,
+                        neuron_count,
+                    ))
+                })
+            });
+            self.population_selection_cutoff = if self.active.len() > global_cap {
+                let cutoff_neuron = self.active[global_cap];
+                (self.state.membrane[cutoff_neuron] - self.model.neurons.threshold[cutoff_neuron])
+                    .clamp(0.0, self.model.config.dynamics.population_inhibition_max)
+            } else {
+                0.0
+            };
+            let clipped = self.active.len().saturating_sub(global_cap);
+            if clipped > 0 {
+                self.active.truncate(global_cap);
+            }
+            clipped
         };
-        let global_cap_clipped_neurons = self.active.len().saturating_sub(global_cap);
-        if global_cap_clipped_neurons > 0 {
-            self.active.truncate(global_cap);
-        }
         self.update_population_inhibition(self.active.len());
 
         for &neuron in &self.active {
@@ -1174,57 +1205,65 @@ impl Runtime {
         self.errors.copy_from_slice(&self.probabilities);
         self.errors[target_output_index] -= 1.0;
         let supervised_strength = strength * target_weight;
+        let (plasticity_scale, next_plasticity_phase) = self.model.config.learning.plasticity_step(
+            self.plasticity_phase,
+            target_output_index == END_DOCUMENT_OUTPUT_INDEX,
+        );
         let neuron_count = self.model.neuron_count();
 
+        // Destination membership is tick-local. Clear prior marks every
+        // supervised step even when recurrent/input plasticity is deferred.
         for &neuron in &self.learning_destinations {
             self.learning_signal[neuron] = 0.0;
             self.learning_destination_mark[neuron] = false;
         }
         self.learning_destinations.clear();
 
-        let mut index = 0usize;
-        while index < self.eligible_recurrent_slots.len() {
-            let slot = self.eligible_recurrent_slots[index];
-            let destination = self.model.recurrent.target_neuron[slot] as usize;
-            self.add_learning_destination(destination);
-            index += 1;
-        }
-        index = 0;
-        while index < self.eligible_input_slots.len() {
-            let slot = self.eligible_input_slots[index];
-            let destination = self.model.input.targets[slot] as usize;
-            self.add_learning_destination(destination);
-            index += 1;
-        }
-        index = 0;
-        while index < self.active.len() {
-            let destination = self.active[index];
-            self.add_learning_destination(destination);
-            index += 1;
-        }
-
-        for &neuron in &self.learning_destinations {
-            let cache_row = neuron * OUTPUT_CLASSES;
-            let mut signal = 0.0f32;
-            for output in 0..OUTPUT_CLASSES {
-                signal += self.output_weights_by_neuron[cache_row + output] * self.errors[output];
+        if plasticity_scale > 0.0 {
+            let mut index = 0usize;
+            while index < self.eligible_recurrent_slots.len() {
+                let slot = self.eligible_recurrent_slots[index];
+                let destination = self.model.recurrent.target_neuron[slot] as usize;
+                self.add_learning_destination(destination);
+                index += 1;
+            }
+            index = 0;
+            while index < self.eligible_input_slots.len() {
+                let slot = self.eligible_input_slots[index];
+                let destination = self.model.input.targets[slot] as usize;
+                self.add_learning_destination(destination);
+                index += 1;
+            }
+            index = 0;
+            while index < self.active.len() {
+                let destination = self.active[index];
+                self.add_learning_destination(destination);
+                index += 1;
             }
 
-            #[cfg(debug_assertions)]
-            {
-                let mut reference = 0.0f32;
+            for &neuron in &self.learning_destinations {
+                let cache_row = neuron * OUTPUT_CLASSES;
+                let mut signal = 0.0f32;
                 for output in 0..OUTPUT_CLASSES {
-                    reference += self.model.output.weights[output * neuron_count + neuron]
-                        * self.errors[output];
+                    signal +=
+                        self.output_weights_by_neuron[cache_row + output] * self.errors[output];
                 }
-                debug_assert!((reference - signal).abs() <= 1.0e-5);
+
+                #[cfg(debug_assertions)]
+                {
+                    let mut reference = 0.0f32;
+                    for output in 0..OUTPUT_CLASSES {
+                        reference += self.model.output.weights[output * neuron_count + neuron]
+                            * self.errors[output];
+                    }
+                    debug_assert!((reference - signal).abs() <= 1.0e-5);
+                }
+                self.learning_signal[neuron] = signal;
             }
-            self.learning_signal[neuron] = signal;
         }
 
-        // The combined softmax error is the residual left after exact context has
-        // contributed its logits. Context dropout periodically makes this the pure
-        // neural error, preventing the recurrent pathway from being starved.
+        // Direct readout/context supervision remains immediate on every target.
+        // Formula v2 only consolidates recurrent/input credit assignment.
         let output_learning_rate = self.model.config.learning.output_learning_rate;
         let maximum_update = self.model.config.learning.max_update;
         let weight_min = self.model.config.learning.weight_min;
@@ -1264,9 +1303,15 @@ impl Runtime {
         }
 
         let mut metrics = LearningUpdateMetrics::default();
-        self.update_recurrent_synapses(supervised_strength, &mut metrics)?;
-        self.update_input_synapses(supervised_strength, &mut metrics)?;
+        if plasticity_scale > 0.0 {
+            let consolidated_strength = supervised_strength * plasticity_scale;
+            self.update_recurrent_synapses(consolidated_strength, &mut metrics)?;
+            self.update_input_synapses(consolidated_strength, &mut metrics)?;
+        }
+        // Inhibitory homeostasis remains per-step; it is a local activity
+        // regulator rather than delayed supervised credit assignment.
         self.apply_inhibitory_homeostasis(strength)?;
+        self.plasticity_phase = next_plasticity_phase;
         Ok(metrics)
     }
 

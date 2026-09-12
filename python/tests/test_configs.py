@@ -28,14 +28,14 @@ EXPECTED_FIELDS = {
         "eligibility_decay", "eligibility_epsilon", "surrogate_width",
         "surrogate_gain", "max_update", "weight_min", "weight_max",
         "provisional_strength", "training_strength", "verified_strength",
-        "end_document_weight",
+        "plasticity_window", "end_document_weight",
     },
     "context": {
         "embedding_dim", "max_order", "slots_per_order", "probe_limit", "learning_rate",
         "confidence_observations", "dropout_rate",
     },
     "replay": {
-        "fraction", "segment_bytes", "teaching_replays", "max_verified_replays",
+        "fraction", "segment_bytes", "stateful_batch", "teaching_replays", "max_verified_replays",
     },
     "training": {
         "max_dataset_passes", "validate_every_bytes", "checkpoint_every_bytes",

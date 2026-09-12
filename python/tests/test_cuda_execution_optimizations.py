@@ -571,6 +571,7 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
             "LEO_MULTI_GPU_PARALLEL_REPLAY": "1",
             "LEO_CUDA_SHARED_PERSISTENT": "0",
             "LEO_CUDA_SHARED_GROUPED": "0",
+            "LEO_CUDA_STORY_LOCAL_BLOCKS": "1",
             "LEO_CUDA_DEVICE_BATCH_MERGE": "0",
             "LEO_CUDA_DEVICE_STORY_STEPS": "0",
             "LEO_CUDA_DEVICE_STORY_POSTPROCESS": "0",
@@ -622,6 +623,7 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("--legacy-execution", scaling)
         self.assertIn("unset LEO_REPLAY_STREAMING", gpu_gate)
         self.assertIn("unset LEO_MULTI_GPU_PARALLEL_REPLAY", gpu_gate)
+        self.assertIn("unset LEO_CUDA_STORY_LOCAL_BLOCKS", gpu_gate)
         self.assertIn("unset LEO_CUDA_FULL_STEP_METRICS", gpu_gate)
         self.assertIn("--counts 1,2", gpu_gate)
         self.assertIn("final-state conformance gate", gpu_gate)
@@ -744,7 +746,7 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("atomicAdd(&counters->eligible_recurrent, 1U);", recurrent)
         self.assertIn("atomicAdd(&counters->eligible_input, 1U);", input_body)
 
-    def test_streaming_replay_is_opt_in_and_classic_replay_remains_default(self):
+    def test_formula_v2_stateful_replay_is_config_driven_with_classic_default(self):
         training = (ROOT / "crates/leo-cli/src/training.rs").read_text()
         backend = (ROOT / "crates/leo-core/src/backend.rs").read_text()
         rust = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
@@ -753,6 +755,7 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         flag = training.split("fn replay_streaming_enabled", 1)[1].split(
             "#[derive(Debug, Clone, Copy, Default)]", 1
         )[0]
+        self.assertIn("runtime.model().config.replay.stateful_batch", flag)
         self.assertIn("LEO_REPLAY_STREAMING", flag)
         self.assertIn(".unwrap_or(false)", flag)
 
@@ -767,13 +770,13 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("fn replay_streaming_batch", backend)
         self.assertIn("pub(crate) fn replay_streaming_batch", rust)
         self.assertIn("target_index: -2", rust)
-        self.assertIn("const bool frozen_advance = step.target_index == -2", kernels)
+        self.assertIn("const bool frozen_advance = MIXED_SCHEDULE && step.target_index == -2", kernels)
         self.assertIn("leo_p_context_advance_history", kernels)
 
         policy = training.split("fn apply_replay_policy", 1)[1].split(
             "fn apply_batch_replay_policy", 1
         )[0]
-        self.assertIn("replay_streaming_enabled()", policy)
+        self.assertIn("replay_streaming_enabled(runtime)", policy)
         self.assertIn("replay_ranges_streaming", policy)
         self.assertIn("replay_target_range_impl", policy)
         self.assertIn("runtime.model().config.replay.fraction", policy)
@@ -793,6 +796,32 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("device_story_postprocess_observed", gpu_gate)
         self.assertIn("device_story_postprocess=true", gpu_gate)
         self.assertIn("training_state_sha256", gpu_gate)
+
+    def test_formula_v2_core_contracts_are_wired_through_cpu_and_cuda(self):
+        config = (ROOT / "crates/leo-core/src/config.rs").read_text()
+        runtime = (ROOT / "crates/leo-core/src/runtime.rs").read_text()
+        training = (ROOT / "crates/leo-cli/src/training.rs").read_text()
+        rust = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+        tiny = (ROOT / "configs/tinystories.toml").read_text()
+
+        self.assertIn("pub plasticity_window: usize", config)
+        self.assertIn("pub stateful_batch: bool", config)
+        self.assertIn("plasticity_window = 4", tiny)
+        self.assertIn("stateful_batch = true", tiny)
+        self.assertIn("plasticity_phase: usize", runtime)
+        self.assertIn("self.plasticity_phase = 0", runtime)
+        self.assertIn(".plasticity_step(", runtime)
+        self.assertIn("plasticity_phase: usize", rust)
+        self.assertIn("self.plasticity_phase = 0", rust)
+        self.assertIn("redundant_global_topk", runtime)
+        self.assertIn("cfg->max_active_global >= available", kernels)
+        self.assertIn("runtime.model().config.replay.stateful_batch", training)
+        self.assertIn("plasticity_scale", runtime)
+        self.assertIn("plasticity_scale: f32", rust)
+        self.assertIn("float plasticity_scale", kernels)
+        self.assertIn("plasticity_commit", kernels)
+        self.assertIn("plasticity_strength", kernels)
 
     def test_grouped_shared_wavefront_parallelizes_each_logical_lane(self):
         rust = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
@@ -1117,6 +1146,58 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertNotIn(
             "training_step_batch(&[(BEGIN_DOCUMENT, Some(story[0] as u32))]", replay
         )
+
+    def test_frozen_prefix_selector_skips_learning_worklist_and_parallelizes_state_writes(self):
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+
+        frozen_selector = kernels.split("leo_p_select_global_frozen", 1)[1].split(
+            "leo_p_cache_surrogate_work", 1
+        )[0]
+        frozen_kernel = kernels.split("leo_advance_frozen_cooperative_body", 1)[1].split(
+            'extern "C" __global__ void leo_advance_frozen_cooperative', 1
+        )[0]
+
+        self.assertIn("leo_p_select_global_impl<false, true>", frozen_selector)
+        self.assertIn("PARALLEL_SELECTED_WRITES", kernels)
+        self.assertIn("for (unsigned int index = lane; index < kept; index += blockDim.x)", kernels)
+        self.assertIn("leo_p_select_global_frozen", frozen_kernel)
+        self.assertIn("__shared__ unsigned int shared_selected_count", frozen_kernel)
+        self.assertIn("leo_p_deliver_events(pointers, tick, false, nullptr, nullptr)", frozen_kernel)
+        self.assertIn("leo_p_inject_symbol(pointers, tick, symbol, false, nullptr, nullptr)", frozen_kernel)
+
+    def test_fast_replay_kernel_specializes_away_mixed_streaming_schedule(self):
+        rust = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+
+        fast = kernels.split('extern "C" __global__ void leo_train_cooperative_fast', 1)[1].split(
+            'extern "C" __global__ void leo_train_cooperative_profiled', 1
+        )[0]
+        general = kernels.split('extern "C" __global__ void leo_train_cooperative(', 1)[1].split(
+            'extern "C" __global__ void leo_train_cooperative_fast', 1
+        )[0]
+        streaming = rust.split("pub(crate) fn replay_streaming_batch", 1)[1].split(
+            "fn training_step_batch_noncooperative", 1
+        )[0]
+
+        self.assertIn("leo_train_cooperative_body<false, true, false>", fast)
+        self.assertIn("leo_train_cooperative_body<false, false, true>", general)
+        self.assertIn("self.shared.kernels.train_cooperative,", streaming)
+        self.assertNotIn("self.shared.kernels.train_cooperative_fast", streaming)
+
+    def test_story_local_block_executor_reuses_existing_exact_kernel_as_opt_in_ab(self):
+        rust = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+
+        self.assertIn("LEO_CUDA_STORY_LOCAL_BLOCKS", rust)
+        self.assertIn("fn cuda_story_local_blocks_enabled", rust)
+        self.assertIn("kernels.train_story_batch", rust)
+        self.assertIn('"leo_train_story_batch"', rust)
+        story_kernel = kernels.split('extern "C" __global__ void leo_train_story_batch', 1)[1].split(
+            'extern "C" __global__ void leo_zero_u32', 1
+        )[0]
+        self.assertIn("const unsigned int lane = blockIdx.x", story_kernel)
+        self.assertIn("leo_train_story_block", story_kernel)
+        self.assertNotIn("cooperative_groups::this_grid().sync", story_kernel)
 
     def test_parallel_multi_gpu_replay_is_opt_in_and_keeps_budget_fp32(self):
         training = (ROOT / "crates/leo-cli/src/training.rs").read_text()

@@ -207,6 +207,15 @@ fn cuda_shared_grouped_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Exact A/B executor: one CUDA block owns one story lane and therefore never
+/// participates in cross-story whole-grid barriers.  The kernel already exists
+/// as Leo's story-local execution reference; this switch only exposes it for
+/// controlled P100 measurements.  It is opt-in until canonical benchmarks show
+/// whether removing lockstep outweighs the loss of intra-story CTA parallelism.
+fn cuda_story_local_blocks_enabled() -> bool {
+    env_flag("LEO_CUDA_STORY_LOCAL_BLOCKS")
+}
+
 fn cuda_device_story_steps_enabled() -> bool {
     !env::var("LEO_CUDA_DEVICE_STORY_STEPS")
         .ok()
@@ -393,6 +402,7 @@ struct CudaPersistentStep {
     target_index: i32,
     context_enabled: u32,
     supervised_strength: f32,
+    plasticity_scale: f32,
 }
 
 type CuDevice = c_int;
@@ -912,6 +922,7 @@ struct KernelFunctions {
     train_cooperative: CuFunction,
     train_cooperative_fast: CuFunction,
     train_cooperative_profiled: CuFunction,
+    train_story_batch: CuFunction,
     advance_frozen_persistent: CuFunction,
     advance_frozen_cooperative: CuFunction,
     advance_frozen_cooperative_profiled: CuFunction,
@@ -1547,6 +1558,7 @@ pub(crate) struct CudaRuntime {
     events: CudaRuntimeEvents,
     buffers: Buffers,
     current_tick: u64,
+    plasticity_phase: usize,
     probabilities: Vec<f32>,
     neural_logits: Vec<f32>,
     active: Vec<usize>,
@@ -2195,6 +2207,7 @@ impl CudaRuntime {
             events,
             buffers: Buffers::default(),
             current_tick: 0,
+            plasticity_phase: 0,
             probabilities: vec![0.0; OUTPUT_CLASSES],
             neural_logits: vec![0.0; OUTPUT_CLASSES],
             active: Vec::new(),
@@ -3199,6 +3212,7 @@ impl CudaRuntime {
         self.active.clear();
         self.activation.fill(0.0);
         self.persistent_document_activity = false;
+        self.plasticity_phase = 0;
         Ok(())
     }
 
@@ -3243,7 +3257,18 @@ impl CudaRuntime {
                 } else {
                     1.0
                 };
-                self.launch_learning(strength, strength * target_weight, context_enabled)?;
+                let (plasticity_scale, next_plasticity_phase) =
+                    self.model.config.learning.plasticity_step(
+                        self.plasticity_phase,
+                        target_output_index == END_DOCUMENT_OUTPUT_INDEX,
+                    );
+                self.launch_learning(
+                    strength,
+                    strength * target_weight,
+                    plasticity_scale,
+                    context_enabled,
+                )?;
+                self.plasticity_phase = next_plasticity_phase;
                 self.model.parameter_revision = self.model.parameter_revision.saturating_add(1);
                 self.output_bias_dirty_since_sync = true;
                 if context_enabled {
@@ -3322,6 +3347,7 @@ impl CudaRuntime {
                     target_index: -1,
                     context_enabled: 0,
                     supervised_strength: 0.0,
+                    plasticity_scale: 0.0,
                 });
             }
             let build_ms = build_started
@@ -3493,12 +3519,13 @@ impl CudaRuntime {
         }
 
         let learning_trace = !matches!(permission, Permission::Frozen);
-        let fast_metrics_requested = learning_trace && !self.full_step_metrics;
-        let production_capacity = if fast_metrics_requested {
-            self.shared.replay_fast_grid_blocks
-        } else {
-            self.shared.replay_grid_blocks
-        };
+        // The fast replay kernel is specialized for ordinary supervised target
+        // batches so the compiler can remove mixed frozen-schedule state and
+        // reduce register pressure.  Streaming replay is explicitly semantic-
+        // experimental and therefore uses the general mixed-schedule kernel
+        // and the full training-step record layout.
+        let fast_metrics_requested = false;
+        let production_capacity = self.shared.replay_grid_blocks;
         let cooperative_replay = self.replay_cooperative_enabled
             && self.shared.cooperative_launch
             && production_capacity > 0;
@@ -3535,6 +3562,7 @@ impl CudaRuntime {
             Vec::with_capacity(steps.iter().filter(|step| step.1.is_some()).count());
         let debug_chunks =
             self.debug.chunks || self.debug.sync || self.debug.transfers || self.debug.state;
+        let mut plasticity_phase = self.plasticity_phase;
 
         for (chunk_index, chunk) in steps.chunks(TRAINING_STEP_BATCH_CAPACITY).enumerate() {
             let chunk_started = debug_chunks.then(Instant::now);
@@ -3579,11 +3607,18 @@ impl CudaRuntime {
                         learned_steps = learned_steps.saturating_add(1);
                         context_learning |= context_enabled;
                     }
+                    let (plasticity_scale, next_plasticity_phase) =
+                        self.model.config.learning.plasticity_step(
+                            plasticity_phase,
+                            target_output_index == END_DOCUMENT_OUTPUT_INDEX,
+                        );
+                    plasticity_phase = next_plasticity_phase;
                     device_steps.push(CudaPersistentStep {
                         symbol,
                         target_index: target_output_index as i32,
                         context_enabled: u32::from(context_enabled),
                         supervised_strength: strength * target_weight,
+                        plasticity_scale,
                     });
                     metadata.push(Some((
                         symbol,
@@ -3597,6 +3632,7 @@ impl CudaRuntime {
                         target_index: -2,
                         context_enabled: 1,
                         supervised_strength: 0.0,
+                        plasticity_scale: 0.0,
                     });
                     metadata.push(None);
                 }
@@ -3633,8 +3669,7 @@ impl CudaRuntime {
 
             if self.debug.launches {
                 eprintln!(
-                    "{{\"event\":\"cuda_debug_launch\",\"scope\":\"streaming_replay_schedule\",\"kernel\":\"{}\",\"grid_blocks\":{},\"threads\":{},\"timeline_steps\":{},\"target_steps\":{},\"base_tick\":{}}}",
-                    if fast_metrics_requested { "leo_train_cooperative_fast" } else { "leo_train_cooperative" },
+                    "{{\"event\":\"cuda_debug_launch\",\"scope\":\"streaming_replay_schedule\",\"kernel\":\"leo_train_cooperative\",\"grid_blocks\":{},\"threads\":{},\"timeline_steps\":{},\"target_steps\":{},\"base_tick\":{}}}",
                     replay_blocks,
                     PERSISTENT_THREADS,
                     chunk.len(),
@@ -3644,11 +3679,7 @@ impl CudaRuntime {
             }
 
             self.launch_cooperative_exact(
-                if fast_metrics_requested {
-                    self.shared.kernels.train_cooperative_fast
-                } else {
-                    self.shared.kernels.train_cooperative
-                },
+                self.shared.kernels.train_cooperative,
                 replay_blocks,
                 PERSISTENT_THREADS,
                 &mut parameters,
@@ -3690,6 +3721,7 @@ impl CudaRuntime {
             }
 
             self.current_tick = self.current_tick.saturating_add(chunk.len() as u64);
+            self.plasticity_phase = plasticity_phase;
             self.model.parameter_revision =
                 self.model.parameter_revision.saturating_add(learned_steps);
             if learned_steps > 0 {
@@ -3819,7 +3851,18 @@ impl CudaRuntime {
                         } else {
                             1.0
                         };
-                        self.launch_learning(strength, strength * target_weight, context_enabled)?;
+                        let (plasticity_scale, next_plasticity_phase) =
+                            self.model.config.learning.plasticity_step(
+                                self.plasticity_phase,
+                                target_output_index == END_DOCUMENT_OUTPUT_INDEX,
+                            );
+                        self.launch_learning(
+                            strength,
+                            strength * target_weight,
+                            plasticity_scale,
+                            context_enabled,
+                        )?;
+                        self.plasticity_phase = next_plasticity_phase;
                         self.model.parameter_revision =
                             self.model.parameter_revision.saturating_add(1);
                         self.output_bias_dirty_since_sync = true;
@@ -3888,6 +3931,7 @@ impl CudaRuntime {
         let mut all_metrics = Vec::with_capacity(steps.len());
         let debug_chunks =
             self.debug.chunks || self.debug.sync || self.debug.transfers || self.debug.state;
+        let mut plasticity_phase = self.plasticity_phase;
 
         for (chunk_index, chunk) in steps.chunks(TRAINING_STEP_BATCH_CAPACITY).enumerate() {
             let chunk_started = debug_chunks.then(Instant::now);
@@ -3930,11 +3974,20 @@ impl CudaRuntime {
                     learned_steps = learned_steps.saturating_add(1);
                     context_learning |= context_enabled;
                 }
+                let plasticity_scale = target_index.map_or(0.0, |target_output_index| {
+                    let (scale, next_phase) = self.model.config.learning.plasticity_step(
+                        plasticity_phase,
+                        target_output_index == END_DOCUMENT_OUTPUT_INDEX,
+                    );
+                    plasticity_phase = next_phase;
+                    scale
+                });
                 device_steps.push(CudaPersistentStep {
                     symbol,
                     target_index: target_index.map(|index| index as i32).unwrap_or(-1),
                     context_enabled: u32::from(context_enabled),
                     supervised_strength,
+                    plasticity_scale,
                 });
                 metadata.push((symbol, target_index, context_enabled, learned));
             }
@@ -4115,6 +4168,7 @@ impl CudaRuntime {
                 );
             }
             self.current_tick = self.current_tick.saturating_add(chunk.len() as u64);
+            self.plasticity_phase = plasticity_phase;
             self.model.parameter_revision =
                 self.model.parameter_revision.saturating_add(learned_steps);
             if learned_steps > 0 {
@@ -4883,6 +4937,7 @@ impl CudaRuntime {
         &mut self,
         strength: f32,
         supervised_strength: f32,
+        plasticity_scale: f32,
         context_enabled: bool,
     ) -> LeoResult<()> {
         let b = self.buffers;
@@ -4895,26 +4950,29 @@ impl CudaRuntime {
         let mut errors = b.errors.pointer;
         let mut destination_epoch = b.learning_destination_epoch.pointer;
         let mut learning_signal = b.learning_signal.pointer;
-        let mut signal_params = [
-            param(&mut cfg),
-            param(&mut tick),
-            param(&mut output_weight),
-            param(&mut errors),
-            param(&mut destination_epoch),
-            param(&mut learning_signal),
-        ];
-        self.launch(
-            self.shared.kernels.learning_signals,
-            neuron_count,
-            THREADS,
-            &mut signal_params,
-        )?;
+        if plasticity_scale > 0.0 {
+            let mut signal_params = [
+                param(&mut cfg),
+                param(&mut tick),
+                param(&mut output_weight),
+                param(&mut errors),
+                param(&mut destination_epoch),
+                param(&mut learning_signal),
+            ];
+            self.launch(
+                self.shared.kernels.learning_signals,
+                neuron_count,
+                THREADS,
+                &mut signal_params,
+            )?;
+        }
 
         let mut output_bias = b.output_bias.pointer;
         let mut active = b.active.pointer;
         let mut active_value = b.active_value.pointer;
         let mut active_count = b.active_count.pointer;
         let mut supervised = supervised_strength;
+        let mut plasticity_strength = supervised_strength * plasticity_scale;
         let mut changed_output_marks = b.changed_output_marks.pointer;
         let mut changed_output_list = b.changed_output_list.pointer;
         let mut changed_output_count = b.changed_output_count.pointer;
@@ -5012,19 +5070,21 @@ impl CudaRuntime {
             param(&mut rec_eligible_list),
             param(&mut rec_eligible_count),
             param(&mut learning_signal),
-            param(&mut supervised),
+            param(&mut plasticity_strength),
             param(&mut changed_rec_marks),
             param(&mut changed_rec_list),
             param(&mut changed_rec_count),
             param(&mut counters),
             param(&mut error_flag),
         ];
-        self.launch(
-            self.shared.kernels.update_recurrent_weights,
-            recurrent_count.min(SPARSE_LIST_WORK_ITEMS),
-            THREADS,
-            &mut recurrent_params,
-        )?;
+        if plasticity_scale > 0.0 {
+            self.launch(
+                self.shared.kernels.update_recurrent_weights,
+                recurrent_count.min(SPARSE_LIST_WORK_ITEMS),
+                THREADS,
+                &mut recurrent_params,
+            )?;
+        }
 
         let mut input_target = b.input_target.pointer;
         let mut input_weight = b.input_weight.pointer;
@@ -5042,19 +5102,21 @@ impl CudaRuntime {
             param(&mut input_eligible_list),
             param(&mut input_eligible_count),
             param(&mut learning_signal),
-            param(&mut supervised),
+            param(&mut plasticity_strength),
             param(&mut changed_input_marks),
             param(&mut changed_input_list),
             param(&mut changed_input_count),
             param(&mut counters),
             param(&mut error_flag),
         ];
-        self.launch(
-            self.shared.kernels.update_input_weights,
-            input_count.min(SPARSE_LIST_WORK_ITEMS),
-            THREADS,
-            &mut input_params,
-        )?;
+        if plasticity_scale > 0.0 {
+            self.launch(
+                self.shared.kernels.update_input_weights,
+                input_count.min(SPARSE_LIST_WORK_ITEMS),
+                THREADS,
+                &mut input_params,
+            )?;
+        }
 
         let mut activation = b.activation.pointer;
         let active_capacity = self.model.config.model.max_active_global;
@@ -7595,6 +7657,7 @@ struct PersistentWavefrontLaunch {
     blocks_per_lane: u32,
     extra_lane_blocks: u32,
     grouped: bool,
+    story_local: bool,
     phase_profile_sampled: bool,
     phase_profile_geometry_skipped: bool,
     normal_capacity_blocks: u32,
@@ -7659,6 +7722,40 @@ fn launch_shared_wavefront_persistent_chunk(
     let mut raw_strength = strength;
     let mut scale = batch_scale;
     let mut delta_pointers = coordinator.buffers.batch_delta_pointer_table.pointer;
+
+    if cuda_story_local_blocks_enabled() && !phase_profile {
+        // Reuse Leo's existing exact one-block-per-story kernel as an A/B path.
+        // Each lane has its own persistent model replica, so story trajectories
+        // remain independent and the canonical host/device merge that follows
+        // this launch is unchanged.  No cross-story grid barrier is required.
+        let grid_blocks = lane_count.max(1);
+        let mut parameters = [
+            param(&mut pointer_tables_ptr),
+            param(&mut step_buffers_ptr),
+            param(&mut step_counts_ptr),
+            param(&mut base_ticks_ptr),
+            param(&mut lane_count_value),
+            param(&mut learning_value),
+            param(&mut raw_strength),
+        ];
+        coordinator.launch_exact(
+            coordinator.shared.kernels.train_story_batch,
+            grid_blocks,
+            SHARED_BATCH_THREADS,
+            &mut parameters,
+        )?;
+        return Ok(PersistentWavefrontLaunch {
+            grid_blocks,
+            blocks_per_lane: 1,
+            extra_lane_blocks: 0,
+            grouped: false,
+            story_local: true,
+            phase_profile_sampled: false,
+            phase_profile_geometry_skipped: false,
+            normal_capacity_blocks: lane_count,
+            profiled_capacity_blocks: 0,
+        });
+    }
 
     if grouped_blocks_per_lane > 0 {
         // The grouped kernel is one cooperative whole-grid launch. Every CTA
@@ -7735,6 +7832,7 @@ fn launch_shared_wavefront_persistent_chunk(
             blocks_per_lane: grouped_blocks_per_lane,
             extra_lane_blocks,
             grouped: true,
+            story_local: false,
             phase_profile_sampled,
             phase_profile_geometry_skipped,
             normal_capacity_blocks: coordinator.shared.shared_grouped_blocks_256,
@@ -7769,6 +7867,7 @@ fn launch_shared_wavefront_persistent_chunk(
         blocks_per_lane: 1,
         extra_lane_blocks: 0,
         grouped: false,
+        story_local: false,
         phase_profile_sampled: false,
         phase_profile_geometry_skipped: phase_profile,
         normal_capacity_blocks: coordinator.shared.shared_persistent_blocks_256,
@@ -8156,6 +8255,10 @@ fn launch_device_story_step_builder(
     let mut context_dropout_rate = coordinator.model.config.context.dropout_rate;
     let mut strength_value = strength;
     let mut end_document_weight = coordinator.model.config.learning.end_document_weight;
+    let mut plasticity_window = as_u32(
+        "plasticity window",
+        coordinator.model.config.learning.plasticity_window,
+    )?;
     let mut parameters = [
         param(&mut story_bytes),
         param(&mut story_byte_stride),
@@ -8167,6 +8270,7 @@ fn launch_device_story_step_builder(
         param(&mut context_dropout_rate),
         param(&mut strength_value),
         param(&mut end_document_weight),
+        param(&mut plasticity_window),
     ];
     coordinator.launch_exact(
         coordinator.shared.kernels.build_shared_story_steps,
@@ -8520,11 +8624,24 @@ pub(crate) fn train_story_batch_shared_device(
                             lane_learned_steps[lane_index].saturating_add(1);
                         lane_context_learning[lane_index] |= context_enabled;
                     }
+                    let plasticity_scale = target_index.map_or(0.0, |target_output_index| {
+                        coordinator
+                            .model
+                            .config
+                            .learning
+                            .plasticity_step(
+                                start.saturating_add(record_index)
+                                    % coordinator.model.config.learning.plasticity_window.max(1),
+                                target_output_index == END_DOCUMENT_OUTPUT_INDEX,
+                            )
+                            .0
+                    });
                     device_steps.push(CudaPersistentStep {
                         symbol,
                         target_index: target_index.map(|index| index as i32).unwrap_or(-1),
                         context_enabled: u32::from(context_enabled),
                         supervised_strength,
+                        plasticity_scale,
                     });
                     lane_metadata.push((symbol, target_index, context_enabled, learned));
                 }
@@ -8696,6 +8813,8 @@ pub(crate) fn train_story_batch_shared_device(
                             "leo_shared_wavefront_persistent_grouped_profiled"
                         } else if persistent_launch.grouped {
                             "leo_shared_wavefront_persistent_grouped"
+                        } else if persistent_launch.story_local {
+                            "leo_train_story_batch"
                         } else {
                             "leo_shared_wavefront_persistent"
                         };
@@ -9458,6 +9577,7 @@ fn load_kernels(driver: &DriverFunctions, module: CuModule) -> LeoResult<KernelF
         train_cooperative: get_kernel(driver, module, "leo_train_cooperative")?,
         train_cooperative_fast: get_kernel(driver, module, "leo_train_cooperative_fast")?,
         train_cooperative_profiled: get_kernel(driver, module, "leo_train_cooperative_profiled")?,
+        train_story_batch: get_kernel(driver, module, "leo_train_story_batch")?,
         advance_frozen_persistent: get_kernel(driver, module, "leo_advance_frozen_persistent")?,
         advance_frozen_cooperative: get_kernel(driver, module, "leo_advance_frozen_cooperative")?,
         advance_frozen_cooperative_profiled: get_kernel(
