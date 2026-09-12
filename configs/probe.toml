@@ -44,6 +44,7 @@ provisional_strength = 0.20
 training_strength = 1.0
 verified_strength = 1.0
 plasticity_window = 1
+plasticity_confidence_threshold = 1.00
 end_document_weight = 4.0
 
 [context]

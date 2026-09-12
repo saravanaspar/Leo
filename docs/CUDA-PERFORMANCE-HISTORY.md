@@ -1334,3 +1334,42 @@ The canonical replay policy also selected only `3353` replay targets while execu
 ### Acceptance contract for Formula v2
 
 Do **not** compare Formula-v2 state hashes to the historical v1 hashes.  Acceptance requires: repeatable Formula-v2 hashes across repeated runs; CPU/GPU agreement for the same Formula-v2 config where the existing conformance harness applies; no regression in validation bits-per-byte/generation/recurrent-memory probes; and a material P100 throughput gain.  No speed or quality improvement is claimed until those P100 and training-quality measurements exist.
+
+### Formula-v2 window sweep and W8 lock — P100 evidence
+
+After Formula-v2 stabilized at a clean W4 canonical result near `3507.07 steps/s`,
+the same 16-story benchmark produced `3843.52 steps/s` at W8 and `4038.44
+steps/s` at W16. The longer 1024-story quality run reversed the W8/W16 short-run
+ranking: W8 completed train+validation in `568.38 s` versus `577.53 s` for W16.
+W8 also produced the better held-out likelihood (`3.32556 bits/byte`) versus W4
+`3.33133` and W16 `3.34375`; the v1 reference was `3.31282`. W8 is therefore the
+locked TinyStories consolidation window for the next formula experiment.
+
+At the end of the 1024-story run W8 averaged about `40.85` active neurons and
+`1963.26` recurrent events/byte on held-out evaluation, while W16 averaged about
+`45.45` active neurons and `2183.83` recurrent events/byte. That extra mature
+activity helps explain why W16's lower consolidation frequency did not translate
+into a lower full-run wall time.
+
+## Formula-v3 experiment — surprise-gated consolidation
+
+Formula v3 keeps W8 but stops treating every scheduled consolidation boundary as
+equally informative. TinyStories sets `learning.plasticity_confidence_threshold =
+0.50`. On a W8 boundary, recurrent/input learning-signal construction and weight
+updates execute only if the just-computed target probability is below 50%;
+end-document remains unconditional. Eligibility traces, direct output/context
+supervision, replay selection, and homeostasis retain their Formula-v2 behavior.
+
+The CPU reference uses the already-normalized target probability. CUDA carries
+the same threshold in the persistent step descriptor and evaluates it after the
+forward softmax, before learning-signal construction, so the production path does
+not require a host probability round-trip. Non-persistent CUDA reference paths
+read the target probability only at scheduled consolidation boundaries.
+`test.toml` and `probe.toml` use threshold `1.00`, which preserves the existing
+Formula-v2 consolidation schedule for exact/conformance gates.
+
+This change intentionally creates a new training-state hash. Acceptance requires
+repeatability, CPU/GPU agreement for the same gated config, a P100 throughput
+improvement over the locked W8 reference, and held-out/generation quality that
+meets the project bar. Adaptive replay and a tighter activity-budget formula are
+not part of this tranche; isolate the confidence gate first.

@@ -92,6 +92,11 @@ pub struct LearningConfig {
     /// A value of 1 preserves the v1 immediate-plasticity rule.
     #[serde(default = "default_plasticity_window")]
     pub plasticity_window: usize,
+    /// Confidence cutoff for scheduled recurrent/input consolidation. Target
+    /// probabilities below this value remain plastic; `1.0` preserves legacy
+    /// behavior while lower values make plasticity surprise-driven.
+    #[serde(default = "default_plasticity_confidence_threshold")]
+    pub plasticity_confidence_threshold: f32,
     /// Extra supervised weight for the rare end-of-document target.
     pub end_document_weight: f32,
 }
@@ -130,6 +135,10 @@ fn default_plasticity_window() -> usize {
     1
 }
 
+fn default_plasticity_confidence_threshold() -> f32 {
+    1.0
+}
+
 impl LearningConfig {
     /// Return the recurrent/input consolidation scale and next transient phase.
     /// `phase` counts supervised learning steps since the last consolidation or
@@ -141,6 +150,29 @@ impl LearningConfig {
             (step as f32, 0)
         } else {
             (0.0, step)
+        }
+    }
+
+    /// Gate an already-scheduled recurrent/input consolidation using the model's
+    /// target confidence. End-of-document remains an unconditional boundary.
+    pub(crate) fn gate_plasticity_scale(
+        &self,
+        scheduled_scale: f32,
+        target_probability: f32,
+        end_document: bool,
+    ) -> f32 {
+        if scheduled_scale <= 0.0
+            || end_document
+            || self.plasticity_confidence_threshold >= 1.0
+        {
+            return scheduled_scale;
+        }
+        if !target_probability.is_finite()
+            || target_probability < self.plasticity_confidence_threshold
+        {
+            scheduled_scale
+        } else {
+            0.0
         }
     }
 }
@@ -204,6 +236,7 @@ impl Default for Config {
                 training_strength: 1.00,
                 verified_strength: 1.00,
                 plasticity_window: 1,
+                plasticity_confidence_threshold: 1.0,
                 end_document_weight: 4.0,
             },
             context: ContextConfig {
@@ -413,6 +446,14 @@ impl Config {
                 "learning.plasticity_window must be in 1..=64",
             ));
         }
+        if !self.learning.plasticity_confidence_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.learning.plasticity_confidence_threshold)
+            || self.learning.plasticity_confidence_threshold == 0.0
+        {
+            return Err(LeoError::configuration(
+                "learning.plasticity_confidence_threshold must be finite and in (0, 1]",
+            ));
+        }
 
         if !self.learning.end_document_weight.is_finite()
             || !(1.0..=16.0).contains(&self.learning.end_document_weight)
@@ -539,6 +580,7 @@ mod tests {
         config.context.dropout_rate = 0.25;
         config.learning.end_document_weight = 6.0;
         config.learning.plasticity_window = 4;
+        config.learning.plasticity_confidence_threshold = 0.5;
         config.replay.segment_bytes = 32;
         config.replay.stateful_batch = true;
 
@@ -552,8 +594,37 @@ mod tests {
         assert_eq!(decoded.context.dropout_rate, 0.25);
         assert_eq!(decoded.learning.end_document_weight, 6.0);
         assert_eq!(decoded.learning.plasticity_window, 4);
+        assert_eq!(decoded.learning.plasticity_confidence_threshold, 0.5);
         assert_eq!(decoded.replay.segment_bytes, 32);
         assert!(decoded.replay.stateful_batch);
+    }
+
+    #[test]
+    fn surprise_gate_preserves_schedule_for_low_confidence_and_document_end() {
+        let mut config = Config::default();
+        config.learning.plasticity_confidence_threshold = 0.5;
+
+        assert_eq!(
+            config.learning.gate_plasticity_scale(8.0, 0.49, false),
+            8.0
+        );
+        assert_eq!(
+            config.learning.gate_plasticity_scale(8.0, 0.75, false),
+            0.0
+        );
+        assert_eq!(
+            config.learning.gate_plasticity_scale(3.0, 0.99, true),
+            3.0
+        );
+        assert_eq!(
+            config.learning.gate_plasticity_scale(0.0, 0.10, false),
+            0.0
+        );
+        config.learning.plasticity_confidence_threshold = 1.0;
+        assert_eq!(
+            config.learning.gate_plasticity_scale(8.0, 1.0, false),
+            8.0
+        );
     }
 
     #[test]

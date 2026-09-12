@@ -1205,9 +1205,16 @@ impl Runtime {
         self.errors.copy_from_slice(&self.probabilities);
         self.errors[target_output_index] -= 1.0;
         let supervised_strength = strength * target_weight;
-        let (plasticity_scale, next_plasticity_phase) = self.model.config.learning.plasticity_step(
-            self.plasticity_phase,
-            target_output_index == END_DOCUMENT_OUTPUT_INDEX,
+        let end_document = target_output_index == END_DOCUMENT_OUTPUT_INDEX;
+        let (scheduled_plasticity_scale, next_plasticity_phase) =
+            self.model
+                .config
+                .learning
+                .plasticity_step(self.plasticity_phase, end_document);
+        let plasticity_scale = self.model.config.learning.gate_plasticity_scale(
+            scheduled_plasticity_scale,
+            self.probabilities[target_output_index],
+            end_document,
         );
         let neuron_count = self.model.neuron_count();
 
@@ -1263,7 +1270,8 @@ impl Runtime {
         }
 
         // Direct readout/context supervision remains immediate on every target.
-        // Formula v2 only consolidates recurrent/input credit assignment.
+        // Formula v3 consolidates recurrent/input credit assignment only on
+        // scheduled targets that remain surprising.
         let output_learning_rate = self.model.config.learning.output_learning_rate;
         let maximum_update = self.model.config.learning.max_update;
         let weight_min = self.model.config.learning.weight_min;

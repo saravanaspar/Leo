@@ -403,6 +403,7 @@ struct CudaPersistentStep {
     context_enabled: u32,
     supervised_strength: f32,
     plasticity_scale: f32,
+    plasticity_confidence_threshold: f32,
 }
 
 type CuDevice = c_int;
@@ -3257,11 +3258,17 @@ impl CudaRuntime {
                 } else {
                     1.0
                 };
-                let (plasticity_scale, next_plasticity_phase) =
-                    self.model.config.learning.plasticity_step(
-                        self.plasticity_phase,
-                        target_output_index == END_DOCUMENT_OUTPUT_INDEX,
-                    );
+                let end_document = target_output_index == END_DOCUMENT_OUTPUT_INDEX;
+                let (scheduled_plasticity_scale, next_plasticity_phase) =
+                    self.model
+                        .config
+                        .learning
+                        .plasticity_step(self.plasticity_phase, end_document);
+                let plasticity_scale = self.gate_plasticity_scale_from_device(
+                    scheduled_plasticity_scale,
+                    target_output_index,
+                    end_document,
+                )?;
                 self.launch_learning(
                     strength,
                     strength * target_weight,
@@ -3348,6 +3355,11 @@ impl CudaRuntime {
                     context_enabled: 0,
                     supervised_strength: 0.0,
                     plasticity_scale: 0.0,
+                    plasticity_confidence_threshold: self
+                        .model
+                        .config
+                        .learning
+                        .plasticity_confidence_threshold,
                 });
             }
             let build_ms = build_started
@@ -3619,6 +3631,11 @@ impl CudaRuntime {
                         context_enabled: u32::from(context_enabled),
                         supervised_strength: strength * target_weight,
                         plasticity_scale,
+                        plasticity_confidence_threshold: self
+                            .model
+                            .config
+                            .learning
+                            .plasticity_confidence_threshold,
                     });
                     metadata.push(Some((
                         symbol,
@@ -3633,6 +3650,11 @@ impl CudaRuntime {
                         context_enabled: 1,
                         supervised_strength: 0.0,
                         plasticity_scale: 0.0,
+                        plasticity_confidence_threshold: self
+                            .model
+                            .config
+                            .learning
+                            .plasticity_confidence_threshold,
                     });
                     metadata.push(None);
                 }
@@ -3851,11 +3873,17 @@ impl CudaRuntime {
                         } else {
                             1.0
                         };
-                        let (plasticity_scale, next_plasticity_phase) =
-                            self.model.config.learning.plasticity_step(
-                                self.plasticity_phase,
-                                target_output_index == END_DOCUMENT_OUTPUT_INDEX,
-                            );
+                        let end_document = target_output_index == END_DOCUMENT_OUTPUT_INDEX;
+                        let (scheduled_plasticity_scale, next_plasticity_phase) =
+                            self.model
+                                .config
+                                .learning
+                                .plasticity_step(self.plasticity_phase, end_document);
+                        let plasticity_scale = self.gate_plasticity_scale_from_device(
+                            scheduled_plasticity_scale,
+                            target_output_index,
+                            end_document,
+                        )?;
                         self.launch_learning(
                             strength,
                             strength * target_weight,
@@ -3988,6 +4016,11 @@ impl CudaRuntime {
                     context_enabled: u32::from(context_enabled),
                     supervised_strength,
                     plasticity_scale,
+                    plasticity_confidence_threshold: self
+                        .model
+                        .config
+                        .learning
+                        .plasticity_confidence_threshold,
                 });
                 metadata.push((symbol, target_index, context_enabled, learned));
             }
@@ -4931,6 +4964,28 @@ impl CudaRuntime {
             FORWARD_THREADS,
             &mut parameters,
         )
+    }
+
+    fn gate_plasticity_scale_from_device(
+        &self,
+        scheduled_scale: f32,
+        target_output_index: usize,
+        end_document: bool,
+    ) -> LeoResult<f32> {
+        let learning = &self.model.config.learning;
+        if scheduled_scale <= 0.0
+            || end_document
+            || learning.plasticity_confidence_threshold >= 1.0
+        {
+            return Ok(scheduled_scale);
+        }
+        let mut probabilities = [0.0f32; OUTPUT_CLASSES];
+        self.copy_from_device(self.buffers.probabilities, &mut probabilities)?;
+        Ok(learning.gate_plasticity_scale(
+            scheduled_scale,
+            probabilities[target_output_index],
+            end_document,
+        ))
     }
 
     fn launch_learning(
@@ -8259,6 +8314,8 @@ fn launch_device_story_step_builder(
         "plasticity window",
         coordinator.model.config.learning.plasticity_window,
     )?;
+    let mut plasticity_confidence_threshold =
+        coordinator.model.config.learning.plasticity_confidence_threshold;
     let mut parameters = [
         param(&mut story_bytes),
         param(&mut story_byte_stride),
@@ -8271,6 +8328,7 @@ fn launch_device_story_step_builder(
         param(&mut strength_value),
         param(&mut end_document_weight),
         param(&mut plasticity_window),
+        param(&mut plasticity_confidence_threshold),
     ];
     coordinator.launch_exact(
         coordinator.shared.kernels.build_shared_story_steps,
@@ -8642,6 +8700,11 @@ pub(crate) fn train_story_batch_shared_device(
                         context_enabled: u32::from(context_enabled),
                         supervised_strength,
                         plasticity_scale,
+                        plasticity_confidence_threshold: coordinator
+                            .model
+                            .config
+                            .learning
+                            .plasticity_confidence_threshold,
                     });
                     lane_metadata.push((symbol, target_index, context_enabled, learned));
                 }

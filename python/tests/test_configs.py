@@ -28,7 +28,7 @@ EXPECTED_FIELDS = {
         "eligibility_decay", "eligibility_epsilon", "surrogate_width",
         "surrogate_gain", "max_update", "weight_min", "weight_max",
         "provisional_strength", "training_strength", "verified_strength",
-        "plasticity_window", "end_document_weight",
+        "plasticity_window", "plasticity_confidence_threshold", "end_document_weight",
     },
     "context": {
         "embedding_dim", "max_order", "slots_per_order", "probe_limit", "learning_rate",
@@ -103,6 +103,8 @@ class IntegratedConfigTests(unittest.TestCase):
             self.assertGreater(int(config["context"]["max_order"]), 0)
             self.assertGreater(int(config["context"]["slots_per_order"]), 0)
             self.assertGreater(int(config["context"]["probe_limit"]), 0)
+            self.assertGreater(float(config["learning"]["plasticity_confidence_threshold"]), 0.0)
+            self.assertLessEqual(float(config["learning"]["plasticity_confidence_threshold"]), 1.0)
 
 
 

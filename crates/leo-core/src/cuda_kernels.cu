@@ -1590,6 +1590,7 @@ struct LeoPersistentStep {
     unsigned int context_enabled;
     float supervised_strength;
     float plasticity_scale;
+    float plasticity_confidence_threshold;
 };
 
 
@@ -1601,6 +1602,22 @@ __device__ __forceinline__ T* leo_p_ptr(const unsigned long long* pointers, unsi
 template <typename T>
 __device__ __forceinline__ const T* leo_p_cptr(const unsigned long long* pointers, unsigned int index) {
     return reinterpret_cast<const T*>(pointers[index]);
+}
+
+__device__ __forceinline__ bool leo_p_plasticity_commit(
+    const unsigned long long* pointers,
+    const LeoPersistentStep& step
+) {
+    if (step.target_index < 0 || step.plasticity_scale <= 0.0f) return false;
+    // End-of-document is an unconditional consolidation boundary so a highly
+    // confident final token cannot strand the current eligibility window.
+    if ((unsigned int)step.target_index == LEO_OUTPUTS - 1U) return true;
+    if (step.plasticity_confidence_threshold >= 1.0f) return true;
+    const float probability = leo_p_cptr<float>(pointers, LEO_P_PROBABILITIES)[
+        (unsigned int)step.target_index
+    ];
+    return !isfinite(probability)
+        || probability < step.plasticity_confidence_threshold;
 }
 
 // Persistent story execution is block-local: one CUDA block owns one story.
@@ -4068,7 +4085,7 @@ __device__ __forceinline__ bool leo_context_survives_dropout_exact(
 // Production single-GPU batches upload raw story bytes once and derive the
 // exact persistent step schedule on-device. This preserves BEGIN/END mapping,
 // dropout RNG, target order and supervised-strength arithmetic while avoiding
-// a per-step host descriptor build and 20-byte H2D record stream.
+// a per-step host descriptor build and 24-byte H2D record stream.
 extern "C" __global__ void leo_build_shared_story_steps(
     const unsigned char* story_bytes,
     unsigned int story_byte_stride,
@@ -4080,7 +4097,8 @@ extern "C" __global__ void leo_build_shared_story_steps(
     float context_dropout_rate,
     float strength,
     float end_document_weight,
-    unsigned int plasticity_window
+    unsigned int plasticity_window,
+    float plasticity_confidence_threshold
 ) {
     const unsigned int lane = blockIdx.x;
     if (lane >= lane_count) return;
@@ -4119,6 +4137,7 @@ extern "C" __global__ void leo_build_shared_story_steps(
             context_enabled,
             strength * target_weight,
             plasticity_scale,
+            plasticity_confidence_threshold,
         };
     }
 }
@@ -4264,7 +4283,6 @@ __device__ void leo_train_story_block(
         const LeoPersistentStep step = steps[step_index];
         const unsigned long long tick = base_tick + (unsigned long long)step_index;
         const bool context_enabled = step.context_enabled != 0U;
-        const bool plasticity_commit = step.plasticity_scale > 0.0f;
         const float plasticity_strength = step.supervised_strength * step.plasticity_scale;
         unsigned int* rec_a_list = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_LIST);
         unsigned int* rec_a_count = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_COUNT);
@@ -4322,6 +4340,7 @@ __device__ void leo_train_story_block(
         leo_p_forward(pointers, step.target_index, shared_latent, shared_reduction);
         __syncthreads();
 
+        const bool plasticity_commit = leo_p_plasticity_commit(pointers, step);
         if (step.target_index >= 0 && strength > 0.0f) {
             if (plasticity_commit) {
                 leo_p_learning_signals(pointers, tick);
@@ -4607,7 +4626,6 @@ __device__ __forceinline__ void leo_train_cooperative_body(
         const bool frozen_advance = MIXED_SCHEDULE && step.target_index == -2;
         const bool context_enabled = step.context_enabled != 0U;
         const bool supervised = !frozen_advance && step.target_index >= 0 && strength > 0.0f;
-        const bool plasticity_commit = supervised && step.plasticity_scale > 0.0f;
         const float plasticity_strength = step.supervised_strength * step.plasticity_scale;
         const bool even = MIXED_SCHEDULE
             ? (learning_step_index & 1U) == 0U
@@ -4795,6 +4813,8 @@ __device__ __forceinline__ void leo_train_cooperative_body(
             profile_counters, LEO_CUDA_REPLAY_PROFILE_FORWARD, phase_started
         );
 
+        const bool plasticity_commit = supervised
+            && leo_p_plasticity_commit(pointers, step);
         if (supervised) {
             phase_started = leo_profile_phase_start<PROFILE>();
             if (plasticity_commit) {
@@ -5276,12 +5296,12 @@ __device__ __forceinline__ void leo_shared_phase_learning_signals_lane(
     const LeoPersistentStep* steps = reinterpret_cast<const LeoPersistentStep*>(
         step_buffer_addresses[lane]
     );
-    if (steps[step_index].target_index < 0
-        || steps[step_index].plasticity_scale <= 0.0f
-        || strength <= 0.0f) return;
+    const LeoPersistentStep step = steps[step_index];
+    if (step.target_index < 0 || strength <= 0.0f) return;
     const unsigned long long* p = reinterpret_cast<const unsigned long long*>(
         pointer_table_addresses[lane]
     );
+    if (!leo_p_plasticity_commit(p, step)) return;
     const unsigned long long tick = base_ticks[lane] + (unsigned long long)step_index;
     leo_p_learning_signals_worklist(p, tick);
 }
@@ -5310,7 +5330,7 @@ __device__ __forceinline__ void leo_shared_phase_post_deltas_lane_impl(
     if (step.target_index < 0 || strength <= 0.0f) return;
     const bool learning_trace = learning_trace_raw != 0U;
     const bool context_enabled = step.context_enabled != 0U;
-    const bool plasticity_commit = step.plasticity_scale > 0.0f;
+    const bool plasticity_commit = leo_p_plasticity_commit(p, step);
     const float plasticity_strength = step.supervised_strength * step.plasticity_scale;
 
     unsigned int* rec_a_list = leo_p_ptr<unsigned int>(p, LEO_P_REC_ELIGIBLE_LIST);
@@ -5867,7 +5887,6 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
         }
         const bool learning_trace = active && learning_trace_raw != 0U;
         const bool supervised = active && step.target_index >= 0 && strength > 0.0f;
-        const bool plasticity_commit = supervised && step.plasticity_scale > 0.0f;
         const float plasticity_strength = step.supervised_strength * step.plasticity_scale;
         const bool context_enabled = active && step.context_enabled != 0U;
 
@@ -5993,6 +6012,8 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
             phase_profile_counters, LEO_CUDA_PHASE_PROFILE_POST_CORE, profile_step_thread, &phase_start
         );
 
+        const bool plasticity_commit = supervised
+            && leo_p_plasticity_commit(p, step);
         if (plasticity_commit) {
             leo_p_learning_signals_work(
                 p, tick, lane_thread, lane_stride

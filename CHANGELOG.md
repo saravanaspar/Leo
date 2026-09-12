@@ -4,8 +4,8 @@ All notable project changes should be recorded here.
 
 ## Unreleased
 
-## v1.0.41 - 2026-09-12
-
+- Lock the TinyStories recurrent/input consolidation window at `learning.plasticity_window = 8` after the P100 1024-story A/B: W8 completed the train+validation run in `568.38 s`, held-out quality was `3.32556 bits/byte`, and the clean canonical 16-story benchmark reached `3843.52 steps/s`; W8 dominated W4 on both speed and held-out bits/byte and beat W16 on full-run wall time and held-out bits/byte.
+- Add Formula-v3 surprise-gated recurrent/input plasticity with `learning.plasticity_confidence_threshold`. TinyStories uses `0.50`: an already-scheduled W8 consolidation runs only while the target probability is below 50% (end-document always consolidates). Eligibility traces, direct output/context supervision, inhibitory homeostasis, and replay target selection remain unchanged. Test/probe configs use `1.00` to preserve the existing exact/conformance path.
 - Add the opt-in-by-config Formula-v2 TinyStories experiment: elide the global winner TopK when the sum of per-block winner capacities is already within `max_active_global`, preserving the same local winner set while avoiding a redundant global ranking phase.
 - Promote the existing stateful mixed replay trajectory to `replay.stateful_batch`; TinyStories now resets once per replay story and advances frozen gaps between selected ranges instead of reconstructing every selected segment independently from byte zero. This intentionally changes replay parameter/state visibility and therefore establishes a new Formula-v2 deterministic-hash contract.
 - Add `learning.plasticity_window` and set TinyStories to a four-step recurrent/input consolidation window: eligibility traces still advance every learning tick and output/context supervision remains immediate, while the expensive recurrent/input learning signal and weight commit occur on each fourth supervised learning step (or end-document partial window). Test/probe configs retain window `1` and classic replay.

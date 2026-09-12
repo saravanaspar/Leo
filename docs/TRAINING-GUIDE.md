@@ -1226,22 +1226,52 @@ story-batch path and have a homogeneous visible GPU group.
 The experimental replay flags should graduate to production only after measured
 throughput gains and held-out quality both satisfy the project acceptance bar.
 
-## Experimental Formula v2 (TinyStories)
+## Experimental Formula v3 (TinyStories)
 
-The current Formula-v2 performance experiment is enabled explicitly by the TinyStories config:
+Formula v3 keeps the Formula-v2 work-reduction changes (non-binding global TopK
+elision and stateful batched replay), locks the measured TinyStories consolidation
+window at W8, and adds confidence-gated recurrent/input consolidation:
 
 ```toml
 [learning]
-plasticity_window = 4
+plasticity_window = 8
+plasticity_confidence_threshold = 0.50
 
 [replay]
 stateful_batch = true
 ```
 
-`plasticity_window = 1` preserves per-target recurrent/input plasticity; test and probe configs use that value.  With a larger window, forward eligibility traces still advance every learning tick and readout/context supervision remains immediate, but recurrent/input credit is consolidated only at the supervised-step window boundary (or at end-document); frozen replay gaps do not consume the window.  This changes training semantics and requires a new deterministic-hash and quality baseline.
+`plasticity_window = 8` means eligibility traces still advance on every learning
+tick and direct output/context supervision remains immediate, but the expensive
+recurrent/input learning-signal construction and weight commit are only scheduled
+at each eighth supervised target (or a partial end-document boundary).
 
-`stateful_batch = true` uses one mixed frozen/supervised replay trajectory per story instead of resetting and reconstructing each selected range independently.  It preserves the replay target budget, but it intentionally changes parameter/state visibility between selected replay ranges.  `LEO_REPLAY_STREAMING=1` remains an execution A/B override for configs that leave `stateful_batch = false`.
+`plasticity_confidence_threshold = 0.50` makes those scheduled commits
+surprise-driven. After the forward pass, if the model already assigns the target
+probability `>= 0.50`, recurrent/input consolidation is skipped for that scheduled
+boundary. End-document always commits so a document boundary cannot strand a
+partial eligibility window. A threshold of `1.00` preserves the Formula-v2
+schedule and is used by `test.toml` and `probe.toml` so existing exact CPU/GPU
+conformance coverage remains on the ungated rule. Output/context learning and
+inhibitory/threshold homeostasis are not confidence-gated.
 
-For TinyStories geometry, `128 blocks * 8 local winners == max_active_global 1024`.  Formula v2 therefore skips the redundant global winner TopK after local block competition.  Configurations whose global cap is binding continue to use the established exact global selector.
+The W8 lock is based on the 1024-story P100 A/B before enabling the confidence
+gate. The measured references were:
 
-Formula v2 is experimental: historical v1 training-state SHA-256 values are not acceptance hashes for this mode.  Before release, record repeatable new hashes and compare validation bits/byte, recurrent probes, and generation quality against the v1.0.40 reference in addition to throughput.
+- v1: `1938.30` canonical steps/s, `1561.13 s` full 1024-story experiment,
+  `3.31282` held-out bits/byte;
+- W4: `3507.07` canonical steps/s, `617.87 s`, `3.33133` held-out bits/byte;
+- W8: `3843.52` canonical steps/s, `568.38 s`, `3.32556` held-out bits/byte;
+- W16: `4038.44` canonical steps/s, `577.53 s`, `3.34375` held-out bits/byte.
+
+W8 therefore dominated W4 on speed and held-out quality, while W16's short
+benchmark advantage did not survive the longer training run and came with worse
+held-out bits/byte. Formula-v3 confidence gating is a new semantic experiment and
+must establish a new deterministic hash plus P100 throughput/quality evidence;
+no speed or quality claim is made for the gate until those measurements are run.
+
+For TinyStories geometry, `128 blocks * 8 local winners == max_active_global
+1024`, so the global winner TopK remains redundant after local competition.
+Configurations whose global cap is binding continue to use the established global
+selector. Stateful replay continues to preserve the configured replay target
+budget while carrying one transient trajectory through selected ranges.

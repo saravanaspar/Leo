@@ -797,7 +797,7 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("device_story_postprocess=true", gpu_gate)
         self.assertIn("training_state_sha256", gpu_gate)
 
-    def test_formula_v2_core_contracts_are_wired_through_cpu_and_cuda(self):
+    def test_formula_v3_core_contracts_are_wired_through_cpu_and_cuda(self):
         config = (ROOT / "crates/leo-core/src/config.rs").read_text()
         runtime = (ROOT / "crates/leo-core/src/runtime.rs").read_text()
         training = (ROOT / "crates/leo-cli/src/training.rs").read_text()
@@ -806,8 +806,10 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         tiny = (ROOT / "configs/tinystories.toml").read_text()
 
         self.assertIn("pub plasticity_window: usize", config)
+        self.assertIn("pub plasticity_confidence_threshold: f32", config)
         self.assertIn("pub stateful_batch: bool", config)
-        self.assertIn("plasticity_window = 4", tiny)
+        self.assertIn("plasticity_window = 8", tiny)
+        self.assertIn("plasticity_confidence_threshold = 0.50", tiny)
         self.assertIn("stateful_batch = true", tiny)
         self.assertIn("plasticity_phase: usize", runtime)
         self.assertIn("self.plasticity_phase = 0", runtime)
@@ -817,11 +819,17 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("redundant_global_topk", runtime)
         self.assertIn("cfg->max_active_global >= available", kernels)
         self.assertIn("runtime.model().config.replay.stateful_batch", training)
+        self.assertIn("gate_plasticity_scale", runtime)
         self.assertIn("plasticity_scale", runtime)
         self.assertIn("plasticity_scale: f32", rust)
+        self.assertIn("plasticity_confidence_threshold: f32", rust)
         self.assertIn("float plasticity_scale", kernels)
+        self.assertIn("float plasticity_confidence_threshold", kernels)
+        self.assertIn("leo_p_plasticity_commit", kernels)
         self.assertIn("plasticity_commit", kernels)
         self.assertIn("plasticity_strength", kernels)
+        self.assertIn("probability < step.plasticity_confidence_threshold", kernels)
+        self.assertIn("target_output_index == END_DOCUMENT_OUTPUT_INDEX", runtime)
 
     def test_grouped_shared_wavefront_parallelizes_each_logical_lane(self):
         rust = (ROOT / "crates/leo-core/src/cuda.rs").read_text()

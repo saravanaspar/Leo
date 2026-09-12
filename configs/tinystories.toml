@@ -43,7 +43,8 @@ weight_max = 1.0
 provisional_strength = 0.20
 training_strength = 1.0
 verified_strength = 1.0
-plasticity_window = 4
+plasticity_window = 8
+plasticity_confidence_threshold = 0.50
 end_document_weight = 4.0
 
 [context]
