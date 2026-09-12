@@ -3114,23 +3114,6 @@ __device__ void leo_p_learning_signals_work(const unsigned long long* p, unsigne
     );
 }
 
-__device__ __forceinline__ void leo_p_learning_signals_work_cached_errors(
-    const unsigned long long* p,
-    unsigned long long tick,
-    unsigned int thread,
-    unsigned int stride,
-    float* shared_errors
-) {
-    const float* errors = leo_p_cptr<float>(p, LEO_P_ERRORS);
-    for (unsigned int output = threadIdx.x; output < LEO_OUTPUTS; output += blockDim.x) {
-        shared_errors[output] = errors[output];
-    }
-    __syncthreads();
-    leo_p_learning_signals_work_with_errors(
-        p, tick, thread, stride, shared_errors
-    );
-}
-
 __device__ void leo_p_learning_signals_worklist(
     const unsigned long long* p,
     unsigned long long tick
@@ -4478,7 +4461,6 @@ __device__ __forceinline__ void leo_train_cooperative_body(
 ) {
     __shared__ unsigned long long shared_selection_keys[LEO_GLOBAL_SORT];
     __shared__ float shared_reduction[512];
-    __shared__ float shared_errors[LEO_OUTPUTS];
     const unsigned int model_block_count =
         leo_p_cptr<LeoConfig>(pointers, LEO_P_CONFIG)->block_count;
     const bool learning_trace = learning_trace_raw != 0U;
@@ -4683,8 +4665,8 @@ __device__ __forceinline__ void leo_train_cooperative_body(
 
         if (supervised) {
             phase_started = leo_profile_phase_start<PROFILE>();
-            leo_p_learning_signals_work_cached_errors(
-                pointers, tick, grid_thread, grid_stride, shared_errors
+            leo_p_learning_signals_work(
+                pointers, tick, grid_thread, grid_stride
             );
             leo_profile_phase_end<PROFILE>(
                 profile_counters,
@@ -5696,7 +5678,6 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
 ) {
     __shared__ unsigned long long shared_selection_keys[LEO_GLOBAL_SORT];
     __shared__ float shared_reduction[512];
-    __shared__ float shared_errors[LEO_OUTPUTS];
     if (lane_count == 0U || gridDim.x < lane_count) return;
 
     // Interleave CTAs across lanes. When gridDim.x is not divisible by the
@@ -5867,8 +5848,8 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
         );
 
         if (supervised) {
-            leo_p_learning_signals_work_cached_errors(
-                p, tick, lane_thread, lane_stride, shared_errors
+            leo_p_learning_signals_work(
+                p, tick, lane_thread, lane_stride
             );
         }
         cooperative_groups::this_grid().sync();
