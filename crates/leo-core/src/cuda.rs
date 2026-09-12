@@ -3079,7 +3079,16 @@ impl CudaRuntime {
     }
 
     pub(crate) fn begin_document(&mut self) -> LeoResult<()> {
+        // Preserve the backend contract: callers outside replay may inspect or
+        // compare state immediately after begin_document returns.
         self.reset_transient_state()
+    }
+
+    pub(crate) fn begin_document_deferred_for_replay(&mut self) -> LeoResult<()> {
+        // Classic replay immediately queues frozen-prefix/target work on the
+        // same compute stream. CUDA stream ordering makes every reset store
+        // visible before the first replay step without a host-wide synchronize.
+        self.enqueue_transient_reset()
     }
 
     pub(crate) fn finish_document(&mut self) -> LeoResult<()> {
@@ -3091,6 +3100,11 @@ impl CudaRuntime {
     }
 
     pub(crate) fn reset_transient_state(&mut self) -> LeoResult<()> {
+        self.enqueue_transient_reset()?;
+        self.synchronize()
+    }
+
+    fn enqueue_transient_reset(&mut self) -> LeoResult<()> {
         self.make_current()?;
         let b = self.buffers;
         for buffer in [
@@ -3108,11 +3122,11 @@ impl CudaRuntime {
             b.selected_epoch,
             b.surrogate,
             b.candidate_activation,
-            b.active,
-            b.active_value,
+            // Payload buffers below are count/start-tick gated. Their visible
+            // entries are overwritten before use, so avoid replay-reset traffic
+            // for values that cannot be observed. Shared batch lanes already
+            // rely on the same invariants.
             b.active_count,
-            b.block_winner_neuron,
-            b.block_winner_value,
             b.block_cutoff,
             b.population_cutoff,
             b.population_inhibition,
@@ -3137,13 +3151,8 @@ impl CudaRuntime {
             b.input_eligible_count,
             b.input_next_eligible_count,
             b.ring_count,
-            b.ring_source,
-            b.ring_activation,
-            b.ring_weight,
             b.context_history,
             b.context_history_count,
-            b.active_context_slots,
-            b.active_context_scales,
             b.active_context_count,
             b.context_latent,
             b.context_gradient,
@@ -3187,7 +3196,6 @@ impl CudaRuntime {
             THREADS,
             &mut parameters,
         )?;
-        self.synchronize()?;
         self.active.clear();
         self.activation.fill(0.0);
         self.persistent_document_activity = false;

@@ -177,7 +177,15 @@ fn replay_ranges_streaming(
     }
 
     let begin_started = collect_timing.then(Instant::now);
-    runtime.begin_document()?;
+    if collect_timing {
+        // Keep replay timing attribution accurate: synchronous begin_document
+        // includes the reset work in begin_ms when diagnostics are enabled.
+        runtime.begin_document()?;
+    } else {
+        // Production replay can defer reset completion because the frozen-prefix
+        // or target batch is queued on the same CUDA stream immediately after.
+        runtime.begin_document_deferred_for_replay()?;
+    }
     timing.begin_ms = begin_started
         .map(|started| started.elapsed().as_secs_f64() * 1000.0)
         .unwrap_or(0.0);
@@ -1857,7 +1865,15 @@ fn replay_target_range_impl(
     let mut timing = ReplayTiming::default();
 
     let begin_started = collect_timing.then(Instant::now);
-    runtime.begin_document()?;
+    if collect_timing {
+        // Keep replay timing attribution accurate: synchronous begin_document
+        // includes the reset work in begin_ms when diagnostics are enabled.
+        runtime.begin_document()?;
+    } else {
+        // Production replay can defer reset completion because the frozen-prefix
+        // or target batch is queued on the same CUDA stream immediately after.
+        runtime.begin_document_deferred_for_replay()?;
+    }
     timing.begin_ms = begin_started
         .map(|started| started.elapsed().as_secs_f64() * 1000.0)
         .unwrap_or(0.0);
@@ -1865,19 +1881,7 @@ fn replay_target_range_impl(
     let mut next_target = target_range.start;
     let mut prefix_steps = 0u64;
     let mut target_steps = 0u64;
-    if next_target == 0 {
-        let target_started = collect_timing.then(Instant::now);
-        for metrics in
-            runtime.training_step_batch(&[(BEGIN_DOCUMENT, Some(story[0] as u32))], permission)?
-        {
-            activity.record(metrics);
-            target_steps = target_steps.saturating_add(1);
-        }
-        timing.target_execute_ms += target_started
-            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
-            .unwrap_or(0.0);
-        next_target = 1;
-    } else {
+    if next_target > 0 {
         let prefix_build_started = collect_timing.then(Instant::now);
         let mut prefix = Vec::with_capacity(next_target);
         prefix.push((BEGIN_DOCUMENT, None));
@@ -1898,17 +1902,24 @@ fn replay_target_range_impl(
     }
 
     let target_build_started = collect_timing.then(Instant::now);
-    let target_batch = (next_target..end)
-        .map(|target_position| {
-            let input = story[target_position - 1] as u32;
-            let target = if target_position < story.len() {
-                story[target_position] as u32
-            } else {
-                END_DOCUMENT
-            };
-            (input, Some(target))
-        })
-        .collect::<Vec<_>>();
+    let mut target_batch = Vec::with_capacity(end.saturating_sub(next_target));
+    // A range beginning at target zero used to execute BEGIN_DOCUMENT as a
+    // one-element training batch and then immediately launch a second batch.
+    // Put the same first step at the front of the normal target batch instead;
+    // training_step_batch preserves its serial step order inside one launch.
+    if next_target == 0 {
+        target_batch.push((BEGIN_DOCUMENT, Some(story[0] as u32)));
+        next_target = 1;
+    }
+    target_batch.extend((next_target..end).map(|target_position| {
+        let input = story[target_position - 1] as u32;
+        let target = if target_position < story.len() {
+            story[target_position] as u32
+        } else {
+            END_DOCUMENT
+        };
+        (input, Some(target))
+    }));
     timing.target_build_ms = target_build_started
         .map(|started| started.elapsed().as_secs_f64() * 1000.0)
         .unwrap_or(0.0);

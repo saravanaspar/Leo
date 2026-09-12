@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-const PROFILE_SCHEMA: u32 = 4;
+const PROFILE_SCHEMA: u32 = 5;
 const OBSERVATIONS_PER_CANDIDATE: u32 = 2;
 const PROFILE_SAMPLE_INTERVAL: u64 = 128;
 const LANE_CANDIDATES: [usize; 6] = [8, 16, 32, 64, 96, 128];
@@ -521,6 +521,20 @@ fn build_candidates(
             push_unique(&mut candidates, plan);
         }
 
+        // Cooperative synchronization cost is nonlinear in grid width.  The
+        // old quarter/half/full search skipped the useful middle of the P100
+        // residency range (112 blocks).  These scale-free fractions produce
+        // 64/72/80/84/96 blocks at that capacity while remaining meaningful on
+        // other GPUs.  Throughput, not occupancy, still decides the winner.
+        for (numerator, denominator) in [(4u32, 7u32), (9, 14), (5, 7), (3, 4), (6, 7)] {
+            let mut plan = baseline;
+            plan.fused_wavefront_blocks = max_fused
+                .saturating_mul(numerator)
+                .div_ceil(denominator)
+                .clamp(1, max_fused);
+            push_unique(&mut candidates, plan);
+        }
+
         // A small deterministic interaction set catches lane/grid coupling
         // without spending production batches on dimensions that are inactive
         // in the exact story-batch path.
@@ -677,6 +691,26 @@ mod tests {
         assert!(candidates
             .iter()
             .all(|plan| plan.fused_wavefront_threads == FUSED_WAVEFRONT_THREADS));
+
+        let p100_limits = CudaTuningLimits {
+            multiprocessors: 56,
+            max_threads_per_sm: 2048,
+            max_lanes: 16,
+            fused_blocks_128: 224,
+            fused_blocks_256: 112,
+            fused_blocks_512: 56,
+            grouped_blocks_256: 112,
+        };
+        let p100_baseline = heuristic_plan(p100_limits, 16);
+        let p100_candidates = build_candidates(p100_limits, 16, p100_baseline);
+        for expected in [64u32, 72, 80, 84, 96] {
+            assert!(
+                p100_candidates
+                    .iter()
+                    .any(|plan| plan.fused_wavefront_blocks == expected),
+                "missing P100 intermediate cooperative grid candidate {expected}",
+            );
+        }
     }
 
     #[test]

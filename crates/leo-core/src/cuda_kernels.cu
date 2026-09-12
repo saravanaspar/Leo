@@ -3074,16 +3074,21 @@ __device__ void leo_p_forward(
     }
 }
 
-__device__ void leo_p_learning_signals_work(const unsigned long long* p, unsigned long long tick,
+__device__ __forceinline__ void leo_p_learning_signals_work_with_errors(
+    const unsigned long long* p,
+    unsigned long long tick,
     unsigned int thread,
-    unsigned int stride
+    unsigned int stride,
+    const float* errors
 ) {
     const LeoConfig* cfg = leo_p_cptr<LeoConfig>(p, LEO_P_CONFIG);
     const float* output_weights = leo_p_cptr<float>(p, LEO_P_OUTPUT_WEIGHT);
-    const float* errors = leo_p_cptr<float>(p, LEO_P_ERRORS);
-    const unsigned long long* destination_epoch = leo_p_cptr<unsigned long long>(p, LEO_P_LEARNING_DESTINATION_EPOCH);
-    const unsigned int* destination_list = leo_p_cptr<unsigned int>(p, LEO_P_LEARNING_DESTINATION_LIST);
-    const unsigned int* destination_count = leo_p_cptr<unsigned int>(p, LEO_P_LEARNING_DESTINATION_COUNT);
+    const unsigned long long* destination_epoch =
+        leo_p_cptr<unsigned long long>(p, LEO_P_LEARNING_DESTINATION_EPOCH);
+    const unsigned int* destination_list =
+        leo_p_cptr<unsigned int>(p, LEO_P_LEARNING_DESTINATION_LIST);
+    const unsigned int* destination_count =
+        leo_p_cptr<unsigned int>(p, LEO_P_LEARNING_DESTINATION_COUNT);
     float* learning_signal = leo_p_ptr<float>(p, LEO_P_LEARNING_SIGNAL);
     const unsigned long long tag = tick + 1ULL;
     const unsigned int count = *destination_count;
@@ -3093,11 +3098,37 @@ __device__ void leo_p_learning_signals_work(const unsigned long long* p, unsigne
         const unsigned long long row = (unsigned long long)neuron * LEO_OUTPUTS;
         float signal = 0.0f;
         for (unsigned int output = 0U; output < LEO_OUTPUTS; ++output) {
+            // Keep the historical output-major FP32 accumulation order exactly.
             signal += output_weights[row + output] * errors[output];
         }
         learning_signal[neuron] = signal;
     }
+}
 
+__device__ void leo_p_learning_signals_work(const unsigned long long* p, unsigned long long tick,
+    unsigned int thread,
+    unsigned int stride
+) {
+    leo_p_learning_signals_work_with_errors(
+        p, tick, thread, stride, leo_p_cptr<float>(p, LEO_P_ERRORS)
+    );
+}
+
+__device__ __forceinline__ void leo_p_learning_signals_work_cached_errors(
+    const unsigned long long* p,
+    unsigned long long tick,
+    unsigned int thread,
+    unsigned int stride,
+    float* shared_errors
+) {
+    const float* errors = leo_p_cptr<float>(p, LEO_P_ERRORS);
+    for (unsigned int output = threadIdx.x; output < LEO_OUTPUTS; output += blockDim.x) {
+        shared_errors[output] = errors[output];
+    }
+    __syncthreads();
+    leo_p_learning_signals_work_with_errors(
+        p, tick, thread, stride, shared_errors
+    );
 }
 
 __device__ void leo_p_learning_signals_worklist(
@@ -4292,18 +4323,21 @@ __device__ __forceinline__ unsigned long long leo_profile_phase_start() {
 
 template <bool PROFILE>
 __device__ __forceinline__ void leo_profile_phase_end(
-    cooperative_groups::grid_group grid,
     unsigned long long* counters,
     unsigned int counter,
     unsigned long long started
 ) {
-    grid.sync();
+    // Resolve the cooperative grid only at the synchronization site instead of
+    // keeping a grid_group object live across an entire persistent replay loop.
+    // This mirrors the grouped kernel's residency cleanup and shortens register
+    // lifetimes without changing the barrier or memory-visibility semantics.
+    cooperative_groups::this_grid().sync();
     if (PROFILE && blockIdx.x == 0U && threadIdx.x == 0U && counters != nullptr) {
         counters[counter] += clock64() - started;
     }
     // Profiling is diagnostic-only. The extra barrier keeps phase timestamps
     // non-overlapping and is compiled away from the normal kernel.
-    if (PROFILE) grid.sync();
+    if (PROFILE) cooperative_groups::this_grid().sync();
 }
 
 template <bool PROFILE>
@@ -4314,13 +4348,9 @@ __device__ __forceinline__ void leo_advance_frozen_cooperative_body(
     unsigned long long base_tick,
     unsigned long long* profile_counters
 ) {
-    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
     __shared__ unsigned long long shared_selection_keys[LEO_GLOBAL_SORT];
-    const LeoConfig* cfg = leo_p_cptr<LeoConfig>(pointers, LEO_P_CONFIG);
-    unsigned int* recurrent_list = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_LIST);
-    unsigned int* recurrent_count = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_COUNT);
-    unsigned int* input_list = leo_p_ptr<unsigned int>(pointers, LEO_P_INPUT_ELIGIBLE_LIST);
-    unsigned int* input_count = leo_p_ptr<unsigned int>(pointers, LEO_P_INPUT_ELIGIBLE_COUNT);
+    const unsigned int model_block_count =
+        leo_p_cptr<LeoConfig>(pointers, LEO_P_CONFIG)->block_count;
 
     for (unsigned int step_index = 0U; step_index < step_count; ++step_index) {
         const unsigned int symbol = steps[step_index].symbol;
@@ -4331,6 +4361,14 @@ __device__ __forceinline__ void leo_advance_frozen_cooperative_body(
         // atomic/update ordering. Frozen prefix optimization only distributes
         // phases whose rows are independent.
         if (blockIdx.x == 0U) {
+            unsigned int* recurrent_list =
+                leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_LIST);
+            unsigned int* recurrent_count =
+                leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_COUNT);
+            unsigned int* input_list =
+                leo_p_ptr<unsigned int>(pointers, LEO_P_INPUT_ELIGIBLE_LIST);
+            unsigned int* input_count =
+                leo_p_ptr<unsigned int>(pointers, LEO_P_INPUT_ELIGIBLE_COUNT);
             leo_p_start_tick(pointers, tick);
             __syncthreads();
             leo_p_deliver_events(pointers, tick, false, recurrent_list, recurrent_count);
@@ -4341,18 +4379,18 @@ __device__ __forceinline__ void leo_advance_frozen_cooperative_body(
             __syncthreads();
         }
         leo_profile_phase_end<PROFILE>(
-            grid, profile_counters, LEO_CUDA_FROZEN_PROFILE_PRE, phase_started
+            profile_counters, LEO_CUDA_FROZEN_PROFILE_PRE, phase_started
         );
 
         phase_started = leo_profile_phase_start<PROFILE>();
         for (unsigned int model_block = blockIdx.x;
-             model_block < cfg->block_count;
+             model_block < model_block_count;
              model_block += gridDim.x) {
             leo_p_select_model_block_fast(pointers, tick, model_block, shared_selection_keys);
             __syncthreads();
         }
         leo_profile_phase_end<PROFILE>(
-            grid, profile_counters, LEO_CUDA_FROZEN_PROFILE_SELECT_BLOCKS, phase_started
+            profile_counters, LEO_CUDA_FROZEN_PROFILE_SELECT_BLOCKS, phase_started
         );
 
         phase_started = leo_profile_phase_start<PROFILE>();
@@ -4361,19 +4399,19 @@ __device__ __forceinline__ void leo_advance_frozen_cooperative_body(
             __syncthreads();
         }
         leo_profile_phase_end<PROFILE>(
-            grid, profile_counters, LEO_CUDA_FROZEN_PROFILE_SELECT_GLOBAL, phase_started
+            profile_counters, LEO_CUDA_FROZEN_PROFILE_SELECT_GLOBAL, phase_started
         );
 
         phase_started = leo_profile_phase_start<PROFILE>();
         leo_p_post_and_emit_grid(pointers, tick);
         leo_profile_phase_end<PROFILE>(
-            grid, profile_counters, LEO_CUDA_FROZEN_PROFILE_POST_EMIT, phase_started
+            profile_counters, LEO_CUDA_FROZEN_PROFILE_POST_EMIT, phase_started
         );
 
         if (PROFILE && blockIdx.x == 0U && threadIdx.x == 0U && profile_counters != nullptr) {
             profile_counters[LEO_CUDA_FROZEN_PROFILE_SAMPLES] += 1ULL;
         }
-        if (PROFILE) grid.sync();
+        if (PROFILE) cooperative_groups::this_grid().sync();
     }
 }
 
@@ -4426,7 +4464,8 @@ enum LeoCudaReplayProfileCounter {
 // keep their v1 semantics. Independent model blocks, sparse rows,
 // destinations, weights, homeostasis rows, and post/emit records use the whole
 // cooperative grid. This changes execution geometry only; FP32 equations,
-// target order, parameter visibility, and per-step barriers are unchanged.
+// target order, and required parameter-visibility boundaries remain unchanged.
+// Independent phase bookkeeping may share an existing visibility barrier.
 template <bool PROFILE, bool FAST_METRICS>
 __device__ __forceinline__ void leo_train_cooperative_body(
     const unsigned long long* pointers,
@@ -4437,11 +4476,11 @@ __device__ __forceinline__ void leo_train_cooperative_body(
     float strength,
     unsigned long long* profile_counters
 ) {
-    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
     __shared__ unsigned long long shared_selection_keys[LEO_GLOBAL_SORT];
-    __shared__ float shared_latent[LEO_MAX_CONTEXT_DIM];
     __shared__ float shared_reduction[512];
-    const LeoConfig* cfg = leo_p_cptr<LeoConfig>(pointers, LEO_P_CONFIG);
+    __shared__ float shared_errors[LEO_OUTPUTS];
+    const unsigned int model_block_count =
+        leo_p_cptr<LeoConfig>(pointers, LEO_P_CONFIG)->block_count;
     const bool learning_trace = learning_trace_raw != 0U;
     const unsigned int grid_thread = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int grid_stride = gridDim.x * blockDim.x;
@@ -4458,28 +4497,24 @@ __device__ __forceinline__ void leo_train_cooperative_body(
         const bool frozen_advance = step.target_index == -2;
         const bool context_enabled = step.context_enabled != 0U;
         const bool supervised = !frozen_advance && step.target_index >= 0 && strength > 0.0f;
-        unsigned int* rec_a_list = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_LIST);
-        unsigned int* rec_a_count = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_ELIGIBLE_COUNT);
-        unsigned int* rec_b_list = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_NEXT_ELIGIBLE_LIST);
-        unsigned int* rec_b_count = leo_p_ptr<unsigned int>(pointers, LEO_P_REC_NEXT_ELIGIBLE_COUNT);
-        unsigned int* input_a_list = leo_p_ptr<unsigned int>(pointers, LEO_P_INPUT_ELIGIBLE_LIST);
-        unsigned int* input_a_count = leo_p_ptr<unsigned int>(pointers, LEO_P_INPUT_ELIGIBLE_COUNT);
-        unsigned int* input_b_list = leo_p_ptr<unsigned int>(pointers, LEO_P_INPUT_NEXT_ELIGIBLE_LIST);
-        unsigned int* input_b_count = leo_p_ptr<unsigned int>(pointers, LEO_P_INPUT_NEXT_ELIGIBLE_COUNT);
         const bool even = (learning_step_index & 1U) == 0U;
-        unsigned int* rec_current_list = even ? rec_a_list : rec_b_list;
-        unsigned int* rec_current_count = even ? rec_a_count : rec_b_count;
-        unsigned int* rec_next_list = even ? rec_b_list : rec_a_list;
-        unsigned int* rec_next_count = even ? rec_b_count : rec_a_count;
-        unsigned int* input_current_list = even ? input_a_list : input_b_list;
-        unsigned int* input_current_count = even ? input_a_count : input_b_count;
-        unsigned int* input_next_list = even ? input_b_list : input_a_list;
-        unsigned int* input_next_count = even ? input_b_count : input_a_count;
 
         unsigned long long phase_started = leo_profile_phase_start<PROFILE>();
         // Preserve established atomic ordering for event delivery and input
         // injection by keeping this phase on block 0.
         if (blockIdx.x == 0U) {
+            unsigned int* rec_current_list = leo_p_ptr<unsigned int>(
+                pointers, even ? LEO_P_REC_ELIGIBLE_LIST : LEO_P_REC_NEXT_ELIGIBLE_LIST
+            );
+            unsigned int* rec_current_count = leo_p_ptr<unsigned int>(
+                pointers, even ? LEO_P_REC_ELIGIBLE_COUNT : LEO_P_REC_NEXT_ELIGIBLE_COUNT
+            );
+            unsigned int* input_current_list = leo_p_ptr<unsigned int>(
+                pointers, even ? LEO_P_INPUT_ELIGIBLE_LIST : LEO_P_INPUT_NEXT_ELIGIBLE_LIST
+            );
+            unsigned int* input_current_count = leo_p_ptr<unsigned int>(
+                pointers, even ? LEO_P_INPUT_ELIGIBLE_COUNT : LEO_P_INPUT_NEXT_ELIGIBLE_COUNT
+            );
             leo_p_start_tick(pointers, tick);
             __syncthreads();
             leo_p_deliver_events(
@@ -4502,12 +4537,12 @@ __device__ __forceinline__ void leo_train_cooperative_body(
             __syncthreads();
         }
         leo_profile_phase_end<PROFILE>(
-            grid, profile_counters, LEO_CUDA_REPLAY_PROFILE_PRE, phase_started
+            profile_counters, LEO_CUDA_REPLAY_PROFILE_PRE, phase_started
         );
 
         phase_started = leo_profile_phase_start<PROFILE>();
         for (unsigned int model_block = blockIdx.x;
-             model_block < cfg->block_count;
+             model_block < model_block_count;
              model_block += gridDim.x) {
             if (FAST_METRICS || frozen_advance) {
                 leo_p_select_model_block_fast(pointers, tick, model_block, shared_selection_keys);
@@ -4517,7 +4552,7 @@ __device__ __forceinline__ void leo_train_cooperative_body(
             __syncthreads();
         }
         leo_profile_phase_end<PROFILE>(
-            grid, profile_counters, LEO_CUDA_REPLAY_PROFILE_SELECT_BLOCKS, phase_started
+            profile_counters, LEO_CUDA_REPLAY_PROFILE_SELECT_BLOCKS, phase_started
         );
 
         phase_started = leo_profile_phase_start<PROFILE>();
@@ -4526,7 +4561,7 @@ __device__ __forceinline__ void leo_train_cooperative_body(
             __syncthreads();
         }
         leo_profile_phase_end<PROFILE>(
-            grid, profile_counters, LEO_CUDA_REPLAY_PROFILE_SELECT_GLOBAL, phase_started
+            profile_counters, LEO_CUDA_REPLAY_PROFILE_SELECT_GLOBAL, phase_started
         );
 
         if (frozen_advance) {
@@ -4537,29 +4572,46 @@ __device__ __forceinline__ void leo_train_cooperative_body(
             phase_started = leo_profile_phase_start<PROFILE>();
             leo_p_post_and_emit_grid(pointers, tick);
             leo_profile_phase_end<PROFILE>(
-                grid, profile_counters, LEO_CUDA_REPLAY_PROFILE_POST_EMIT, phase_started
+                profile_counters, LEO_CUDA_REPLAY_PROFILE_POST_EMIT, phase_started
             );
             if (PROFILE && blockIdx.x == 0U && threadIdx.x == 0U && profile_counters != nullptr) {
                 profile_counters[LEO_CUDA_REPLAY_PROFILE_SAMPLES] += 1ULL;
             }
-            if (PROFILE) grid.sync();
+            if (PROFILE) cooperative_groups::this_grid().sync();
             continue;
         }
 
         phase_started = leo_profile_phase_start<PROFILE>();
         leo_p_cache_surrogate_work(pointers, tick, grid_thread, grid_stride);
+        // Reset the next eligibility counts while surrogate work is in flight.
+        // These stores are independent, and the existing phase-end grid barrier
+        // makes both results visible before either eligibility pass begins.
+        if (learning_trace && blockIdx.x == 0U && threadIdx.x == 0U) {
+            *leo_p_ptr<unsigned int>(
+                pointers, even ? LEO_P_REC_NEXT_ELIGIBLE_COUNT : LEO_P_REC_ELIGIBLE_COUNT
+            ) = 0U;
+            *leo_p_ptr<unsigned int>(
+                pointers, even ? LEO_P_INPUT_NEXT_ELIGIBLE_COUNT : LEO_P_INPUT_ELIGIBLE_COUNT
+            ) = 0U;
+        }
         leo_profile_phase_end<PROFILE>(
-            grid, profile_counters, LEO_CUDA_REPLAY_PROFILE_CACHE_SURROGATE, phase_started
+            profile_counters, LEO_CUDA_REPLAY_PROFILE_CACHE_SURROGATE, phase_started
         );
 
         if (learning_trace) {
-            if (blockIdx.x == 0U && threadIdx.x == 0U) {
-                *rec_next_count = 0U;
-                *input_next_count = 0U;
-            }
-            grid.sync();
-
             phase_started = leo_profile_phase_start<PROFILE>();
+            unsigned int* rec_current_list = leo_p_ptr<unsigned int>(
+                pointers, even ? LEO_P_REC_ELIGIBLE_LIST : LEO_P_REC_NEXT_ELIGIBLE_LIST
+            );
+            unsigned int* rec_current_count = leo_p_ptr<unsigned int>(
+                pointers, even ? LEO_P_REC_ELIGIBLE_COUNT : LEO_P_REC_NEXT_ELIGIBLE_COUNT
+            );
+            unsigned int* rec_next_list = leo_p_ptr<unsigned int>(
+                pointers, even ? LEO_P_REC_NEXT_ELIGIBLE_LIST : LEO_P_REC_ELIGIBLE_LIST
+            );
+            unsigned int* rec_next_count = leo_p_ptr<unsigned int>(
+                pointers, even ? LEO_P_REC_NEXT_ELIGIBLE_COUNT : LEO_P_REC_ELIGIBLE_COUNT
+            );
             if (FAST_METRICS) {
                 leo_p_update_recurrent_eligibility_work_fast(
                     pointers, tick, rec_current_list, rec_current_count,
@@ -4572,11 +4624,23 @@ __device__ __forceinline__ void leo_train_cooperative_body(
                 );
             }
             leo_profile_phase_end<PROFILE>(
-                grid, profile_counters,
+                profile_counters,
                 LEO_CUDA_REPLAY_PROFILE_RECURRENT_ELIGIBILITY, phase_started
             );
 
             phase_started = leo_profile_phase_start<PROFILE>();
+            unsigned int* input_current_list = leo_p_ptr<unsigned int>(
+                pointers, even ? LEO_P_INPUT_ELIGIBLE_LIST : LEO_P_INPUT_NEXT_ELIGIBLE_LIST
+            );
+            unsigned int* input_current_count = leo_p_ptr<unsigned int>(
+                pointers, even ? LEO_P_INPUT_ELIGIBLE_COUNT : LEO_P_INPUT_NEXT_ELIGIBLE_COUNT
+            );
+            unsigned int* input_next_list = leo_p_ptr<unsigned int>(
+                pointers, even ? LEO_P_INPUT_NEXT_ELIGIBLE_LIST : LEO_P_INPUT_ELIGIBLE_LIST
+            );
+            unsigned int* input_next_count = leo_p_ptr<unsigned int>(
+                pointers, even ? LEO_P_INPUT_NEXT_ELIGIBLE_COUNT : LEO_P_INPUT_ELIGIBLE_COUNT
+            );
             if (FAST_METRICS) {
                 leo_p_update_input_eligibility_work_fast(
                     pointers, tick, input_current_list, input_current_count,
@@ -4589,7 +4653,7 @@ __device__ __forceinline__ void leo_train_cooperative_body(
                 );
             }
             leo_profile_phase_end<PROFILE>(
-                grid, profile_counters,
+                profile_counters,
                 LEO_CUDA_REPLAY_PROFILE_INPUT_ELIGIBILITY, phase_started
             );
         }
@@ -4597,7 +4661,7 @@ __device__ __forceinline__ void leo_train_cooperative_body(
         phase_started = leo_profile_phase_start<PROFILE>();
         leo_p_post_and_emit_work(pointers, tick, grid_thread, grid_stride);
         leo_profile_phase_end<PROFILE>(
-            grid, profile_counters, LEO_CUDA_REPLAY_PROFILE_POST_EMIT, phase_started
+            profile_counters, LEO_CUDA_REPLAY_PROFILE_POST_EMIT, phase_started
         );
 
         phase_started = leo_profile_phase_start<PROFILE>();
@@ -4606,22 +4670,24 @@ __device__ __forceinline__ void leo_train_cooperative_body(
         // exact 256-thread softmax/error reduction on block 0 so FP32
         // reduction order is unchanged.
         leo_p_forward_context_latent_work(pointers, grid_thread, grid_stride);
-        grid.sync();
+        cooperative_groups::this_grid().sync();
         leo_p_forward_logits_work(pointers, grid_thread, grid_stride);
-        grid.sync();
+        cooperative_groups::this_grid().sync();
         if (blockIdx.x == 0U) {
             leo_p_forward_finalize(pointers, step.target_index, shared_reduction);
             __syncthreads();
         }
         leo_profile_phase_end<PROFILE>(
-            grid, profile_counters, LEO_CUDA_REPLAY_PROFILE_FORWARD, phase_started
+            profile_counters, LEO_CUDA_REPLAY_PROFILE_FORWARD, phase_started
         );
 
         if (supervised) {
             phase_started = leo_profile_phase_start<PROFILE>();
-            leo_p_learning_signals_work(pointers, tick, grid_thread, grid_stride);
+            leo_p_learning_signals_work_cached_errors(
+                pointers, tick, grid_thread, grid_stride, shared_errors
+            );
             leo_profile_phase_end<PROFILE>(
-                grid, profile_counters,
+                profile_counters,
                 LEO_CUDA_REPLAY_PROFILE_LEARNING_SIGNALS, phase_started
             );
 
@@ -4630,7 +4696,7 @@ __device__ __forceinline__ void leo_train_cooperative_body(
                 pointers, step.supervised_strength, grid_thread, grid_stride
             );
             leo_profile_phase_end<PROFILE>(
-                grid, profile_counters, LEO_CUDA_REPLAY_PROFILE_OUTPUT_UPDATE, phase_started
+                profile_counters, LEO_CUDA_REPLAY_PROFILE_OUTPUT_UPDATE, phase_started
             );
 
             phase_started = leo_profile_phase_start<PROFILE>();
@@ -4640,19 +4706,22 @@ __device__ __forceinline__ void leo_train_cooperative_body(
                 );
             }
             leo_profile_phase_end<PROFILE>(
-                grid, profile_counters, LEO_CUDA_REPLAY_PROFILE_CONTEXT_UPDATE, phase_started
+                profile_counters, LEO_CUDA_REPLAY_PROFILE_CONTEXT_UPDATE, phase_started
             );
 
-            const unsigned int* learning_rec_list =
-                learning_trace ? rec_next_list : rec_current_list;
-            const unsigned int* learning_rec_count =
-                learning_trace ? rec_next_count : rec_current_count;
-            const unsigned int* learning_input_list =
-                learning_trace ? input_next_list : input_current_list;
-            const unsigned int* learning_input_count =
-                learning_trace ? input_next_count : input_current_count;
-
             phase_started = leo_profile_phase_start<PROFILE>();
+            const unsigned int* learning_rec_list = leo_p_cptr<unsigned int>(
+                pointers,
+                learning_trace
+                    ? (even ? LEO_P_REC_NEXT_ELIGIBLE_LIST : LEO_P_REC_ELIGIBLE_LIST)
+                    : (even ? LEO_P_REC_ELIGIBLE_LIST : LEO_P_REC_NEXT_ELIGIBLE_LIST)
+            );
+            const unsigned int* learning_rec_count = leo_p_cptr<unsigned int>(
+                pointers,
+                learning_trace
+                    ? (even ? LEO_P_REC_NEXT_ELIGIBLE_COUNT : LEO_P_REC_ELIGIBLE_COUNT)
+                    : (even ? LEO_P_REC_ELIGIBLE_COUNT : LEO_P_REC_NEXT_ELIGIBLE_COUNT)
+            );
             if (FAST_METRICS) {
                 leo_p_update_recurrent_weights_work_fast(
                     pointers, learning_rec_list, learning_rec_count,
@@ -4665,10 +4734,22 @@ __device__ __forceinline__ void leo_train_cooperative_body(
                 );
             }
             leo_profile_phase_end<PROFILE>(
-                grid, profile_counters, LEO_CUDA_REPLAY_PROFILE_RECURRENT_UPDATE, phase_started
+                profile_counters, LEO_CUDA_REPLAY_PROFILE_RECURRENT_UPDATE, phase_started
             );
 
             phase_started = leo_profile_phase_start<PROFILE>();
+            const unsigned int* learning_input_list = leo_p_cptr<unsigned int>(
+                pointers,
+                learning_trace
+                    ? (even ? LEO_P_INPUT_NEXT_ELIGIBLE_LIST : LEO_P_INPUT_ELIGIBLE_LIST)
+                    : (even ? LEO_P_INPUT_ELIGIBLE_LIST : LEO_P_INPUT_NEXT_ELIGIBLE_LIST)
+            );
+            const unsigned int* learning_input_count = leo_p_cptr<unsigned int>(
+                pointers,
+                learning_trace
+                    ? (even ? LEO_P_INPUT_NEXT_ELIGIBLE_COUNT : LEO_P_INPUT_ELIGIBLE_COUNT)
+                    : (even ? LEO_P_INPUT_ELIGIBLE_COUNT : LEO_P_INPUT_NEXT_ELIGIBLE_COUNT)
+            );
             if (FAST_METRICS) {
                 leo_p_update_input_weights_work_fast(
                     pointers, learning_input_list, learning_input_count,
@@ -4681,24 +4762,26 @@ __device__ __forceinline__ void leo_train_cooperative_body(
                 );
             }
             leo_profile_phase_end<PROFILE>(
-                grid, profile_counters, LEO_CUDA_REPLAY_PROFILE_INPUT_UPDATE, phase_started
+                profile_counters, LEO_CUDA_REPLAY_PROFILE_INPUT_UPDATE, phase_started
             );
 
             phase_started = leo_profile_phase_start<PROFILE>();
             leo_p_inhibitory_homeostasis_work(
                 pointers, strength, grid_thread, grid_stride
             );
-            leo_profile_phase_end<PROFILE>(
-                grid, profile_counters, LEO_CUDA_REPLAY_PROFILE_INHIBITORY, phase_started
-            );
+            // Do not add a profiling-only grid boundary here. Inhibitory
+            // homeostasis writes recurrent weights while threshold homeostasis
+            // writes thresholds, so production intentionally overlaps them.
+            // The HOMEOSTASIS counter below measures the combined interval.
+        } else {
+            phase_started = leo_profile_phase_start<PROFILE>();
         }
 
-        phase_started = leo_profile_phase_start<PROFILE>();
         if (learning_trace) {
             leo_p_homeostasis_work(pointers, tick, grid_thread, grid_stride);
         }
         leo_profile_phase_end<PROFILE>(
-            grid, profile_counters, LEO_CUDA_REPLAY_PROFILE_HOMEOSTASIS, phase_started
+            profile_counters, LEO_CUDA_REPLAY_PROFILE_HOMEOSTASIS, phase_started
         );
 
         phase_started = leo_profile_phase_start<PROFILE>();
@@ -4711,13 +4794,13 @@ __device__ __forceinline__ void leo_train_cooperative_body(
             __syncthreads();
         }
         leo_profile_phase_end<PROFILE>(
-            grid, profile_counters, LEO_CUDA_REPLAY_PROFILE_CAPTURE, phase_started
+            profile_counters, LEO_CUDA_REPLAY_PROFILE_CAPTURE, phase_started
         );
 
         if (PROFILE && blockIdx.x == 0U && threadIdx.x == 0U && profile_counters != nullptr) {
             profile_counters[LEO_CUDA_REPLAY_PROFILE_SAMPLES] += 1ULL;
         }
-        if (PROFILE) grid.sync();
+        if (PROFILE) cooperative_groups::this_grid().sync();
         if (learning_trace) {
             ++learning_step_index;
         }
@@ -5613,6 +5696,7 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
 ) {
     __shared__ unsigned long long shared_selection_keys[LEO_GLOBAL_SORT];
     __shared__ float shared_reduction[512];
+    __shared__ float shared_errors[LEO_OUTPUTS];
     if (lane_count == 0U || gridDim.x < lane_count) return;
 
     // Interleave CTAs across lanes. When gridDim.x is not divisible by the
@@ -5675,8 +5759,9 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
         );
 
         // Each lane group owns its story's model blocks. This retains the exact
-        // per-block selection helper/order while allowing unrelated story lanes
-        // to advance independently through their own phase barriers.
+        // per-block selection helper/order while distributing each story lane over
+        // its assigned CTA group. Required cross-lane visibility still uses
+        // cooperative whole-grid barriers.
         for (unsigned int model_block = lane_block; model_block < model_block_count;
              model_block += blocks_in_lane) {
             const unsigned int work = lane * model_block_count + model_block;
@@ -5704,14 +5789,9 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
         if (active) {
             leo_p_cache_surrogate_work(p, tick, lane_thread, lane_stride);
         }
-        cooperative_groups::this_grid().sync();
-        leo_phase_profile_mark<PROFILED>(
-            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_CACHE_SURROGATE, profile_step_thread, &phase_start
-        );
-
-        // Rebuild ping-pong eligibility pointers only in the phases that consume
-        // them. Keeping eight 64-bit pointers live across the whole persistent
-        // step inflated register pressure enough to halve Pascal residency.
+        // Count reset is independent of surrogate calculation.  Do both before
+        // the same whole-grid visibility boundary instead of paying a second
+        // cooperative barrier solely for two scalar stores per lane.
         if (learning_trace && lane_leader && threadIdx.x == 0U) {
             const bool even = (step_index & 1U) == 0U;
             unsigned int* rec_a_count = leo_p_ptr<unsigned int>(p, LEO_P_REC_ELIGIBLE_COUNT);
@@ -5722,6 +5802,13 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
             *(even ? input_b_count : input_a_count) = 0U;
         }
         cooperative_groups::this_grid().sync();
+        leo_phase_profile_mark<PROFILED>(
+            phase_profile_counters, LEO_CUDA_PHASE_PROFILE_CACHE_SURROGATE, profile_step_thread, &phase_start
+        );
+
+        // Rebuild ping-pong eligibility pointers only in the phases that consume
+        // them. Keeping eight 64-bit pointers live across the whole persistent
+        // step inflated register pressure enough to halve Pascal residency.
 
         if (learning_trace) {
             const bool even = (step_index & 1U) == 0U;
@@ -5780,7 +5867,9 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
         );
 
         if (supervised) {
-            leo_p_learning_signals_work(p, tick, lane_thread, lane_stride);
+            leo_p_learning_signals_work_cached_errors(
+                p, tick, lane_thread, lane_stride, shared_errors
+            );
         }
         cooperative_groups::this_grid().sync();
         leo_phase_profile_mark<PROFILED>(
@@ -5835,17 +5924,21 @@ __device__ __forceinline__ void leo_shared_wavefront_persistent_grouped_body(
         }
         cooperative_groups::this_grid().sync();
 
-        // Recurrent supervised updates and inhibitory homeostasis touch the
-        // same recurrent weights, so keep an explicit grid barrier between
-        // them even though both phases are independently parallelized.
-        if (supervised) {
-            leo_p_inhibitory_homeostasis_work(p, strength, lane_thread, lane_stride);
-        }
-        cooperative_groups::this_grid().sync();
+        // The barrier after the input update closes all supervised parameter
+        // delta phases. Record that boundary before starting homeostasis so the
+        // profiled kernel keeps the same synchronization schedule as production.
         leo_phase_profile_mark<PROFILED>(
             phase_profile_counters, LEO_CUDA_PHASE_PROFILE_POST_DELTAS, profile_step_thread, &phase_start
         );
 
+        // Recurrent supervised updates and inhibitory homeostasis touch the
+        // same recurrent weights, so the preceding grid barrier is required.
+        // Inhibitory homeostasis writes recurrent weights while threshold
+        // homeostasis writes thresholds; run both before the next shared
+        // visibility boundary in production and profiled kernels alike.
+        if (supervised) {
+            leo_p_inhibitory_homeostasis_work(p, strength, lane_thread, lane_stride);
+        }
         if (learning_trace) {
             leo_p_homeostasis_work(p, tick, lane_thread, lane_stride);
         }

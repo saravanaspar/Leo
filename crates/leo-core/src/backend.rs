@@ -389,6 +389,15 @@ pub trait RuntimeBackend: Send {
     fn active_neurons(&self) -> &[usize];
     fn activation(&self, neuron: usize) -> f32;
     fn begin_document(&mut self) -> LeoResult<()>;
+
+    /// Replay-only reset path. Backends that cannot safely defer completion use
+    /// the ordinary synchronous begin-document contract. CUDA overrides this to
+    /// enqueue the reset on the same stream as the immediately following replay
+    /// work, avoiding one host round-trip without weakening begin_document().
+    fn begin_document_deferred_for_replay(&mut self) -> LeoResult<()> {
+        self.begin_document()
+    }
+
     fn finish_document(&mut self) -> LeoResult<()>;
     fn reset_transient_state(&mut self) -> LeoResult<()>;
     fn step(
@@ -686,6 +695,10 @@ impl RuntimeBackend for GpuRuntime {
         self.runtime.begin_document()
     }
 
+    fn begin_document_deferred_for_replay(&mut self) -> LeoResult<()> {
+        self.runtime.begin_document_deferred_for_replay()
+    }
+
     fn finish_document(&mut self) -> LeoResult<()> {
         self.runtime.finish_document()
     }
@@ -912,6 +925,10 @@ impl BackendRuntime {
 
     pub fn begin_document(&mut self) -> LeoResult<()> {
         self.inner.begin_document()
+    }
+
+    pub fn begin_document_deferred_for_replay(&mut self) -> LeoResult<()> {
+        self.inner.begin_document_deferred_for_replay()
     }
 
     pub fn finish_document(&mut self) -> LeoResult<()> {
