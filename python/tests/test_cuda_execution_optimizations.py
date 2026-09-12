@@ -812,9 +812,13 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("step_index < max_step_count", grouped)
         self.assertIn("active = lane_valid && step_index < lane_step_count", grouped)
         self.assertNotIn("leo_lane_group_barrier", kernels)
-        self.assertGreaterEqual(
-            grouped.count("cooperative_groups::this_grid().sync();"), 19
+        # Cache-surrogate work and next-eligibility count reset are independent
+        # and now share one visibility boundary. Keep the exact expected count
+        # so accidental synchronization changes remain visible to this gate.
+        self.assertEqual(
+            grouped.count("cooperative_groups::this_grid().sync();"), 17
         )
+        self.assertIn("Count reset is independent of surrogate calculation", grouped)
         self.assertNotIn("cooperative_groups::grid_group grid", grouped)
         self.assertNotIn("rec_current_list = nullptr", grouped)
         self.assertIn(
@@ -1028,6 +1032,91 @@ class CudaExecutionOptimizationTests(unittest.TestCase):
         self.assertIn("const float base2 = base * base", decay)
         self.assertIn("const float base4 = base2 * base2", decay)
         self.assertIn("while (exponent != 0ULL)", decay)
+
+    def test_cuda_document_reset_keeps_public_sync_contract_and_replay_deferred_fast_path(self):
+        rust = (ROOT / "crates/leo-core/src/cuda.rs").read_text()
+        backend = (ROOT / "crates/leo-core/src/backend.rs").read_text()
+        training = (ROOT / "crates/leo-cli/src/training.rs").read_text()
+        begin = rust.split("pub(crate) fn begin_document", 1)[1].split(
+            "pub(crate) fn begin_document_deferred_for_replay", 1
+        )[0]
+        deferred = rust.split(
+            "pub(crate) fn begin_document_deferred_for_replay", 1
+        )[1].split("pub(crate) fn finish_document", 1)[0]
+        reset = rust.split("fn enqueue_transient_reset", 1)[1].split(
+            "pub(crate) fn step", 1
+        )[0]
+        replay = training.split("fn replay_target_range_impl", 1)[1].split(
+            "#[cfg(test)]", 1
+        )[0]
+
+        # General backend callers retain the historical synchronous reset API.
+        self.assertIn("self.reset_transient_state()", begin)
+        self.assertNotIn("self.enqueue_transient_reset()", begin)
+        # Only classic replay may queue the reset and rely on same-stream ordering.
+        self.assertIn("self.enqueue_transient_reset()", deferred)
+        self.assertIn("fn begin_document_deferred_for_replay", backend)
+        self.assertIn("if collect_timing {", replay)
+        self.assertIn("runtime.begin_document()?;", replay)
+        self.assertIn("runtime.begin_document_deferred_for_replay()?;", replay)
+
+        # These payloads are hidden behind counts or are rebuilt by start_tick.
+        for redundant in (
+            "b.active,",
+            "b.active_value,",
+            "b.block_winner_neuron,",
+            "b.block_winner_value,",
+            "b.ring_source,",
+            "b.ring_activation,",
+            "b.ring_weight,",
+            "b.active_context_slots,",
+            "b.active_context_scales,",
+        ):
+            self.assertNotIn(redundant, reset)
+        for required in (
+            "b.active_count,",
+            "b.ring_count,",
+            "b.active_context_count,",
+            "b.recurrent_eligibility,",
+            "b.input_eligibility,",
+        ):
+            self.assertIn(required, reset)
+
+    def test_profiled_homeostasis_uses_production_sync_schedule(self):
+        kernels = (ROOT / "crates/leo-core/src/cuda_kernels.cu").read_text()
+        grouped = kernels.split("leo_shared_wavefront_persistent_grouped_body", 1)[1].split(
+            'extern "C" __global__ void\n__launch_bounds__(256, 2)\nleo_shared_wavefront_persistent_grouped',
+            1,
+        )[0]
+        replay = kernels.split("leo_train_cooperative_body", 1)[1].split(
+            'extern "C" __global__ void leo_train_cooperative(', 1
+        )[0]
+
+        self.assertNotIn(
+            "if (PROFILED) cooperative_groups::this_grid().sync();", grouped
+        )
+        self.assertNotIn(
+            "LEO_CUDA_REPLAY_PROFILE_INHIBITORY, phase_started", replay
+        )
+        self.assertIn(
+            "The HOMEOSTASIS counter below measures the combined interval", replay
+        )
+
+    def test_replay_target_zero_fuses_begin_step_into_one_ordered_target_batch(self):
+        training = (ROOT / "crates/leo-cli/src/training.rs").read_text()
+        replay = training.split("fn replay_target_range_impl", 1)[1].split(
+            "#[cfg(test)]", 1
+        )[0]
+
+        self.assertIn("if next_target == 0 {", replay)
+        self.assertIn(
+            "target_batch.push((BEGIN_DOCUMENT, Some(story[0] as u32)));", replay
+        )
+        self.assertIn("next_target = 1;", replay)
+        self.assertEqual(replay.count("runtime.training_step_batch(&target_batch"), 1)
+        self.assertNotIn(
+            "training_step_batch(&[(BEGIN_DOCUMENT, Some(story[0] as u32))]", replay
+        )
 
     def test_parallel_multi_gpu_replay_is_opt_in_and_keeps_budget_fp32(self):
         training = (ROOT / "crates/leo-cli/src/training.rs").read_text()

@@ -16,8 +16,8 @@ The reference TinyStories configuration is `configs/tinystories.toml`:
 
 ## Quick start: safe/default path
 
-If the overlay is already applied and TinyStories is prepared, this is the shortest
-safe sequence before a real run:
+If the intended branch/commit is checked out and TinyStories is prepared, this is
+the shortest safe sequence before a real run:
 
 ```bash
 cargo build --release -p leo-cli
@@ -118,31 +118,42 @@ Verify the cooperative-groups header:
 test -f "${CUDA_HOME:-/usr/local/cuda}/include/cooperative_groups.h" && echo CUDA_HEADERS_OK
 ```
 
-## 3. Apply the changed-files overlay
+## 3. Check out the exact branch or commit
 
-Create a branch before applying the overlay:
-
-```bash
-git switch -c perf/leo-training-speedup
-```
-
-If the ZIP is in `~/Downloads` and the current directory is the Leo repository
-root:
+Performance evidence is meaningful only when the tested source revision is
+unambiguous. On an existing clone, update remote state and check out the branch
+you intend to validate:
 
 ```bash
-unzip -o ~/Downloads/Leo-speedup-full-overlay-v2.zip -d .
-```
-
-Verify what changed:
-
-```bash
+git fetch origin --prune
+git switch <branch>
+git pull --ff-only origin <branch>
+git rev-parse HEAD
 git status --short
-git diff --check
-git diff --stat
 ```
 
-Do not commit generated data, run directories, CUDA caches, model checkpoints, or
-benchmark logs unless the repository policy explicitly requires them.
+For the current P100 optimization work, the branch name used during development is:
+
+```text
+perf/p100-fp32-throughput
+```
+
+On an ephemeral GPU runner such as Kaggle, clone the pushed branch directly:
+
+```bash
+cd /kaggle/working
+rm -rf Leo
+git clone --branch perf/p100-fp32-throughput --single-branch \
+  https://github.com/saravanaspar/Leo.git Leo
+cd Leo
+git rev-parse HEAD
+git status --short
+```
+
+Do not copy an uncommitted overlay onto the GPU runner when collecting acceptance
+results. Test the same commit that will be reviewed. Do not commit generated data,
+run directories, CUDA caches, model checkpoints, or benchmark logs unless the
+repository policy explicitly requires them.
 
 ## 4. Build
 
@@ -162,7 +173,7 @@ The CUDA backend uses NVRTC at runtime, so a successful Rust build alone does no
 prove that CUDA kernels compile or execute on the target GPU. Run the GPU gate in
 the next section.
 
-## 5. Mandatory tests before training or pushing
+## 5. Mandatory tests before training or merging
 
 Run the normal repository gate:
 
@@ -181,21 +192,28 @@ plumbing, CUDA autotuning/cache behavior, and the optimized-vs-legacy final
 training-state digest. On a host with at least two visible GPUs it also runs the
 1-GPU vs 2-GPU exact-state scaling gate.
 
-For an explicit pre-push sequence:
+For a developer machine without the target NVIDIA GPU, run the non-GPU gate
+before committing/pushing the branch that the GPU runner will fetch:
 
 ```bash
-cargo fmt --check
+cargo fmt --all -- --check
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 bash ./scripts/check.sh
-bash ./scripts/check_gpu.sh
 git diff --check
 git status --short
 ```
 
-Do **not** push a CUDA performance change if `scripts/check_gpu.sh` has not passed
-on real NVIDIA hardware.
+It is acceptable to push that tested commit so an external GPU runner such as
+Kaggle can fetch it. **Do not merge or claim CUDA acceptance** until the exact
+pushed commit passes:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash ./scripts/check_gpu.sh
+```
+
+Record `git rev-parse HEAD` in the GPU log so the validation is tied to the commit.
 
 ## 6. Prepare TinyStories data
 
@@ -882,13 +900,140 @@ git status --short
 
 ## 26. Performance target tracking
 
-The remembered 32K baseline is approximately 800 steps/s without replay and
-approximately 600 steps/s with 30% replay. Treat those as historical estimates,
-not acceptance measurements.
+The current accepted P100 reference on merged main `027f9a7` is approximately:
 
-For the first clean run record the actual current numbers and use them as the
-new baseline. The primary target discussed for 32K + 30% replay is at least
-6,000 end-to-end `steps_per_second` without a model-quality regression.
+```text
+32K replay-off, optimized, 64 stories: 3393.45 steps/s
+32K canonical replay=0.30, 16 stories: 1853.70 steps/s
+canonical replay execution throughput: 4441.28 steps/s
+canonical replay wall fraction: 58.65%
+```
+
+Historical exact-state acceptance hashes for those reference workloads are:
+
+```text
+replay=0:
+14894f9039c59359a81ebed48d71b563617636348fb4347f2accefc5bfcd50e9
+
+replay=0.30:
+5b30b3f442f3aecf17a6a41e1b98b21b802cd27aa70fbe0c79cb1f9257527e6e
+```
+
+For the current optimization effort, the P100 target is at least **8,000
+end-to-end `steps_per_second`** on the canonical 16-worker, replay=0.30 workload
+without changing the replay hash. That is about a 4.32x improvement over the
+1853.70 steps/s merged-main reference.
+
+Use fresh model state, a fresh tuning cache after architectural changes, one
+warm-up/autotune run, and repeated measured runs before accepting small
+differences. Do not substitute replay-off or `execution_steps_per_second` for the
+canonical replay-on `steps_per_second` target.
+
+### P100 acceptance benchmark commands
+
+Create a replay-off copy of the standard configuration and fresh benchmark models:
+
+```bash
+rm -rf runs/p100-acceptance
+mkdir -p runs/p100-acceptance
+
+cp configs/tinystories.toml runs/p100-acceptance/tinystories-replay0.toml
+python3 - <<'PY2'
+from pathlib import Path
+p = Path("runs/p100-acceptance/tinystories-replay0.toml")
+s = p.read_text()
+old = "[replay]\nfraction = 0.30"
+new = "[replay]\nfraction = 0.0"
+if old not in s:
+    raise SystemExit("standard replay fraction was not found exactly once")
+p.write_text(s.replace(old, new, 1))
+PY2
+
+target/release/leo init \
+  --config runs/p100-acceptance/tinystories-replay0.toml \
+  --output runs/p100-acceptance/replay0.pscls
+
+target/release/leo init \
+  --config configs/tinystories.toml \
+  --output runs/p100-acceptance/replay30.pscls
+```
+
+Start with a fresh CUDA execution-plan cache after an architectural change:
+
+```bash
+export LEO_CACHE_DIR=/kaggle/working/leo-p100-cache
+rm -rf "$LEO_CACHE_DIR"
+mkdir -p "$LEO_CACHE_DIR"
+
+unset LEO_REPLAY_STREAMING
+unset LEO_MULTI_GPU_PARALLEL_REPLAY
+unset LEO_CUDA_FULL_STEP_METRICS
+unset LEO_CUDA_PHASE_PROFILE
+unset LEO_CUDA_REPLAY_PROFILE
+unset LEO_CUDA_DEBUG
+unset LEO_CUDA_DEBUG_SYNC
+unset LEO_CUDA_REPLAY_BLOCKS
+unset LEO_CUDA_FROZEN_BLOCKS
+```
+
+Use a 1,024-story replay-off warm-up so the 32K execution tuner has enough
+logical batches to finish its bounded candidate search. This is tuning/warm-up
+evidence, not the historical 64-story replay-off acceptance measurement:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 LEO_MULTI_GPU=0 \
+  target/release/leo benchmark \
+    --train \
+    --model runs/p100-acceptance/replay0.pscls \
+    --bytes data/prepared/tinystories.train.bytes \
+    --index data/prepared/tinystories.train.idx \
+    --stories 1024 \
+    --workers 16 \
+    --backend gpu \
+    2>&1 | tee runs/p100-acceptance/warmup-1024.log
+```
+
+Then collect the historical replay-off control on 64 stories:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 LEO_MULTI_GPU=0 \
+  target/release/leo benchmark \
+    --train \
+    --model runs/p100-acceptance/replay0.pscls \
+    --bytes data/prepared/tinystories.train.bytes \
+    --index data/prepared/tinystories.train.idx \
+    --stories 64 \
+    --workers 16 \
+    --backend gpu \
+    2>&1 | tee runs/p100-acceptance/replay0-64.log
+```
+
+Collect the canonical replay=0.30 acceptance measurement on 16 stories:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 LEO_MULTI_GPU=0 \
+  target/release/leo benchmark \
+    --train \
+    --model runs/p100-acceptance/replay30.pscls \
+    --bytes data/prepared/tinystories.train.bytes \
+    --index data/prepared/tinystories.train.idx \
+    --stories 16 \
+    --workers 16 \
+    --backend gpu \
+    2>&1 | tee runs/p100-acceptance/replay30-16.log
+```
+
+Extract the final records:
+
+```bash
+grep '"event":"training_benchmark"' runs/p100-acceptance/replay0-64.log | tail -n 1
+grep '"event":"training_benchmark"' runs/p100-acceptance/replay30-16.log | tail -n 1
+```
+
+For execution-only acceptance, the 64-story replay-off and 16-story replay-on
+hashes must remain the historical values above. Repeat the two measured commands
+after warm-up when judging throughput; do not compare an instrumented/profiled run
+to a clean production run.
 
 Record at minimum:
 
@@ -1001,45 +1146,55 @@ unset LEO_MULTI_GPU_PARALLEL_REPLAY
 
 The speed result is not accepted if held-out quality regresses.
 
-## 28. Pre-push checklist
+## 28. Pre-push and pre-merge checklist
 
-Run this immediately before pushing:
+Before committing/pushing from a developer machine:
 
 ```bash
-cargo fmt --check
+cargo fmt --all -- --check
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 bash ./scripts/check.sh
-bash ./scripts/check_gpu.sh
 git diff --check
 git status --short
 ```
 
-Then review the actual patch:
+Review the actual patch before committing:
 
 ```bash
 git diff --stat
 git diff
 ```
 
-Do not include model/data/cache/run artifacts in the commit.
+If the target GPU is only available after the branch is pushed, push the exact
+commit and validate that commit on the GPU runner. Before merge, require:
+
+```bash
+git rev-parse HEAD
+CUDA_VISIBLE_DEVICES=0 bash ./scripts/check_gpu.sh
+```
+
+Then run the canonical P100 throughput/hash benchmarks from this guide. Do not
+include model/data/cache/run artifacts or benchmark logs in the commit.
 
 ## 29. Recommended rollout sequence
 
-1. Apply overlay and build release.
-2. Pass `scripts/check.sh`.
-3. Pass `scripts/check_gpu.sh` on the target NVIDIA GPU.
-4. Run optimized-vs-legacy 32K benchmark with experimental replay off.
-5. Record the real replay-on `steps_per_second` and state hash.
-6. Run a longer safe/default training and `scripts/evaluate.sh`.
-7. Benchmark `LEO_REPLAY_STREAMING=1` separately.
-8. Run the full quality A/B before accepting streaming replay.
-9. If using multiple GPUs, benchmark exact/default multi-GPU first.
-10. Benchmark `LEO_MULTI_GPU_PARALLEL_REPLAY=1` separately and run its own
-    quality A/B before accepting it.
-11. Only combine experimental replay modes after each is independently stable.
-12. Keep the exact/default path available as the production rollback baseline.
+1. Check out the exact source branch/commit and record `git rev-parse HEAD`.
+2. Pass the non-GPU repository checks locally.
+3. Commit/push the exact revision if the target GPU is available only remotely.
+4. On the target NVIDIA GPU, pass `scripts/check_gpu.sh` for that exact commit.
+5. Prepare the pinned TinyStories dataset with `scripts/data.sh`.
+6. Run the 64-story replay-off hash/control benchmark.
+7. Run the 16-story canonical replay=0.30 benchmark and record
+   `steps_per_second`, replay timing, and `training_state_sha256`.
+8. Repeat clean measured runs after autotuning/warm-up before judging throughput.
+9. Run a longer safe/default training and `scripts/evaluate.sh` when validating
+   model quality rather than execution-only performance.
+10. Keep `LEO_REPLAY_STREAMING` and `LEO_MULTI_GPU_PARALLEL_REPLAY` disabled for
+    exact/default acceptance; benchmark them only as separate semantic
+    experiments with their own quality A/B.
+11. Keep the exact/default path available as the production rollback baseline.
 
 ## 30. Recommended production state today
 
